@@ -35,4 +35,25 @@ jobs:
         uses: codecov/codecov-action@v2.1.0
         with:
           file: ./coverage.txt
+          
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          # This token is provided by Actions, you do not need to create your own token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{github.ref}}
+          release_name: ${{github.ref}}
+
+      - name: Upload linux-arm
+        uses: actions/upload-release-asset@v1
+        env:
+          # This token is provided by Actions, you do not need to create your own token
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: victoria-metrics-prod
+          asset_name: victoria-metrics-prod-linux-arm
+          asset_content_type: application/octet-stream
 
