@@ -377,7 +377,7 @@ func (tb *table) AddRows(rows []rawRow) error {
 func (tb *table) getMinMaxTimestamps() (int64, int64) {
 	now := int64(fasttime.UnixTimestamp() * 1000)
 	minTimestamp := now - tb.retentionMsecs
-	maxTimestamp := now + 2*24*3600*1000 // allow max +2 days from now due to timezones shit :)
+	maxTimestamp := now + 30*24*3600*1000 // allow max +30 days from now
 	if minTimestamp < 0 {
 		// Negative timestamps aren't supported by the storage.
 		minTimestamp = 0
