@@ -1,83 +1,75 @@
-import {EditorState} from "@codemirror/state";
-import {EditorView, keymap} from "@codemirror/view";
-import {defaultKeymap} from "@codemirror/commands";
-import React, {FC, useEffect, useRef, useState} from "react";
-import {PromQLExtension} from "codemirror-promql";
-import {basicSetup} from "@codemirror/basic-setup";
-import {QueryHistory} from "../../../../state/common/reducer";
+import React, {FC, useEffect, useMemo, useRef, useState} from "preact/compat";
+import {KeyboardEvent} from "react";
 import {ErrorTypes} from "../../../../types";
+import Popper from "@mui/material/Popper";
+import TextField from "@mui/material/TextField";
+import Box from "@mui/material/Box";
+import Paper from "@mui/material/Paper";
+import MenuItem from "@mui/material/MenuItem";
+import MenuList from "@mui/material/MenuList";
 
 export interface QueryEditorProps {
-    setHistoryIndex: (step: number, index: number) => void;
-    setQuery: (query: string, index: number) => void;
-    runQuery: () => void;
-    query: string;
-    index: number;
-    queryHistory: QueryHistory;
-    server: string;
-    oneLiner?: boolean;
-    autocomplete: boolean;
-    error?: ErrorTypes | string;
+  setHistoryIndex: (step: number, index: number) => void;
+  setQuery: (query: string, index: number) => void;
+  runQuery: () => void;
+  query: string;
+  index: number;
+  oneLiner?: boolean;
+  autocomplete: boolean;
+  error?: ErrorTypes | string;
+  queryOptions: string[];
 }
 
 const QueryEditor: FC<QueryEditorProps> = ({
   index,
   query,
-  queryHistory,
   setHistoryIndex,
   setQuery,
   runQuery,
-  server,
-  oneLiner = false,
   autocomplete,
-  error
+  error,
+  queryOptions
 }) => {
 
-  const ref = useRef<HTMLDivElement>(null);
+  const [downMetaKeys, setDownMetaKeys] = useState<string[]>([]);
+  const [focusField, setFocusField] = useState(false);
+  const [focusOption, setFocusOption] = useState(-1);
+  const autocompleteAnchorEl = useRef<HTMLDivElement>(null);
+  const wrapperEl = useRef<HTMLUListElement>(null);
 
-  const [editorView, setEditorView] = useState<EditorView>();
-  const [focusEditor, setFocusEditor] = useState(false);
+  const openAutocomplete = useMemo(() => {
+    return !(!autocomplete || downMetaKeys.length || query.length < 2 || !focusField);
+  }, [query, downMetaKeys, autocomplete, focusField]);
 
-  // init editor view on load
-  useEffect(() => {
-    if (ref.current) {
-      setEditorView(new EditorView(
-        {
-          parent: ref.current
-        })
-      );
+  const actualOptions = useMemo(() => {
+    if (!openAutocomplete) return [];
+    try {
+      const regexp = new RegExp(String(query), "i");
+      return queryOptions.filter((item) => regexp.test(item) && item !== query);
+    } catch (e) {
+      return [];
     }
-    return () => editorView?.destroy();
-  }, []);
+  }, [autocomplete, query, queryOptions]);
 
-  // update state on change of autocomplete server
-  useEffect(() => {
-    const promQL = new PromQLExtension();
-    promQL.activateCompletion(autocomplete);
-    promQL.setComplete({remote: {url: server}});
+  const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const {key, ctrlKey, metaKey, shiftKey} = e;
+    if (ctrlKey || metaKey) setDownMetaKeys([...downMetaKeys, e.key]);
+    if (key === "ArrowUp" && openAutocomplete && actualOptions.length) {
+      e.preventDefault();
+      setFocusOption((prev) => prev === 0 ? 0 : prev - 1);
+    } else if (key === "ArrowDown" && openAutocomplete && actualOptions.length) {
+      e.preventDefault();
+      setFocusOption((prev) => prev >= actualOptions.length - 1 ? actualOptions.length - 1 : prev + 1);
+    } else if (key === "Enter" && openAutocomplete && actualOptions.length && !shiftKey) {
+      e.preventDefault();
+      setQuery(actualOptions[focusOption], index);
+    }
+    return true;
+  };
 
-    const listenerExtension = EditorView.updateListener.of(editorUpdate => {
-      if (editorUpdate.focusChanged) {
-        setFocusEditor(editorView?.hasFocus || false);
-      }
-      if (editorUpdate.docChanged) {
-        setQuery(editorUpdate.state.doc.toJSON().map(el => el.trim()).join(""), index);
-      }
-    });
-
-    editorView?.setState(EditorState.create({
-      doc: query,
-      extensions: [
-        basicSetup,
-        keymap.of(defaultKeymap),
-        listenerExtension,
-        promQL.asExtension(),
-      ]
-    }));
-  }, [server, editorView, autocomplete, queryHistory]);
-
-  const onKeyUp = (e: React.KeyboardEvent<HTMLDivElement>): void => {
+  const handleKeyUp = (e: KeyboardEvent<HTMLDivElement>) => {
     const {key, ctrlKey, metaKey} = e;
+    if (downMetaKeys.includes(key)) setDownMetaKeys(downMetaKeys.filter(k => k !== key));
     const ctrlMetaKey = ctrlKey || metaKey;
     if (key === "Enter" && ctrlMetaKey) {
       runQuery();
@@ -88,14 +80,36 @@ const QueryEditor: FC<QueryEditorProps> = ({
     }
   };
 
-  return <div className={`query-editor-container 
-    ${focusEditor ? "query-editor-container_focus" : ""}
-    query-editor-container-${oneLiner ? "one-line" : "multi-line"}
-    ${error === ErrorTypes.validQuery ? "query-editor-container_error" : ""}`}>
-    {/*Class one-line-scroll and other codemirror styles are declared in index.css*/}
-    <label className="query-editor-label">Query</label>
-    <div className="query-editor" ref={ref} onKeyUp={onKeyUp}/>
-  </div>;
+  useEffect(() => {
+    if (!wrapperEl.current) return;
+    const target = wrapperEl.current.childNodes[focusOption] as HTMLElement;
+    if (target?.scrollIntoView) target.scrollIntoView({block: "center"});
+  }, [focusOption]);
+
+  return <Box ref={autocompleteAnchorEl}>
+    <TextField
+      defaultValue={query}
+      fullWidth
+      label={`Query ${index + 1}`}
+      multiline
+      error={!!error}
+      onFocus={() => setFocusField(true)}
+      onBlur={() => setFocusField(false)}
+      onKeyUp={handleKeyUp}
+      onKeyDown={handleKeyDown}
+      onChange={(e) => setQuery(e.target.value, index)}
+    />
+    <Popper open={openAutocomplete} anchorEl={autocompleteAnchorEl.current} placement="bottom-start">
+      <Paper elevation={3} sx={{ maxHeight: 300, overflow: "auto" }}>
+        <MenuList ref={wrapperEl} dense>
+          {actualOptions.map((item, i) =>
+            <MenuItem key={item} sx={{bgcolor: `rgba(0, 0, 0, ${i === focusOption ? 0.12 : 0})`}}>
+              {item}
+            </MenuItem>)}
+        </MenuList>
+      </Paper>
+    </Popper>
+  </Box>;
 };
 
 export default QueryEditor;

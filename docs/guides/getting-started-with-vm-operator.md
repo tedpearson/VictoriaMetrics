@@ -148,7 +148,7 @@ vminsert-example-vmcluster-persistent    ClusterIP   10.107.47.136   <none>     
 ```
 
 To scrape metrics from Kubernetes with a VictoriaMetrics Cluster we will need to install [VMAgent](https://docs.victoriametrics.com/vmagent.html) with some additional configurations.
-Copy `vminsert-example-vmcluster-persistent` (or whatever user put into metadata.name field [https://docs.victoriametrics.com/getting-started-with-vm-operator.html#example-cluster-config](https://docs.victoriametrics.com/getting-started-with-vm-operator.html#example-cluster-config)) service name and add it to the `remoteWrite` URL from [quick-start example](https://github.com/VictoriaMetrics/operator/blob/master/docs/quick-start.MD#vmagent). 
+Copy `vminsert-example-vmcluster-persistent` (or whatever user put into metadata.name field [https://docs.victoriametrics.com/guides/getting-started-with-vm-operator.html#example-cluster-config](https://docs.victoriametrics.com/guides/getting-started-with-vm-operator.html#example-cluster-config)) service name and add it to the `remoteWrite` URL from [quick-start example](https://github.com/VictoriaMetrics/operator/blob/master/docs/quick-start.MD#vmagent). 
 Here is an example of the full configuration that we need to apply:
 
 <div class="with-copy" markdown="1">
@@ -282,11 +282,11 @@ cat <<EOF | helm install my-grafana grafana/grafana -f -
     default:
       victoriametrics:
         gnetId: 11176
-        revision: 16
+        revision: 17
         datasource: victoriametrics
       vmagent:
         gnetId: 12683
-        revision: 6
+        revision: 7
         datasource: victoriametrics
       kubernetes:
         gnetId: 14205

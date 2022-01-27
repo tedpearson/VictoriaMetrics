@@ -48,7 +48,7 @@ export const setQueryStringValue = (newValue: Record<string, unknown>): void => 
         newQsValue.push(`g${i}.${queryKey}=${valueEncoded}`);
       }
     });
-    newQsValue.push(`g${i}.expr=${q}`);
+    newQsValue.push(`g${i}.expr=${encodeURIComponent(q)}`);
   });
 
   setQueryStringWithoutPageReload(newQsValue.join("&"));

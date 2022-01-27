@@ -126,13 +126,14 @@ func (sw *ScrapeWork) canSwitchToStreamParseMode() bool {
 
 // key returns unique identifier for the given sw.
 //
-// it can be used for comparing for equality for two ScrapeWork objects.
+// It can be used for comparing for equality for two ScrapeWork objects.
 func (sw *ScrapeWork) key() string {
-	// Do not take into account OriginalLabels.
-	key := fmt.Sprintf("ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
+	// Do not take into account OriginalLabels, since they can be changed with relabeling.
+	// Take into account JobNameOriginal in order to capture the case when the original job_name is changed via relabeling.
+	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
 		"ProxyURL=%s, ProxyAuthConfig=%s, AuthConfig=%s, MetricRelabelConfigs=%s, SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v, StreamParse=%v, "+
 		"ScrapeAlignInterval=%s, ScrapeOffset=%s, SeriesLimit=%d",
-		sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.LabelsString(),
+		sw.jobNameOriginal, sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.LabelsString(),
 		sw.ProxyURL.String(), sw.ProxyAuthConfig.String(),
 		sw.AuthConfig.String(), sw.MetricRelabelConfigs.String(), sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive, sw.StreamParse,
 		sw.ScrapeAlignInterval, sw.ScrapeOffset, sw.SeriesLimit)
@@ -255,7 +256,7 @@ func (sw *scrapeWork) finalizeLastScrape() {
 	}
 }
 
-func (sw *scrapeWork) run(stopCh <-chan struct{}) {
+func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) {
 	var randSleep uint64
 	scrapeInterval := sw.Config.ScrapeInterval
 	scrapeAlignInterval := sw.Config.ScrapeAlignInterval
@@ -269,7 +270,12 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}) {
 		// scrape urls and labels.
 		// This also makes consistent scrape times across restarts
 		// for a target with the same ScrapeURL and labels.
-		key := fmt.Sprintf("ScrapeURL=%s, Labels=%s", sw.Config.ScrapeURL, sw.Config.LabelsString())
+		//
+		// Include clusterMemberNum to the key in order to guarantee that each member in vmagent cluster
+		// scrapes replicated targets at different time offsets. This guarantees that the deduplication consistently leaves samples
+		// received from the same vmagent replica.
+		// See https://docs.victoriametrics.com/vmagent.html#scraping-big-number-of-targets
+		key := fmt.Sprintf("ClusterMemberNum=%d, ScrapeURL=%s, Labels=%s", *clusterMemberNum, sw.Config.ScrapeURL, sw.Config.LabelsString())
 		h := xxhash.Sum64(bytesutil.ToUnsafeBytes(key))
 		randSleep = uint64(float64(scrapeInterval) * (float64(h) / (1 << 64)))
 		sleepOffset := uint64(time.Now().UnixNano()) % uint64(scrapeInterval)
@@ -305,7 +311,14 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}) {
 		case <-stopCh:
 			t := time.Now().UnixNano() / 1e6
 			lastScrape := sw.loadLastScrape()
-			sw.sendStaleSeries(lastScrape, "", t, true)
+			select {
+			case <-globalStopCh:
+				// Do not send staleness markers on graceful shutdown as Prometheus does.
+				// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2013#issuecomment-1006994079
+			default:
+				// Send staleness markers when the given target disappears.
+				sw.sendStaleSeries(lastScrape, "", t, true)
+			}
 			if sw.seriesLimiter != nil {
 				job := sw.Config.Job()
 				metrics.UnregisterMetric(fmt.Sprintf(`promscrape_series_limit_rows_dropped_total{scrape_job_original=%q,scrape_job=%q,scrape_target=%q}`,
@@ -438,7 +451,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	}
 	sw.finalizeLastScrape()
 	if !mustSwitchToStreamParse {
-		// Return wc to the pool only if its size is smaller than -promscrape.minResponseSizeForStreamParse
+		// Return body to the pool only if its size is smaller than -promscrape.minResponseSizeForStreamParse
 		// This should reduce memory usage when scraping targets which return big responses.
 		leveledbytebufferpool.Put(body)
 	}
@@ -698,9 +711,12 @@ func (sw *scrapeWork) sendStaleSeries(lastScrape, currScrape string, timestamp i
 		for i := range samples {
 			samples[i].Value = decimal.StaleNaN
 		}
+		staleSamplesCreated.Add(len(samples))
 	}
 	sw.pushData(&wc.writeRequest)
 }
+
+var staleSamplesCreated = metrics.NewCounter(`promscrape_stale_samples_created_total`)
 
 func (sw *scrapeWork) getLabelsHash(labels []prompbmarshal.Label) uint64 {
 	// It is OK if there will be hash collisions for distinct sets of labels,

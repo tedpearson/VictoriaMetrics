@@ -490,11 +490,14 @@ func TestRollupNewRollupFuncSuccess(t *testing.T) {
 
 	f("default_rollup", 34)
 	f("changes", 11)
+	f("changes_prometheus", 10)
 	f("delta", 34)
+	f("delta_prometheus", -89)
 	f("deriv", -266.85860231406093)
 	f("deriv_fast", -712)
 	f("idelta", 0)
 	f("increase", 398)
+	f("increase_prometheus", 275)
 	f("irate", 0)
 	f("rate", 2200)
 	f("resets", 5)
@@ -510,6 +513,7 @@ func TestRollupNewRollupFuncSuccess(t *testing.T) {
 	f("sum2_over_time", 37951)
 	f("geomean_over_time", 39.33466603189148)
 	f("count_over_time", 12)
+	f("stale_samples_over_time", 0)
 	f("stddev_over_time", 30.752935722554287)
 	f("stdvar_over_time", 945.7430555555555)
 	f("first_over_time", 123)
@@ -524,6 +528,7 @@ func TestRollupNewRollupFuncSuccess(t *testing.T) {
 	f("descent_over_time", 231)
 	f("zscore_over_time", -0.4254336383156416)
 	f("timestamp", 0.13)
+	f("timestamp_with_name", 0.13)
 	f("mode_over_time", 34)
 	f("rate_over_sum", 4520)
 }
@@ -850,6 +855,20 @@ func TestRollupFuncsNoWindow(t *testing.T) {
 		timestampsExpected := []int64{0, 40, 80, 120, 160}
 		testRowsEqual(t, values, rc.Timestamps, valuesExpected, timestampsExpected)
 	})
+	t.Run("delta_prometheus", func(t *testing.T) {
+		rc := rollupConfig{
+			Func:   rollupDeltaPrometheus,
+			Start:  0,
+			End:    160,
+			Step:   40,
+			Window: 0,
+		}
+		rc.Timestamps = getTimestamps(rc.Start, rc.End, rc.Step)
+		values := rc.Do(nil, testValues, testTimestamps)
+		valuesExpected := []float64{nan, -102, -42, -10, nan}
+		timestampsExpected := []int64{0, 40, 80, 120, 160}
+		testRowsEqual(t, values, rc.Timestamps, valuesExpected, timestampsExpected)
+	})
 	t.Run("idelta", func(t *testing.T) {
 		rc := rollupConfig{
 			Func:   rollupIdelta,
@@ -945,6 +964,20 @@ func TestRollupFuncsNoWindow(t *testing.T) {
 		rc.Timestamps = getTimestamps(rc.Start, rc.End, rc.Step)
 		values := rc.Do(nil, testValues, testTimestamps)
 		valuesExpected := []float64{nan, 4, 4, 3, 0}
+		timestampsExpected := []int64{0, 40, 80, 120, 160}
+		testRowsEqual(t, values, rc.Timestamps, valuesExpected, timestampsExpected)
+	})
+	t.Run("changes_prometheus", func(t *testing.T) {
+		rc := rollupConfig{
+			Func:   rollupChangesPrometheus,
+			Start:  0,
+			End:    160,
+			Step:   40,
+			Window: 0,
+		}
+		rc.Timestamps = getTimestamps(rc.Start, rc.End, rc.Step)
+		values := rc.Do(nil, testValues, testTimestamps)
+		valuesExpected := []float64{nan, 3, 3, 2, 0}
 		timestampsExpected := []int64{0, 40, 80, 120, 160}
 		testRowsEqual(t, values, rc.Timestamps, valuesExpected, timestampsExpected)
 	})
