@@ -1,6 +1,11 @@
 name: main
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to release
+        required: true
+        type: string
 jobs:
   build:
     name: Build
@@ -30,8 +35,8 @@ jobs:
           # This token is provided by Actions, you do not need to create your own token
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{github.ref}}
-          release_name: ${{github.ref}}
+          tag_name: ${{inputs.tag}}
+          release_name: ${{inputs.tag}}
 
       - name: Upload linux-arm
         uses: actions/upload-release-asset@v1
