@@ -40,7 +40,7 @@ type Server struct {
 // MustStop must be called on the returned server when it is no longer needed.
 func MustStart(addr string, insertHandler func(r io.Reader) error) *Server {
 	logger.Infof("starting TCP Graphite server at %q", addr)
-	lnTCP, err := netutil.NewTCPListener("graphite", addr)
+	lnTCP, err := netutil.NewTCPListener("graphite", addr, nil)
 	if err != nil {
 		logger.Fatalf("cannot start TCP Graphite server at %q: %s", addr, err)
 	}
@@ -135,7 +135,7 @@ func (s *Server) serveUDP(insertHandler func(r io.Reader) error) {
 		go func() {
 			defer wg.Done()
 			var bb bytesutil.ByteBuffer
-			bb.B = bytesutil.ResizeNoCopy(bb.B, 64*1024)
+			bb.B = bytesutil.ResizeNoCopyNoOverallocate(bb.B, 64*1024)
 			for {
 				bb.Reset()
 				bb.B = bb.B[:cap(bb.B)]

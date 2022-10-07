@@ -1,6 +1,7 @@
 package vminsert
 
 import (
+	"embed"
 	"flag"
 	"fmt"
 	"net/http"
@@ -20,6 +21,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/promremotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/vmimport"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/influxutils"
 	graphiteserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/graphite"
@@ -27,6 +30,7 @@ import (
 	opentsdbserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/opentsdb"
 	opentsdbhttpserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/opentsdbhttp"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -36,7 +40,7 @@ import (
 
 var (
 	graphiteListenAddr = flag.String("graphiteListenAddr", "", "TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty")
-	influxListenAddr   = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8189 must be set. Doesn't work if empty. "+
+	influxListenAddr   = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8089 must be set. Doesn't work if empty. "+
 		"This flag isn't needed when ingesting data over HTTP - just send it to http://<victoriametrics>:8428/write")
 	opentsdbListenAddr = flag.String("opentsdbListenAddr", "", "TCP and UDP address to listen for OpentTSDB metrics. "+
 		"Telnet put messages and HTTP /api/put messages are simultaneously served on TCP port. "+
@@ -53,6 +57,11 @@ var (
 	opentsdbServer     *opentsdbserver.Server
 	opentsdbhttpServer *opentsdbhttpserver.Server
 )
+
+//go:embed static
+var staticFiles embed.FS
+
+var staticServer = http.FileServer(http.FS(staticFiles))
 
 // Init initializes vminsert.
 func Init() {
@@ -73,7 +82,9 @@ func Init() {
 	if len(*opentsdbHTTPListenAddr) > 0 {
 		opentsdbhttpServer = opentsdbhttpserver.MustStart(*opentsdbHTTPListenAddr, opentsdbhttp.InsertHandler)
 	}
-	promscrape.Init(prompush.Push)
+	promscrape.Init(func(at *auth.Token, wr *prompbmarshal.WriteRequest) {
+		prompush.Push(wr)
+	})
 }
 
 // Stop stops vminsert.
@@ -100,6 +111,20 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	defer requestDuration.UpdateDuration(startTime)
 
 	path := strings.Replace(r.URL.Path, "//", "/", -1)
+	if strings.HasPrefix(path, "/static") {
+		staticServer.ServeHTTP(w, r)
+		return true
+	}
+	if strings.HasPrefix(path, "/prometheus/static") {
+		r.URL.Path = strings.TrimPrefix(path, "/prometheus")
+		staticServer.ServeHTTP(w, r)
+		return true
+	}
+	if strings.HasPrefix(path, "/datadog/") {
+		// Trim suffix from paths starting from /datadog/ in order to support legacy DataDog agent.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/2670
+		path = strings.TrimSuffix(path, "/")
+	}
 	switch path {
 	case "/prometheus/api/v1/write", "/api/v1/write":
 		prometheusWriteRequests.Inc()
@@ -148,6 +173,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/influx/write", "/influx/api/v2/write", "/write", "/api/v2/write":
 		influxWriteRequests.Inc()
+		addInfluxResponseHeaders(w)
 		if err := influx.InsertHandlerForHTTP(r); err != nil {
 			influxWriteErrors.Inc()
 			httpserver.Errorf(w, r, "%s", err)
@@ -157,6 +183,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/influx/query", "/query":
 		influxQueryRequests.Inc()
+		addInfluxResponseHeaders(w)
 		influxutils.WriteDatabaseNames(w)
 		return true
 	case "/datadog/api/v1/series":
@@ -184,8 +211,13 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
-	case "/datadog/intake/":
+	case "/datadog/intake":
 		datadogIntakeRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{}`)
+		return true
+	case "/datadog/api/v1/metadata":
+		datadogMetadataRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{}`)
 		return true
@@ -193,11 +225,23 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		promscrapeTargetsRequests.Inc()
 		promscrape.WriteHumanReadableTargetsStatus(w, r)
 		return true
+	case "/prometheus/service-discovery", "/service-discovery":
+		promscrapeServiceDiscoveryRequests.Inc()
+		promscrape.WriteServiceDiscovery(w, r)
+		return true
 	case "/prometheus/api/v1/targets", "/api/v1/targets":
 		promscrapeAPIV1TargetsRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		state := r.FormValue("state")
 		promscrape.WriteAPIV1Targets(w, state)
+		return true
+	case "/prometheus/target_response", "/target_response":
+		promscrapeTargetResponseRequests.Inc()
+		if err := promscrape.WriteTargetResponse(w, r); err != nil {
+			promscrapeTargetResponseErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
 		return true
 	case "/prometheus/config", "/config":
 		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
@@ -211,6 +255,22 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		promscrapeConfigRequests.Inc()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		promscrape.WriteConfigData(w)
+		return true
+	case "/prometheus/api/v1/status/config", "/api/v1/status/config":
+		// See https://prometheus.io/docs/prometheus/latest/querying/api/#config
+		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
+			err := &httpserver.ErrorWithStatusCode{
+				Err:        fmt.Errorf("The provided authKey doesn't match -configAuthKey"),
+				StatusCode: http.StatusUnauthorized,
+			}
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		promscrapeStatusConfigRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		var bb bytesutil.ByteBuffer
+		promscrape.WriteConfigData(&bb)
+		fmt.Fprintf(w, `{"status":"success","data":{"yaml":%q}}`, bb.B)
 		return true
 	case "/prometheus/-/reload", "/-/reload":
 		promscrapeConfigReloadRequests.Inc()
@@ -231,6 +291,12 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		// This is not our link
 		return false
 	}
+}
+
+func addInfluxResponseHeaders(w http.ResponseWriter) {
+	// This is needed for some clients, which expect InfluxDB version header.
+	// See, for example, https://github.com/ntop/ntopng/issues/5449#issuecomment-1005347597
+	w.Header().Set("X-Influxdb-Version", "1.8.0")
 }
 
 var (
@@ -261,12 +327,18 @@ var (
 
 	datadogValidateRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/validate", protocol="datadog"}`)
 	datadogCheckRunRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/check_run", protocol="datadog"}`)
-	datadogIntakeRequests   = metrics.NewCounter(`vm_http_requests_total{path="/datadog/intake/", protocol="datadog"}`)
+	datadogIntakeRequests   = metrics.NewCounter(`vm_http_requests_total{path="/datadog/intake", protocol="datadog"}`)
+	datadogMetadataRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/metadata", protocol="datadog"}`)
 
-	promscrapeTargetsRequests      = metrics.NewCounter(`vm_http_requests_total{path="/targets"}`)
-	promscrapeAPIV1TargetsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/targets"}`)
+	promscrapeTargetsRequests          = metrics.NewCounter(`vm_http_requests_total{path="/targets"}`)
+	promscrapeServiceDiscoveryRequests = metrics.NewCounter(`vm_http_requests_total{path="/service-discovery"}`)
+	promscrapeAPIV1TargetsRequests     = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/targets"}`)
 
-	promscrapeConfigRequests = metrics.NewCounter(`vm_http_requests_total{path="/config"}`)
+	promscrapeTargetResponseRequests = metrics.NewCounter(`vm_http_requests_total{path="/target_response"}`)
+	promscrapeTargetResponseErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/target_response"}`)
+
+	promscrapeConfigRequests       = metrics.NewCounter(`vm_http_requests_total{path="/config"}`)
+	promscrapeStatusConfigRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/status/config"}`)
 
 	promscrapeConfigReloadRequests = metrics.NewCounter(`vm_http_requests_total{path="/-/reload"}`)
 

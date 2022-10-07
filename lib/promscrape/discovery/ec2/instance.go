@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/awsapi"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
 
@@ -16,10 +16,11 @@ func getInstancesLabels(cfg *apiConfig) ([]map[string]string, error) {
 		return nil, err
 	}
 	azMap := getAZMap(cfg)
+	region := cfg.awsConfig.GetRegion()
 	var ms []map[string]string
 	for _, r := range rs {
 		for _, inst := range r.InstanceSet.Items {
-			ms = inst.appendTargetLabels(ms, r.OwnerID, cfg.port, azMap)
+			ms = inst.appendTargetLabels(ms, r.OwnerID, region, cfg.port, azMap)
 		}
 	}
 	return ms, nil
@@ -29,8 +30,9 @@ func getReservations(cfg *apiConfig) ([]Reservation, error) {
 	// See https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeInstances.html
 	var rs []Reservation
 	pageToken := ""
+	instanceFilters := awsapi.GetFiltersQueryString(cfg.instanceFilters)
 	for {
-		data, err := getEC2APIResponse(cfg, "DescribeInstances", cfg.filters, pageToken)
+		data, err := cfg.awsConfig.GetEC2APIResponse("DescribeInstances", instanceFilters, pageToken)
 		if err != nil {
 			return nil, fmt.Errorf("cannot obtain instances: %w", err)
 		}
@@ -133,64 +135,7 @@ func parseInstancesResponse(data []byte) (*InstancesResponse, error) {
 	return &v, nil
 }
 
-func getAZMap(cfg *apiConfig) map[string]string {
-	cfg.azMapLock.Lock()
-	defer cfg.azMapLock.Unlock()
-
-	if cfg.azMap != nil {
-		return cfg.azMap
-	}
-
-	azs, err := getAvailabilityZones(cfg)
-	cfg.azMap = make(map[string]string, len(azs))
-	if err != nil {
-		logger.Warnf("couldn't load availability zones map, so __meta_ec2_availability_zone_id label isn't set: %s", err)
-		return cfg.azMap
-	}
-	for _, az := range azs {
-		cfg.azMap[az.ZoneName] = az.ZoneID
-	}
-	return cfg.azMap
-}
-
-func getAvailabilityZones(cfg *apiConfig) ([]AvailabilityZone, error) {
-	// See https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html
-	data, err := getEC2APIResponse(cfg, "DescribeAvailabilityZones", "", "")
-	if err != nil {
-		return nil, fmt.Errorf("cannot obtain availability zones: %w", err)
-	}
-	azr, err := parseAvailabilityZonesResponse(data)
-	if err != nil {
-		return nil, fmt.Errorf("cannot parse availability zones list: %w", err)
-	}
-	return azr.AvailabilityZoneInfo.Items, nil
-}
-
-// AvailabilityZonesResponse represents the response for https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html
-type AvailabilityZonesResponse struct {
-	AvailabilityZoneInfo AvailabilityZoneInfo `xml:"availabilityZoneInfo"`
-}
-
-// AvailabilityZoneInfo represents availabilityZoneInfo for https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html
-type AvailabilityZoneInfo struct {
-	Items []AvailabilityZone `xml:"item"`
-}
-
-// AvailabilityZone represents availabilityZone for https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_AvailabilityZone.html
-type AvailabilityZone struct {
-	ZoneName string `xml:"zoneName"`
-	ZoneID   string `xml:"zoneId"`
-}
-
-func parseAvailabilityZonesResponse(data []byte) (*AvailabilityZonesResponse, error) {
-	var v AvailabilityZonesResponse
-	if err := xml.Unmarshal(data, &v); err != nil {
-		return nil, fmt.Errorf("cannot unmarshal DescribeAvailabilityZonesResponse from %q: %w", data, err)
-	}
-	return &v, nil
-}
-
-func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string, port int, azMap map[string]string) []map[string]string {
+func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID, region string, port int, azMap map[string]string) []map[string]string {
 	if len(inst.PrivateIPAddress) == 0 {
 		// Cannot scrape instance without private IP address
 		return ms
@@ -213,6 +158,7 @@ func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string,
 		"__meta_ec2_private_ip":           inst.PrivateIPAddress,
 		"__meta_ec2_public_dns_name":      inst.PublicDNSName,
 		"__meta_ec2_public_ip":            inst.PublicIPAddress,
+		"__meta_ec2_region":               region,
 		"__meta_ec2_vpc_id":               inst.VPCID,
 	}
 	if len(inst.VPCID) > 0 {
@@ -242,8 +188,7 @@ func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string,
 		if len(t.Key) == 0 || len(t.Value) == 0 {
 			continue
 		}
-		name := discoveryutils.SanitizeLabelName(t.Key)
-		m["__meta_ec2_tag_"+name] = t.Value
+		m[discoveryutils.SanitizeLabelName("__meta_ec2_tag_"+t.Key)] = t.Value
 	}
 	ms = append(ms, m)
 	return ms

@@ -1,13 +1,13 @@
-import {TimeParams, TimePeriod} from "../types";
+import {RelativeTimeOption, TimeParams, TimePeriod} from "../types";
 import dayjs, {UnitTypeShort} from "dayjs";
 import duration from "dayjs/plugin/duration";
 import utc from "dayjs/plugin/utc";
-import numeral from "numeral";
+import {getQueryStringValue} from "./query-string";
 
 dayjs.extend(duration);
 dayjs.extend(utc);
 
-const MAX_ITEMS_PER_CHART = window.innerWidth / 2;
+const MAX_ITEMS_PER_CHART = window.innerWidth / 4;
 
 export const limitsDurations = {min: 1, max: 1.578e+11}; // min: 1 ms, max: 5 years
 
@@ -26,7 +26,7 @@ export const supportedDurations = [
 
 const shortDurations = supportedDurations.map(d => d.short);
 
-export const roundTimeSeconds = (num: number): number => +(numeral(num).format("0.000"));
+export const roundToMilliseconds = (num: number): number => Math.round(num*1000)/1000;
 
 export const isSupportedDuration = (str: string): Partial<Record<UnitTypeShort, string>> | undefined => {
 
@@ -59,7 +59,7 @@ export const getTimeperiodForDuration = (dur: string, date?: Date): TimeParams =
   }, {});
 
   const delta = dayjs.duration(durObject).asSeconds();
-  const step = roundTimeSeconds(delta / MAX_ITEMS_PER_CHART) || 0.001;
+  const step = roundToMilliseconds(delta / MAX_ITEMS_PER_CHART) || 0.001;
 
   return {
     start: n - delta,
@@ -106,5 +106,39 @@ export const checkDurationLimit = (dur: string): string => {
   return dur;
 };
 
-export const dateFromSeconds = (epochTimeInSeconds: number): Date =>
-  new Date(epochTimeInSeconds * 1000);
+export const dateFromSeconds = (epochTimeInSeconds: number): Date => new Date(epochTimeInSeconds * 1000);
+
+export const relativeTimeOptions: RelativeTimeOption[] = [
+  {title: "Last 5 minutes", duration: "5m"},
+  {title: "Last 15 minutes", duration: "15m"},
+  {title: "Last 30 minutes", duration: "30m", isDefault: true},
+  {title: "Last 1 hour", duration: "1h"},
+  {title: "Last 3 hours", duration: "3h"},
+  {title: "Last 6 hours", duration: "6h"},
+  {title: "Last 12 hours", duration: "12h"},
+  {title: "Last 24 hours", duration: "24h"},
+  {title: "Last 2 days", duration: "2d"},
+  {title: "Last 7 days", duration: "7d"},
+  {title: "Last 30 days", duration: "30d"},
+  {title: "Last 90 days", duration: "90d"},
+  {title: "Last 180 days", duration: "180d"},
+  {title: "Last 1 year", duration: "1y"},
+  {title: "Yesterday", duration: "1d", until: () => dayjs().subtract(1, "day").endOf("day").toDate()},
+  {title: "Today", duration: "1d", until: () => dayjs().endOf("day").toDate()},
+].map(o => ({
+  id: o.title.replace(/\s/g, "_").toLocaleLowerCase(),
+  until: o.until ? o.until : () => dayjs().toDate(),
+  ...o
+}));
+
+export const getRelativeTime = ({relativeTimeId, defaultDuration, defaultEndInput}:
+                                  { relativeTimeId?: string, defaultDuration: string, defaultEndInput: Date }) => {
+  const defaultId = relativeTimeOptions.find(t => t.isDefault)?.id;
+  const id = relativeTimeId || getQueryStringValue("g0.relative_time", defaultId) as string;
+  const target = relativeTimeOptions.find(d => d.id === id);
+  return {
+    relativeTimeId: target ? id : "none",
+    duration: target ? target.duration : defaultDuration,
+    endInput: target ? target.until() : defaultEndInput
+  };
+};

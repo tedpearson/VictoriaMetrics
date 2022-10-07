@@ -67,7 +67,7 @@ func (op *otsdbProcessor) run(silent, verbose bool) error {
 		queryRanges += len(rt.QueryRanges)
 	}
 	for _, metric := range metrics {
-		log.Println(fmt.Sprintf("Starting work on %s", metric))
+		log.Printf("Starting work on %s", metric)
 		serieslist, err := op.oc.FindSeries(metric)
 		if err != nil {
 			return fmt.Errorf("couldn't retrieve series list for %s : %s", metric, err)
@@ -82,6 +82,9 @@ func (op *otsdbProcessor) run(silent, verbose bool) error {
 		errCh := make(chan error)
 		// we're going to make serieslist * queryRanges queries, so we should represent that in the progress bar
 		bar := pb.StartNew(len(serieslist) * queryRanges)
+		defer func(bar *pb.ProgressBar) {
+			bar.Finish()
+		}(bar)
 		var wg sync.WaitGroup
 		wg.Add(op.otsdbcc)
 		for i := 0; i < op.otsdbcc; i++ {
@@ -120,6 +123,7 @@ func (op *otsdbProcessor) run(silent, verbose bool) error {
 				}
 			}
 		}
+
 		// Drain channels per metric
 		close(seriesCh)
 		wg.Wait()
@@ -156,11 +160,14 @@ func (op *otsdbProcessor) do(s queryObj) error {
 	for k, v := range data.Tags {
 		labels = append(labels, vm.LabelPair{Name: k, Value: v})
 	}
-	op.im.Input() <- &vm.TimeSeries{
+	ts := vm.TimeSeries{
 		Name:       data.Metric,
 		LabelPairs: labels,
 		Timestamps: data.Timestamps,
 		Values:     data.Values,
+	}
+	if err := op.im.Input(&ts); err != nil {
+		return err
 	}
 	return nil
 }

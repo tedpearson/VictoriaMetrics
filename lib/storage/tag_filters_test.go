@@ -185,7 +185,7 @@ func TestConvertToCompositeTagFilters(t *testing.T) {
 				IsRegexp:   false,
 			},
 			{
-				Key:        []byte("\xfe\x03barfoo"),
+				Key:        []byte("foo"),
 				Value:      []byte("abc"),
 				IsNegative: true,
 				IsRegexp:   false,
@@ -588,21 +588,7 @@ func TestConvertToCompositeTagFilters(t *testing.T) {
 				IsRegexp:   true,
 			},
 			{
-				Key:        []byte("\xfe\x03barfoo"),
-				Value:      []byte("abc"),
-				IsNegative: true,
-				IsRegexp:   false,
-			},
-		},
-		{
-			{
-				Key:        nil,
-				Value:      []byte("bar|foo"),
-				IsNegative: false,
-				IsRegexp:   true,
-			},
-			{
-				Key:        []byte("\xfe\x03foofoo"),
+				Key:        []byte("foo"),
 				Value:      []byte("abc"),
 				IsNegative: true,
 				IsRegexp:   false,
@@ -689,26 +675,11 @@ func TestGetCommonPrefix(t *testing.T) {
 	f([]string{"foo1", "foo2", "foo34"}, "foo")
 }
 
-func TestExtractRegexpPrefix(t *testing.T) {
-	f := func(s string, expectedPrefix, expectedSuffix string) {
-		t.Helper()
-		prefix, suffix := extractRegexpPrefix([]byte(s))
-		if string(prefix) != expectedPrefix {
-			t.Fatalf("unexpected prefix for %q; got %q; want %q", s, prefix, expectedPrefix)
-		}
-		if string(suffix) != expectedSuffix {
-			t.Fatalf("unexpected suffix for %q; got %q; want %q", s, suffix, expectedSuffix)
-		}
-	}
-	f("", "", "")
-	f("foobar", "foobar", "")
-}
-
 func TestGetRegexpFromCache(t *testing.T) {
 	f := func(s string, orValuesExpected, expectedMatches, expectedMismatches []string, suffixExpected string) {
 		t.Helper()
 		for i := 0; i < 3; i++ {
-			rcv, err := getRegexpFromCache([]byte(s))
+			rcv, err := getRegexpFromCache(s)
 			if err != nil {
 				t.Fatalf("unexpected error for s=%q: %s", s, err)
 			}
@@ -778,7 +749,7 @@ func TestTagFilterMatchSuffix(t *testing.T) {
 	var tf tagFilter
 
 	tvNoTrailingTagSeparator := func(s string) string {
-		return string(marshalTagValueNoTrailingTagSeparator(nil, []byte(s)))
+		return string(marshalTagValueNoTrailingTagSeparator(nil, s))
 	}
 	init := func(value string, isNegative, isRegexp bool, expectedPrefix string) {
 		t.Helper()
@@ -1159,108 +1130,75 @@ func TestTagFilterMatchSuffix(t *testing.T) {
 	})
 }
 
-func TestGetOrValues(t *testing.T) {
-	f := func(s string, valuesExpected []string) {
-		t.Helper()
-		values := getOrValues(s)
-		if !reflect.DeepEqual(values, valuesExpected) {
-			t.Fatalf("unexpected values for s=%q; got %q; want %q", s, values, valuesExpected)
-		}
-	}
-
-	f("", []string{""})
-	f("|foo", []string{"", "foo"})
-	f("|foo|", []string{"", "", "foo"})
-	f("foo.+", nil)
-	f("foo.*", nil)
-	f(".*", nil)
-	f("foo|.*", nil)
-	f("foobar", []string{"foobar"})
-	f("z|x|c", []string{"c", "x", "z"})
-	f("foo|bar", []string{"bar", "foo"})
-	f("(foo|bar)", []string{"bar", "foo"})
-	f("(foo|bar)baz", []string{"barbaz", "foobaz"})
-	f("[a-z]", nil)
-	f("[a-d]", []string{"a", "b", "c", "d"})
-	f("x[a-d]we", []string{"xawe", "xbwe", "xcwe", "xdwe"})
-	f("foo(bar|baz)", []string{"foobar", "foobaz"})
-	f("foo(ba[rz]|(xx|o))", []string{"foobar", "foobaz", "fooo", "fooxx"})
-	f("foo(?:bar|baz)x(qwe|rt)", []string{"foobarxqwe", "foobarxrt", "foobazxqwe", "foobazxrt"})
-	f("foo(bar||baz)", []string{"foo", "foobar", "foobaz"})
-	f("(a|b|c)(d|e|f)(g|h|k)", nil)
-	f("(?i)foo", nil)
-	f("(?i)(foo|bar)", nil)
-}
-
-func TestGetRegexpPrefix(t *testing.T) {
-	f := func(t *testing.T, s, expectedPrefix, expectedSuffix string) {
+func TestSimplifyRegexp(t *testing.T) {
+	f := func(s, expectedPrefix, expectedSuffix string) {
 		t.Helper()
 
-		prefix, suffix := getRegexpPrefix([]byte(s))
-		if string(prefix) != expectedPrefix {
+		prefix, suffix := simplifyRegexp(s)
+		if prefix != expectedPrefix {
 			t.Fatalf("unexpected prefix for s=%q; got %q; want %q", s, prefix, expectedPrefix)
 		}
-		if string(suffix) != expectedSuffix {
+		if suffix != expectedSuffix {
 			t.Fatalf("unexpected suffix for s=%q; got %q; want %q", s, suffix, expectedSuffix)
 		}
 
 		// Get the prefix from cache.
-		prefix, suffix = getRegexpPrefix([]byte(s))
-		if string(prefix) != expectedPrefix {
+		prefix, suffix = simplifyRegexp(s)
+		if prefix != expectedPrefix {
 			t.Fatalf("unexpected prefix for s=%q; got %q; want %q", s, prefix, expectedPrefix)
 		}
-		if string(suffix) != expectedSuffix {
+		if suffix != expectedSuffix {
 			t.Fatalf("unexpected suffix for s=%q; got %q; want %q", s, suffix, expectedSuffix)
 		}
 	}
 
-	f(t, "", "", "")
-	f(t, "^", "", "")
-	f(t, "$", "", "")
-	f(t, "^()$", "", "")
-	f(t, "^(?:)$", "", "")
-	f(t, "foobar", "foobar", "")
-	f(t, "foo$|^foobar", "foo", "(?:(?:)|bar)")
-	f(t, "^(foo$|^foobar)$", "foo", "(?:(?:)|bar)")
-	f(t, "foobar|foobaz", "fooba", "[rz]")
-	f(t, "(fo|(zar|bazz)|x)", "", "fo|zar|bazz|x")
-	f(t, "(тестЧЧ|тест)", "тест", "(?:ЧЧ|(?:))")
-	f(t, "foo(bar|baz|bana)", "fooba", "(?:[rz]|na)")
-	f(t, "^foobar|foobaz", "fooba", "[rz]")
-	f(t, "^foobar|^foobaz$", "fooba", "[rz]")
-	f(t, "foobar|foobaz", "fooba", "[rz]")
-	f(t, "(?:^foobar|^foobaz)aa.*", "fooba", "[rz]aa(?-s:.)*")
-	f(t, "foo[bar]+", "foo", "[a-br]+")
-	f(t, "foo[a-z]+", "foo", "[a-z]+")
-	f(t, "foo[bar]*", "foo", "[a-br]*")
-	f(t, "foo[a-z]*", "foo", "[a-z]*")
-	f(t, "foo[x]+", "foo", "x+")
-	f(t, "foo[^x]+", "foo", "[^x]+")
-	f(t, "foo[x]*", "foo", "x*")
-	f(t, "foo[^x]*", "foo", "[^x]*")
-	f(t, "foo[x]*bar", "foo", "x*bar")
-	f(t, "fo\\Bo[x]*bar?", "fo", "\\Box*bar?")
-	f(t, "foo.+bar", "foo", "(?-s:.)+bar")
-	f(t, "a(b|c.*).+", "a", "(?:b|c(?-s:.)*)(?-s:.)+")
-	f(t, "ab|ac", "a", "[b-c]")
-	f(t, "(?i)xyz", "", "(?i:XYZ)")
-	f(t, "(?i)foo|bar", "", "(?i:FOO)|(?i:BAR)")
-	f(t, "(?i)up.+x", "", "(?i:UP)(?-s:.)+(?i:X)")
-	f(t, "(?smi)xy.*z$", "", "(?i:XY)(?s:.)*(?i:Z)(?m:$)")
+	f("", "", "")
+	f("^", "", "")
+	f("$", "", "")
+	f("^()$", "", "")
+	f("^(?:)$", "", "")
+	f("foobar", "foobar", "")
+	f("foo$|^foobar", "foo", "|bar")
+	f("^(foo$|^foobar)$", "foo", "|bar")
+	f("foobar|foobaz", "fooba", "[rz]")
+	f("(fo|(zar|bazz)|x)", "", "fo|zar|bazz|x")
+	f("(тестЧЧ|тест)", "тест", "ЧЧ|")
+	f("foo(bar|baz|bana)", "fooba", "[rz]|na")
+	f("^foobar|foobaz", "fooba", "[rz]")
+	f("^foobar|^foobaz$", "fooba", "[rz]")
+	f("foobar|foobaz", "fooba", "[rz]")
+	f("(?:^foobar|^foobaz)aa.*", "fooba", "[rz]aa.*")
+	f("foo[bar]+", "foo", "[a-br]+")
+	f("foo[a-z]+", "foo", "[a-z]+")
+	f("foo[bar]*", "foo", "[a-br]*")
+	f("foo[a-z]*", "foo", "[a-z]*")
+	f("foo[x]+", "foo", "x+")
+	f("foo[^x]+", "foo", "[^x]+")
+	f("foo[x]*", "foo", "x*")
+	f("foo[^x]*", "foo", "[^x]*")
+	f("foo[x]*bar", "foo", "x*bar")
+	f("fo\\Bo[x]*bar?", "fo", "\\Box*bar?")
+	f("foo.+bar", "foo", ".+bar")
+	f("a(b|c.*).+", "a", "(?:b|c.*).+")
+	f("ab|ac", "a", "[b-c]")
+	f("(?i)xyz", "", "(?i:XYZ)")
+	f("(?i)foo|bar", "", "(?i:FOO)|(?i:BAR)")
+	f("(?i)up.+x", "", "(?i:UP).+(?i:X)")
+	f("(?smi)xy.*z$", "", "(?i:XY)(?s:.)*(?i:Z)(?m:$)")
 
 	// test invalid regexps
-	f(t, "a(", "a(", "")
-	f(t, "a[", "a[", "")
-	f(t, "a[]", "a[]", "")
-	f(t, "a{", "a{", "")
-	f(t, "a{}", "a{}", "")
-	f(t, "invalid(regexp", "invalid(regexp", "")
+	f("a(", "a(", "")
+	f("a[", "a[", "")
+	f("a[]", "a[]", "")
+	f("a{", "a{", "")
+	f("a{}", "a{}", "")
+	f("invalid(regexp", "invalid(regexp", "")
 
 	// The transformed regexp mustn't match aba
-	f(t, "a?(^ba|c)", "", "a?(?:\\Aba|c)")
+	f("a?(^ba|c)", "", "a?(?:\\Aba|c)")
 
 	// The transformed regexp mustn't match barx
-	f(t, "(foo|bar$)x*", "", "(?:foo|bar(?-m:$))x*")
+	f("(foo|bar$)x*", "", "(?:foo|bar$)x*")
 }
 
 func TestTagFiltersString(t *testing.T) {
@@ -1277,7 +1215,7 @@ func TestTagFiltersString(t *testing.T) {
 	mustAdd("tag_n", "n_value", true, false)
 	mustAdd("tag_re_graphite", "foo\\.bar", false, true)
 	s := tfs.String()
-	sExpected := `{__name__="metric_name", tag_re=~"re.value", tag_nre!~"nre.value", tag_n!="n_value", tag_re_graphite="foo.bar"}`
+	sExpected := `{__name__="metric_name",tag_re=~"re.value",tag_nre!~"nre.value",tag_n!="n_value",tag_re_graphite="foo.bar"}`
 	if s != sExpected {
 		t.Fatalf("unexpected TagFilters.String(); got %q; want %q", s, sExpected)
 	}

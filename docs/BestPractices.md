@@ -1,9 +1,8 @@
 ---
-sort: 19
+sort: 20
 ---
 
 # VictoriaMetrics best practices
-
 
 ## Install Recommendation
 
@@ -11,17 +10,15 @@ It is recommended running the latest available release of VictoriaMetrics from [
 
 There is no need to tune VictoriaMetrics because it uses reasonable defaults for command-line flags.  These flags are automatically adjusted for the available CPU and RAM resources. There is no need in Operating System tuning because VictoriaMetrics is optimized for default OS settings. The only option is to increase the limit on the [number of open files in the OS](https://medium.com/@muhammadtriwibowo/set-permanently-ulimit-n-open-files-in-ubuntu-4d61064429a), so VictoriaMetrics could accept more incoming connections and could keep open more data files.
 
-
 ## Filesystem
 
 The recommended filesystem for VictoriaMetrics is [ext4](https://en.wikipedia.org/wiki/Ext4). If you plan to store more than 1TB of data on ext4 partition or plan to extend it to more than 16TB, then the following options are recommended to pass to mkfs.ext4:
 
-```
+```sh
 mkfs.ext4 ... -O 64bit,huge_file,extent -T huge
 ```
 
-VictoriaMetrics should work OK with other filesystems, including network filesystems such as [NFS](https://en.wikipedia.org/wiki/Network_File_System), [Amazon EFS](https://aws.amazon.com/efs/) and [Google Filestore](https://cloud.google.com/filestore).
-
+VictoriaMetrics should work OK with other filesystems too.
 
 ## Operation System
 
@@ -30,11 +27,20 @@ VictoriaMetrics is production-ready for the following operating systems:
 * Linux (Alpine, Ubuntu, Debian, RedHat, etc.)
 * FreeBSD
 * OpenBSD
+* Solaris/SmartOS
 
 Some VictoriaMetrics components ([vmagent](https://docs.victoriametrics.com/vmagent.html), [vmalert](https://docs.victoriametrics.com/vmalert.html) and [vmauth](https://docs.victoriametrics.com/vmauth.html)) can run on Windows.
 
 VictoriaMetrics can run also on MacOS for testing and development purposes.
 
+## Supported Architectures
+
+* **Linux**: i386, amd64, arm, arm64, ppc64le
+* **FreeBSD**: i386, amd64, arm
+* **OpenBSD**: i386, amd64, arm
+* **Solaris/SmartOS**: i386, amd64
+* **MacOS**: amd64, arm64 (for testing and development purposes)
+* **Windows**: amd64 (supported by [vmagent](https://docs.victoriametrics.com/vmagent.html), [vmalert](https://docs.victoriametrics.com/vmalert.html) and [vmauth](https://docs.victoriametrics.com/vmauth.html)).
 
 ## Upgrade procedure
 
@@ -48,11 +54,9 @@ The following steps must be performed during the upgrade / downgrade procedure:
 * Wait until the process stops. This can take a few seconds.
 * Start the upgraded VictoriaMetrics.
 
-
 ## Backup Recommendations
 
 VictoriaMetrics supports backups via [vmbackup](https://docs.victoriametrics.com/vmbackup.html) and [vmrestore](https://docs.victoriametrics.com/vmrestore.html) tools. There is also [vmbackupmanager](https://docs.victoriametrics.com/vmbackupmanager.html), which simplifies backup automation.
-
 
 ## Technical Support and Services
 

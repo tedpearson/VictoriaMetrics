@@ -4,35 +4,30 @@ import (
 	"crypto/md5"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v2"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // Group contains list of Rules grouped into
 // entity with one name and evaluation interval
 type Group struct {
-	Type        datasource.Type `yaml:"type,omitempty"`
+	Type        Type `yaml:"type,omitempty"`
 	File        string
-	Name        string             `yaml:"name"`
-	Interval    utils.PromDuration `yaml:"interval"`
-	Rules       []Rule             `yaml:"rules"`
-	Concurrency int                `yaml:"concurrency"`
-	// ExtraFilterLabels is a list label filters applied to every rule
-	// request withing a group. Is compatible only with VM datasources.
-	// See https://docs.victoriametrics.com#prometheus-querying-api-enhancements
-	// DEPRECATED: use Params field instead
-	ExtraFilterLabels map[string]string `yaml:"extra_filter_labels"`
+	Name        string              `yaml:"name"`
+	Interval    *promutils.Duration `yaml:"interval,omitempty"`
+	Limit       int                 `yaml:"limit,omitempty"`
+	Rules       []Rule              `yaml:"rules"`
+	Concurrency int                 `yaml:"concurrency"`
 	// Labels is a set of label value pairs, that will be added to every rule.
 	// It has priority over the external labels.
 	Labels map[string]string `yaml:"labels"`
@@ -41,6 +36,8 @@ type Group struct {
 	Checksum string
 	// Optional HTTP URL parameters added to each rule request
 	Params url.Values `yaml:"params"`
+	// Headers contains optional HTTP headers added to each rule request
+	Headers []Header `yaml:"headers,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
@@ -58,23 +55,7 @@ func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 	// change default value to prometheus datasource.
 	if g.Type.Get() == "" {
-		g.Type.Set(datasource.NewPrometheusType())
-	}
-
-	// backward compatibility with deprecated `ExtraFilterLabels` param
-	if len(g.ExtraFilterLabels) > 0 {
-		if g.Params == nil {
-			g.Params = url.Values{}
-		}
-		// Sort extraFilters for consistent order for query args across runs.
-		extraFilters := make([]string, 0, len(g.ExtraFilterLabels))
-		for k, v := range g.ExtraFilterLabels {
-			extraFilters = append(extraFilters, fmt.Sprintf("%s=%s", k, v))
-		}
-		sort.Strings(extraFilters)
-		for _, extraFilter := range extraFilters {
-			g.Params.Add("extra_label", extraFilter)
-		}
+		g.Type.Set(NewPrometheusType())
 	}
 
 	h := md5.New()
@@ -84,7 +65,7 @@ func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // Validate check for internal Group or Rule configuration errors
-func (g *Group) Validate(validateAnnotations, validateExpressions bool) error {
+func (g *Group) Validate(validateTplFn ValidateTplFn, validateExpressions bool) error {
 	if g.Name == "" {
 		return fmt.Errorf("group name must be set")
 	}
@@ -96,7 +77,7 @@ func (g *Group) Validate(validateAnnotations, validateExpressions bool) error {
 			ruleName = r.Alert
 		}
 		if _, ok := uniqueRules[r.ID]; ok {
-			return fmt.Errorf("rule %q duplicate", ruleName)
+			return fmt.Errorf("%q is a duplicate within the group %q", r.String(), g.Name)
 		}
 		uniqueRules[r.ID] = struct{}{}
 		if err := r.Validate(); err != nil {
@@ -110,11 +91,11 @@ func (g *Group) Validate(validateAnnotations, validateExpressions bool) error {
 				return fmt.Errorf("invalid expression for rule %q.%q: %w", g.Name, ruleName, err)
 			}
 		}
-		if validateAnnotations {
-			if err := notifier.ValidateTemplates(r.Annotations); err != nil {
+		if validateTplFn != nil {
+			if err := validateTplFn(r.Annotations); err != nil {
 				return fmt.Errorf("invalid annotations for rule %q.%q: %w", g.Name, ruleName, err)
 			}
-			if err := notifier.ValidateTemplates(r.Labels); err != nil {
+			if err := validateTplFn(r.Labels); err != nil {
 				return fmt.Errorf("invalid labels for rule %q.%q: %w", g.Name, ruleName, err)
 			}
 		}
@@ -126,12 +107,13 @@ func (g *Group) Validate(validateAnnotations, validateExpressions bool) error {
 // recording rule or alerting rule.
 type Rule struct {
 	ID          uint64
-	Record      string             `yaml:"record,omitempty"`
-	Alert       string             `yaml:"alert,omitempty"`
-	Expr        string             `yaml:"expr"`
-	For         utils.PromDuration `yaml:"for"`
-	Labels      map[string]string  `yaml:"labels,omitempty"`
-	Annotations map[string]string  `yaml:"annotations,omitempty"`
+	Record      string              `yaml:"record,omitempty"`
+	Alert       string              `yaml:"alert,omitempty"`
+	Expr        string              `yaml:"expr"`
+	For         *promutils.Duration `yaml:"for,omitempty"`
+	Labels      map[string]string   `yaml:"labels,omitempty"`
+	Annotations map[string]string   `yaml:"annotations,omitempty"`
+	Debug       bool                `yaml:"debug,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
@@ -153,6 +135,32 @@ func (r *Rule) Name() string {
 		return r.Record
 	}
 	return r.Alert
+}
+
+// String implements Stringer interface
+func (r *Rule) String() string {
+	ruleType := "recording"
+	if r.Alert != "" {
+		ruleType = "alerting"
+	}
+	b := strings.Builder{}
+	b.WriteString(fmt.Sprintf("%s rule %q", ruleType, r.Name()))
+	b.WriteString(fmt.Sprintf("; expr: %q", r.Expr))
+
+	kv := sortMap(r.Labels)
+	for i := range kv {
+		if i == 0 {
+			b.WriteString("; labels:")
+		}
+		b.WriteString(" ")
+		b.WriteString(kv[i].key)
+		b.WriteString("=")
+		b.WriteString(kv[i].value)
+		if i < len(kv)-1 {
+			b.WriteString(",")
+		}
+	}
+	return b.String()
 }
 
 // HashRule hashes significant Rule fields into
@@ -187,8 +195,11 @@ func (r *Rule) Validate() error {
 	return checkOverflow(r.XXX, "rule")
 }
 
+// ValidateTplFn must validate the given annotations
+type ValidateTplFn func(annotations map[string]string) error
+
 // Parse parses rule configs from given file patterns
-func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool) ([]Group, error) {
+func Parse(pathPatterns []string, validateTplFn ValidateTplFn, validateExpressions bool) ([]Group, error) {
 	var fp []string
 	for _, pattern := range pathPatterns {
 		matches, err := filepath.Glob(pattern)
@@ -198,7 +209,6 @@ func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool)
 		fp = append(fp, matches...)
 	}
 	errGroup := new(utils.ErrGroup)
-	var isExtraFilterLabelsUsed bool
 	var groups []Group
 	for _, file := range fp {
 		uniqueGroups := map[string]struct{}{}
@@ -208,7 +218,7 @@ func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool)
 			continue
 		}
 		for _, g := range gr {
-			if err := g.Validate(validateAnnotations, validateExpressions); err != nil {
+			if err := g.Validate(validateTplFn, validateExpressions); err != nil {
 				errGroup.Add(fmt.Errorf("invalid group %q in file %q: %w", g.Name, file, err))
 				continue
 			}
@@ -218,9 +228,6 @@ func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool)
 			}
 			uniqueGroups[g.Name] = struct{}{}
 			g.File = file
-			if len(g.ExtraFilterLabels) > 0 {
-				isExtraFilterLabelsUsed = true
-			}
 			groups = append(groups, g)
 		}
 	}
@@ -230,14 +237,11 @@ func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool)
 	if len(groups) < 1 {
 		logger.Warnf("no groups found in %s", strings.Join(pathPatterns, ";"))
 	}
-	if isExtraFilterLabelsUsed {
-		logger.Warnf("field `extra_filter_labels` is deprecated - use `params` instead")
-	}
 	return groups, nil
 }
 
 func parseFile(path string) ([]Group, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error reading alert rule file: %w", err)
 	}

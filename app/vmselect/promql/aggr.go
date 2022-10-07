@@ -11,7 +11,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
-	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/cespare/xxhash/v2"
 )
 
 var aggrFuncs = map[string]aggrFunc{
@@ -104,6 +104,9 @@ func removeGroupTags(metricName *storage.MetricName, modifier *metricsql.Modifie
 
 func aggrFuncExt(afe func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries, argOrig []*timeseries,
 	modifier *metricsql.ModifierExpr, maxSeries int, keepOriginal bool) ([]*timeseries, error) {
+	// Remove empty time series, e.g. series with all NaN samples,
+	// since such series are ignored by aggregate functions.
+	argOrig = removeEmptySeries(argOrig)
 	arg := copyTimeseriesMetricNames(argOrig, keepOriginal)
 
 	// Perform grouping.
@@ -619,7 +622,7 @@ func newAggrFuncTopK(isReverse bool) aggrFunc {
 				})
 				fillNaNsAtIdx(n, ks[n], tss)
 			}
-			tss = removeNaNs(tss)
+			tss = removeEmptySeries(tss)
 			reverseSeries(tss)
 			return tss
 		}
@@ -686,7 +689,7 @@ func getRangeTopKTimeseries(tss []*timeseries, modifier *metricsql.ModifierExpr,
 	if remainingSumTS != nil {
 		tss = append(tss, remainingSumTS)
 	}
-	tss = removeNaNs(tss)
+	tss = removeEmptySeries(tss)
 	reverseSeries(tss)
 	return tss
 }

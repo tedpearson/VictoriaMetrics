@@ -72,12 +72,13 @@ var rollupFuncs = map[string]bool{
 	// `timestamp` function must return timestamp for the last datapoint on the current window
 	// in order to properly handle offset and timestamps unaligned to the current step.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/415 for details.
-	"timestamp":           true,
-	"timestamp_with_name": true,
-	"tlast_over_time":     true,
-	"tmax_over_time":      true,
-	"tmin_over_time":      true,
-	"zscore_over_time":    true,
+	"timestamp":              true,
+	"timestamp_with_name":    true,
+	"tlast_change_over_time": true,
+	"tlast_over_time":        true,
+	"tmax_over_time":         true,
+	"tmin_over_time":         true,
+	"zscore_over_time":       true,
 }
 
 // IsRollupFunc returns whether funcName is known rollup function.
@@ -90,8 +91,7 @@ func IsRollupFunc(funcName string) bool {
 //
 // -1 is returned if fe isn't a rollup function.
 func GetRollupArgIdx(fe *FuncExpr) int {
-	funcName := fe.Name
-	funcName = strings.ToLower(funcName)
+	funcName := strings.ToLower(fe.Name)
 	if !rollupFuncs[funcName] {
 		return -1
 	}

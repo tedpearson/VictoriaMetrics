@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/fasthttp"
 	"github.com/VictoriaMetrics/metrics"
@@ -46,57 +46,69 @@ type client struct {
 
 	scrapeURL               string
 	scrapeTimeoutSecondsStr string
-	host                    string
+	hostPort                string
 	requestURI              string
-	getAuthHeader           func() string
-	getProxyAuthHeader      func() string
+	setHeaders              func(req *http.Request)
+	setProxyHeaders         func(req *http.Request)
+	setFasthttpHeaders      func(req *fasthttp.Request)
+	setFasthttpProxyHeaders func(req *fasthttp.Request)
 	denyRedirects           bool
 	disableCompression      bool
 	disableKeepAlive        bool
 }
 
+func addMissingPort(addr string, isTLS bool) string {
+	if strings.Contains(addr, ":") {
+		return addr
+	}
+	if isTLS {
+		return addr + ":443"
+	}
+	return addr + ":80"
+}
+
 func newClient(sw *ScrapeWork) *client {
 	var u fasthttp.URI
 	u.Update(sw.ScrapeURL)
-	host := string(u.Host())
+	hostPort := string(u.Host())
+	dialAddr := hostPort
 	requestURI := string(u.RequestURI())
 	isTLS := string(u.Scheme()) == "https"
 	var tlsCfg *tls.Config
 	if isTLS {
 		tlsCfg = sw.AuthConfig.NewTLSConfig()
 	}
-	getProxyAuthHeader := func() string { return "" }
+	setProxyHeaders := func(req *http.Request) {}
+	setFasthttpProxyHeaders := func(req *fasthttp.Request) {}
 	proxyURL := sw.ProxyURL
 	if !isTLS && proxyURL.IsHTTPOrHTTPS() {
 		// Send full sw.ScrapeURL in requests to a proxy host for non-TLS scrape targets
 		// like net/http package from Go does.
 		// See https://en.wikipedia.org/wiki/Proxy_server#Web_proxy_servers
-		pu := proxyURL.URL()
-		host = pu.Host
+		pu := proxyURL.GetURL()
+		dialAddr = pu.Host
 		requestURI = sw.ScrapeURL
 		isTLS = pu.Scheme == "https"
 		if isTLS {
 			tlsCfg = sw.ProxyAuthConfig.NewTLSConfig()
 		}
 		proxyURLOrig := proxyURL
-		getProxyAuthHeader = func() string {
-			return proxyURLOrig.GetAuthHeader(sw.ProxyAuthConfig)
+		setProxyHeaders = func(req *http.Request) {
+			proxyURLOrig.SetHeaders(sw.ProxyAuthConfig, req)
+		}
+		setFasthttpProxyHeaders = func(req *fasthttp.Request) {
+			proxyURLOrig.SetFasthttpHeaders(sw.ProxyAuthConfig, req)
 		}
 		proxyURL = &proxy.URL{}
 	}
-	if !strings.Contains(host, ":") {
-		if !isTLS {
-			host += ":80"
-		} else {
-			host += ":443"
-		}
-	}
+	hostPort = addMissingPort(hostPort, isTLS)
+	dialAddr = addMissingPort(dialAddr, isTLS)
 	dialFunc, err := newStatDialFunc(proxyURL, sw.ProxyAuthConfig)
 	if err != nil {
 		logger.Fatalf("cannot create dial func: %s", err)
 	}
 	hc := &fasthttp.HostClient{
-		Addr:                         host,
+		Addr:                         dialAddr,
 		Name:                         "vm_promscrape",
 		Dial:                         dialFunc,
 		IsTLS:                        isTLS,
@@ -110,7 +122,7 @@ func newClient(sw *ScrapeWork) *client {
 	}
 	var sc *http.Client
 	var proxyURLFunc func(*http.Request) (*url.URL, error)
-	if pu := sw.ProxyURL.URL(); pu != nil {
+	if pu := sw.ProxyURL.GetURL(); pu != nil {
 		proxyURLFunc = http.ProxyURL(pu)
 	}
 	sc = &http.Client{
@@ -146,10 +158,12 @@ func newClient(sw *ScrapeWork) *client {
 		sc:                      sc,
 		scrapeURL:               sw.ScrapeURL,
 		scrapeTimeoutSecondsStr: fmt.Sprintf("%.3f", sw.ScrapeTimeout.Seconds()),
-		host:                    host,
+		hostPort:                hostPort,
 		requestURI:              requestURI,
-		getAuthHeader:           sw.AuthConfig.GetAuthHeader,
-		getProxyAuthHeader:      getProxyAuthHeader,
+		setHeaders:              func(req *http.Request) { sw.AuthConfig.SetHeaders(req, true) },
+		setProxyHeaders:         setProxyHeaders,
+		setFasthttpHeaders:      func(req *fasthttp.Request) { sw.AuthConfig.SetFasthttpHeaders(req, true) },
+		setFasthttpProxyHeaders: setFasthttpProxyHeaders,
 		denyRedirects:           sw.DenyRedirects,
 		disableCompression:      sw.DisableCompression,
 		disableKeepAlive:        sw.DisableKeepAlive,
@@ -173,12 +187,9 @@ func (c *client) GetStreamReader() (*streamReader, error) {
 	// Set X-Prometheus-Scrape-Timeout-Seconds like Prometheus does, since it is used by some exporters such as PushProx.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1179#issuecomment-813117162
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
-	if ah := c.getAuthHeader(); ah != "" {
-		req.Header.Set("Authorization", ah)
-	}
-	if ah := c.getProxyAuthHeader(); ah != "" {
-		req.Header.Set("Proxy-Authorization", ah)
-	}
+	c.setHeaders(req)
+	c.setProxyHeaders(req)
+	scrapeRequests.Inc()
 	resp, err := c.sc.Do(req)
 	if err != nil {
 		cancel()
@@ -186,7 +197,7 @@ func (c *client) GetStreamReader() (*streamReader, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_scrapes_total{status_code="%d"}`, resp.StatusCode)).Inc()
-		respBody, _ := ioutil.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		cancel()
 		return nil, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
@@ -201,11 +212,20 @@ func (c *client) GetStreamReader() (*streamReader, error) {
 	}, nil
 }
 
+// checks fasthttp status code for redirect as standard http/client does.
+func isStatusRedirect(statusCode int) bool {
+	switch statusCode {
+	case 301, 302, 303, 307, 308:
+		return true
+	}
+	return false
+}
+
 func (c *client) ReadData(dst []byte) ([]byte, error) {
 	deadline := time.Now().Add(c.hc.ReadTimeout)
 	req := fasthttp.AcquireRequest()
 	req.SetRequestURI(c.requestURI)
-	req.Header.SetHost(c.host)
+	req.Header.SetHost(c.hostPort)
 	// The following `Accept` header has been copied from Prometheus sources.
 	// See https://github.com/prometheus/prometheus/blob/f9d21f10ecd2a343a381044f131ea4e46381ce09/scrape/scrape.go#L532 .
 	// This is needed as a workaround for scraping stupid Java-based servers such as Spring Boot.
@@ -215,12 +235,8 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	// Set X-Prometheus-Scrape-Timeout-Seconds like Prometheus does, since it is used by some exporters such as PushProx.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1179#issuecomment-813117162
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
-	if ah := c.getAuthHeader(); ah != "" {
-		req.Header.Set("Authorization", ah)
-	}
-	if ah := c.getProxyAuthHeader(); ah != "" {
-		req.Header.Set("Proxy-Authorization", ah)
-	}
+	c.setFasthttpHeaders(req)
+	c.setFasthttpProxyHeaders(req)
 	if !*disableCompression && !c.disableCompression {
 		req.Header.Set("Accept-Encoding", "gzip")
 	}
@@ -237,7 +253,7 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	err := doRequestWithPossibleRetry(c.hc, req, resp, deadline)
 	statusCode := resp.StatusCode()
 	redirectsCount := 0
-	for err == nil && (statusCode == fasthttp.StatusMovedPermanently || statusCode == fasthttp.StatusFound) {
+	for err == nil && isStatusRedirect(statusCode) {
 		if redirectsCount > 5 {
 			err = fmt.Errorf("too many redirects")
 			break
@@ -312,33 +328,12 @@ var (
 	scrapesOK             = metrics.NewCounter(`vm_promscrape_scrapes_total{status_code="200"}`)
 	scrapesGunzipped      = metrics.NewCounter(`vm_promscrape_scrapes_gunziped_total`)
 	scrapesGunzipFailed   = metrics.NewCounter(`vm_promscrape_scrapes_gunzip_failed_total`)
+	scrapeRequests        = metrics.NewCounter(`vm_promscrape_scrape_requests_total`)
 	scrapeRetries         = metrics.NewCounter(`vm_promscrape_scrape_retries_total`)
 )
 
 func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
-	sleepTime := time.Second
-	for {
-		// Use DoDeadline instead of Do even if hc.ReadTimeout is already set in order to guarantee the given deadline
-		// across multiple retries.
-		err := hc.DoDeadline(req, resp, deadline)
-		if err == nil {
-			return nil
-		}
-		if err != fasthttp.ErrConnectionClosed && !strings.Contains(err.Error(), "broken pipe") {
-			return err
-		}
-		// Retry request if the server closes the keep-alive connection unless deadline exceeds.
-		maxSleepTime := time.Until(deadline)
-		if sleepTime > maxSleepTime {
-			return fmt.Errorf("the server closes all the connection attempts: %w", err)
-		}
-		sleepTime += sleepTime
-		if sleepTime > maxSleepTime {
-			sleepTime = maxSleepTime
-		}
-		time.Sleep(sleepTime)
-		scrapeRetries.Inc()
-	}
+	return discoveryutils.DoRequestWithPossibleRetry(hc, req, resp, deadline, scrapeRequests, scrapeRetries)
 }
 
 type streamReader struct {

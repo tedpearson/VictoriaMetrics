@@ -42,10 +42,20 @@ type Client struct {
 
 	apiServer string
 
-	hostPort           string
-	getAuthHeader      func() string
-	getProxyAuthHeader func() string
-	sendFullURL        bool
+	hostPort                string
+	setFasthttpHeaders      func(req *fasthttp.Request)
+	setFasthttpProxyHeaders func(req *fasthttp.Request)
+	sendFullURL             bool
+}
+
+func addMissingPort(addr string, isTLS bool) string {
+	if strings.Contains(addr, ":") {
+		return addr
+	}
+	if isTLS {
+		return addr + ":443"
+	}
+	return addr + ":80"
 }
 
 // NewClient returns new Client for the given args.
@@ -64,36 +74,32 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 	}
 
 	hostPort := string(u.Host())
+	dialAddr := hostPort
 	isTLS := string(u.Scheme()) == "https"
 	var tlsCfg *tls.Config
 	if isTLS {
 		tlsCfg = ac.NewTLSConfig()
 	}
 	sendFullURL := !isTLS && proxyURL.IsHTTPOrHTTPS()
-	getProxyAuthHeader := func() string { return "" }
+	setFasthttpProxyHeaders := func(req *fasthttp.Request) {}
 	if sendFullURL {
 		// Send full urls in requests to a proxy host for non-TLS apiServer
 		// like net/http package from Go does.
 		// See https://en.wikipedia.org/wiki/Proxy_server#Web_proxy_servers
-		pu := proxyURL.URL()
-		hostPort = pu.Host
+		pu := proxyURL.GetURL()
+		dialAddr = pu.Host
 		isTLS = pu.Scheme == "https"
 		if isTLS {
 			tlsCfg = proxyAC.NewTLSConfig()
 		}
 		proxyURLOrig := proxyURL
-		getProxyAuthHeader = func() string {
-			return proxyURLOrig.GetAuthHeader(proxyAC)
+		setFasthttpProxyHeaders = func(req *fasthttp.Request) {
+			proxyURLOrig.SetFasthttpHeaders(proxyAC, req)
 		}
 		proxyURL = &proxy.URL{}
 	}
-	if !strings.Contains(hostPort, ":") {
-		port := "80"
-		if isTLS {
-			port = "443"
-		}
-		hostPort = net.JoinHostPort(hostPort, port)
-	}
+	hostPort = addMissingPort(hostPort, isTLS)
+	dialAddr = addMissingPort(dialAddr, isTLS)
 	if dialFunc == nil {
 		var err error
 		dialFunc, err = proxyURL.NewDialFunc(proxyAC)
@@ -102,7 +108,7 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		}
 	}
 	hc := &fasthttp.HostClient{
-		Addr:                hostPort,
+		Addr:                dialAddr,
 		Name:                "vm_promscrape/discovery",
 		IsTLS:               isTLS,
 		TLSConfig:           tlsCfg,
@@ -113,7 +119,7 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		Dial:                dialFunc,
 	}
 	blockingClient := &fasthttp.HostClient{
-		Addr:                hostPort,
+		Addr:                dialAddr,
 		Name:                "vm_promscrape/discovery",
 		IsTLS:               isTLS,
 		TLSConfig:           tlsCfg,
@@ -123,18 +129,18 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		MaxConns:            64 * 1024,
 		Dial:                dialFunc,
 	}
-	getAuthHeader := func() string { return "" }
+	setFasthttpHeaders := func(req *fasthttp.Request) {}
 	if ac != nil {
-		getAuthHeader = ac.GetAuthHeader
+		setFasthttpHeaders = func(req *fasthttp.Request) { ac.SetFasthttpHeaders(req, true) }
 	}
 	return &Client{
-		hc:                 hc,
-		blockingClient:     blockingClient,
-		apiServer:          apiServer,
-		hostPort:           hostPort,
-		getAuthHeader:      getAuthHeader,
-		getProxyAuthHeader: getProxyAuthHeader,
-		sendFullURL:        sendFullURL,
+		hc:                      hc,
+		blockingClient:          blockingClient,
+		apiServer:               apiServer,
+		hostPort:                hostPort,
+		setFasthttpHeaders:      setFasthttpHeaders,
+		setFasthttpProxyHeaders: setFasthttpProxyHeaders,
+		sendFullURL:             sendFullURL,
 	}, nil
 }
 
@@ -202,12 +208,8 @@ func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, 
 	}
 	req.Header.SetHost(c.hostPort)
 	req.Header.Set("Accept-Encoding", "gzip")
-	if ah := c.getAuthHeader(); ah != "" {
-		req.Header.Set("Authorization", ah)
-	}
-	if ah := c.getProxyAuthHeader(); ah != "" {
-		req.Header.Set("Proxy-Authorization", ah)
-	}
+	c.setFasthttpHeaders(&req)
+	c.setFasthttpProxyHeaders(&req)
 	if modifyRequest != nil {
 		modifyRequest(&req)
 	}
@@ -238,20 +240,23 @@ func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, 
 	return data, nil
 }
 
-func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
+// DoRequestWithPossibleRetry performs the given req at hc and stores the response at resp.
+func DoRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time, requestCounter, retryCounter *metrics.Counter) error {
 	sleepTime := time.Second
-	discoveryRequests.Inc()
+	requestCounter.Inc()
 	for {
 		// Use DoDeadline instead of Do even if hc.ReadTimeout is already set in order to guarantee the given deadline
 		// across multiple retries.
 		err := hc.DoDeadline(req, resp, deadline)
 		if err == nil {
-			return nil
-		}
-		if err != fasthttp.ErrConnectionClosed && !strings.Contains(err.Error(), "broken pipe") {
+			statusCode := resp.StatusCode()
+			if statusCode != fasthttp.StatusTooManyRequests {
+				return nil
+			}
+		} else if err != fasthttp.ErrConnectionClosed && !strings.Contains(err.Error(), "broken pipe") {
 			return err
 		}
-		// Retry request if the server closes the keep-alive connection unless deadline exceeds.
+		// Retry request after exponentially increased sleep.
 		maxSleepTime := time.Until(deadline)
 		if sleepTime > maxSleepTime {
 			return fmt.Errorf("the server closes all the connection attempts: %w", err)
@@ -261,11 +266,15 @@ func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, 
 			sleepTime = maxSleepTime
 		}
 		time.Sleep(sleepTime)
-		discoveryRetries.Inc()
+		retryCounter.Inc()
 	}
 }
 
+func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
+	return DoRequestWithPossibleRetry(hc, req, resp, deadline, discoveryRequests, discoveryRetries)
+}
+
 var (
-	discoveryRetries  = metrics.NewCounter(`vm_promscrape_discovery_retries_total`)
 	discoveryRequests = metrics.NewCounter(`vm_promscrape_discovery_requests_total`)
+	discoveryRetries  = metrics.NewCounter(`vm_promscrape_discovery_retries_total`)
 )

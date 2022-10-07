@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -33,7 +33,7 @@ type apiConfig struct {
 	// tokenLock guards creds refresh
 	tokenLock sync.Mutex
 	creds     *apiCredentials
-	// authTokenReq contins request body for apiCredentials
+	// authTokenReq contains request body for apiCredentials
 	authTokenReq []byte
 	// keystone endpoint
 	endpoint   *url.URL
@@ -81,7 +81,11 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		port:         sdc.Port,
 	}
 	if sdc.TLSConfig != nil {
-		ac, err := promauth.NewConfig(baseDir, nil, nil, "", "", nil, sdc.TLSConfig)
+		opts := &promauth.Options{
+			BaseDir:   baseDir,
+			TLSConfig: sdc.TLSConfig,
+		}
+		ac, err := opts.NewConfig()
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +138,7 @@ func getCreds(cfg *apiConfig) (*apiCredentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed query openstack identity api, url: %s, err: %w", apiURL.String(), err)
 	}
-	r, err := ioutil.ReadAll(resp.Body)
+	r, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read response from %q: %w", apiURL.String(), err)
@@ -164,7 +168,7 @@ func getCreds(cfg *apiConfig) (*apiCredentials, error) {
 
 // readResponseBody reads body from http.Response.
 func readResponseBody(resp *http.Response, apiURL string) ([]byte, error) {
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read response from %q: %w", apiURL, err)

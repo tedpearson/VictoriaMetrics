@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/digitalocean"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/dns"
@@ -23,6 +25,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/openstack"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -35,8 +38,8 @@ var (
 		"The path can point to local file and to http url. "+
 		"See https://docs.victoriametrics.com/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
 
-	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", 30*time.Second, "Interval for checking for changes in 'file_sd_config'. "+
-		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config for details")
+	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", time.Minute, "Interval for checking for changes in 'file_sd_config'. "+
+		"See https://docs.victoriametrics.com/sd_configs.html#file_sd_configs for details")
 )
 
 // CheckConfig checks -promscrape.config for errors and unsupported options.
@@ -51,7 +54,8 @@ func CheckConfig() error {
 // Init initializes Prometheus scraper with config from the `-promscrape.config`.
 //
 // Scraped data is passed to pushData.
-func Init(pushData func(wr *prompbmarshal.WriteRequest)) {
+func Init(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
+	mustInitClusterMemberID()
 	globalStopChan = make(chan struct{})
 	scraperWG.Add(1)
 	go func() {
@@ -88,7 +92,7 @@ func WriteConfigData(w io.Writer) {
 	_, _ = w.Write(*b)
 }
 
-func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) {
+func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) {
 	if configFile == "" {
 		// Nothing to scrape.
 		return
@@ -109,6 +113,7 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 	cfg.mustStart()
 
 	scs := newScrapeConfigs(pushData, globalStopCh)
+	scs.add("azure_sd_configs", *azure.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getAzureSDScrapeWork(swsPrev) })
 	scs.add("consul_sd_configs", *consul.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
 	scs.add("digitalocean_sd_configs", *digitalocean.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDigitalOceanDScrapeWork(swsPrev) })
 	scs.add("dns_sd_configs", *dns.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
@@ -121,6 +126,7 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 	scs.add("http_sd_configs", *http.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getHTTPDScrapeWork(swsPrev) })
 	scs.add("kubernetes_sd_configs", *kubernetes.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
 	scs.add("openstack_sd_configs", *openstack.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
+	scs.add("yandexcloud_sd_configs", *yandexcloud.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getYandexCloudSDScrapeWork(swsPrev) })
 	scs.add("static_configs", 0, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getStaticScrapeWork() })
 
 	var tickerCh <-chan time.Time
@@ -144,8 +150,7 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 				logger.Infof("nothing changed in %q", configFile)
 				goto waitForChans
 			}
-			cfg.mustStop()
-			cfgNew.mustStart()
+			cfgNew.mustRestart(cfg)
 			cfg = cfgNew
 			data = dataNew
 			marshaledData = cfgNew.marshal()
@@ -160,10 +165,10 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 				// Nothing changed since the previous loadConfig
 				goto waitForChans
 			}
-			cfg.mustStop()
-			cfgNew.mustStart()
+			cfgNew.mustRestart(cfg)
 			cfg = cfgNew
 			data = dataNew
+			marshaledData = cfgNew.marshal()
 			configData.Store(&marshaledData)
 		case <-globalStopCh:
 			cfg.mustStop()
@@ -181,14 +186,14 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 var configReloads = metrics.NewCounter(`vm_promscrape_config_reloads_total`)
 
 type scrapeConfigs struct {
-	pushData     func(wr *prompbmarshal.WriteRequest)
+	pushData     func(at *auth.Token, wr *prompbmarshal.WriteRequest)
 	wg           sync.WaitGroup
 	stopCh       chan struct{}
 	globalStopCh <-chan struct{}
 	scfgs        []*scrapeConfig
 }
 
-func newScrapeConfigs(pushData func(wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scrapeConfigs {
+func newScrapeConfigs(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scrapeConfigs {
 	return &scrapeConfigs{
 		pushData:     pushData,
 		stopCh:       make(chan struct{}),
@@ -230,7 +235,7 @@ func (scs *scrapeConfigs) stop() {
 
 type scrapeConfig struct {
 	name          string
-	pushData      func(wr *prompbmarshal.WriteRequest)
+	pushData      func(at *auth.Token, wr *prompbmarshal.WriteRequest)
 	getScrapeWork func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork
 	checkInterval time.Duration
 	cfgCh         chan *Config
@@ -257,7 +262,11 @@ func (scfg *scrapeConfig) run(globalStopCh <-chan struct{}) {
 		sws := scfg.getScrapeWork(cfg, swsPrev)
 		sg.update(sws)
 		swsPrev = sws
-		scfg.discoveryDuration.UpdateDuration(startTime)
+		if sg.scrapersStarted.Get() > 0 {
+			// update duration only if at least one scraper has started
+			// otherwise this SD is considered as inactive
+			scfg.discoveryDuration.UpdateDuration(startTime)
+		}
 	}
 	updateScrapeWork(cfg)
 	atomic.AddInt32(&PendingScrapeConfigs, -1)
@@ -279,7 +288,7 @@ type scraperGroup struct {
 	wg       sync.WaitGroup
 	mLock    sync.Mutex
 	m        map[string]*scraper
-	pushData func(wr *prompbmarshal.WriteRequest)
+	pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)
 
 	changesCount    *metrics.Counter
 	activeScrapers  *metrics.Counter
@@ -289,7 +298,7 @@ type scraperGroup struct {
 	globalStopCh <-chan struct{}
 }
 
-func newScraperGroup(name string, pushData func(wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scraperGroup {
+func newScraperGroup(name string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scraperGroup {
 	sg := &scraperGroup{
 		name:     name,
 		m:        make(map[string]*scraper),
@@ -373,14 +382,14 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 		sg.activeScrapers.Inc()
 		sg.scrapersStarted.Inc()
 		sg.wg.Add(1)
-		tsmGlobal.Register(sw)
+		tsmGlobal.Register(&sc.sw)
 		go func(sw *ScrapeWork) {
 			defer func() {
 				sg.wg.Done()
 				close(sc.stoppedCh)
 			}()
 			sc.sw.run(sc.stopCh, sg.globalStopCh)
-			tsmGlobal.Unregister(sw)
+			tsmGlobal.Unregister(&sc.sw)
 			sg.activeScrapers.Dec()
 			sg.scrapersStopped.Inc()
 		}(sw)
@@ -405,7 +414,7 @@ type scraper struct {
 	stoppedCh chan struct{}
 }
 
-func newScraper(sw *ScrapeWork, group string, pushData func(wr *prompbmarshal.WriteRequest)) *scraper {
+func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)) *scraper {
 	sc := &scraper{
 		stopCh:    make(chan struct{}),
 		stoppedCh: make(chan struct{}),

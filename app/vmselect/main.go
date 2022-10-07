@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -31,6 +34,7 @@ var (
 		"limit is reached; see also -search.maxQueryDuration")
 	resetCacheAuthKey    = flag.String("search.resetCacheAuthKey", "", "Optional authKey for resetting rollup cache via /internal/resetRollupResultCache call")
 	logSlowQueryDuration = flag.Duration("search.logSlowQueryDuration", 5*time.Second, "Log queries with execution time exceeding this value. Zero disables slow query logging")
+	vmalertProxyURL      = flag.String("vmalert.proxyURL", "", "Optional URL for proxying requests to vmalert. For example, if -vmalert.proxyURL=http://vmalert:8880 , then alerting API requests such as /api/v1/rules from Grafana will be proxied to http://vmalert:8880/api/v1/rules")
 )
 
 var slowQueries = metrics.NewCounter(`vm_slow_queries_total`)
@@ -57,6 +61,7 @@ func Init() {
 	promql.InitRollupResultCache(*vmstorage.DataPath + "/cache/rollupResult")
 
 	concurrencyCh = make(chan struct{}, *maxConcurrentRequests)
+	initVMAlertProxy()
 }
 
 // Stop stops vmselect
@@ -87,6 +92,8 @@ var vmuiFileServer = http.FileServer(http.FS(vmuiFiles))
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	startTime := time.Now()
 	defer requestDuration.UpdateDuration(startTime)
+	tracerEnabled := searchutils.GetBool(r, "trace")
+	qt := querytracer.New(tracerEnabled, r.URL.Path)
 
 	// Limit the number of concurrent queries.
 	select {
@@ -102,6 +109,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		t := timerpool.Get(d)
 		select {
 		case concurrencyCh <- struct{}{}:
+			qt.Printf("wait in queue because -search.maxConcurrentRequests=%d concurrent requests are executed", *maxConcurrentRequests)
 			timerpool.Put(t)
 			defer func() { <-concurrencyCh }()
 		case <-t.C:
@@ -153,18 +161,19 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		path = path[len("/graphite"):]
 	}
 	// vmui access.
-	if strings.HasPrefix(path, "/vmui") {
-		r.URL.Path = path
-		vmuiFileServer.ServeHTTP(w, r)
-		return true
-	}
-	if path == "/graph" {
-		// Redirect to /graph/, otherwise vmui redirects to /vmui/, which can be inaccessible in user env.
+	if path == "/vmui" || path == "/graph" {
+		// VMUI access via incomplete url without `/` in the end. Redirect to complete url.
 		// Use relative redirect, since, since the hostname and path prefix may be incorrect if VictoriaMetrics
 		// is hidden behind vmauth or similar proxy.
 		_ = r.ParseForm()
-		newURL := "graph/?" + r.Form.Encode()
-		http.Redirect(w, r, newURL, http.StatusFound)
+		path = strings.TrimPrefix(path, "/")
+		newURL := path + "/?" + r.Form.Encode()
+		httpserver.Redirect(w, newURL)
+		return true
+	}
+	if strings.HasPrefix(path, "/vmui/") {
+		r.URL.Path = path
+		vmuiFileServer.ServeHTTP(w, r)
 		return true
 	}
 	if strings.HasPrefix(path, "/graph/") {
@@ -173,14 +182,13 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		vmuiFileServer.ServeHTTP(w, r)
 		return true
 	}
-
 	if strings.HasPrefix(path, "/api/v1/label/") {
 		s := path[len("/api/v1/label/"):]
 		if strings.HasSuffix(s, "/values") {
 			labelValuesRequests.Inc()
 			labelName := s[:len(s)-len("/values")]
 			httpserver.EnableCORS(w, r)
-			if err := prometheus.LabelValuesHandler(startTime, labelName, w, r); err != nil {
+			if err := prometheus.LabelValuesHandler(qt, startTime, labelName, w, r); err != nil {
 				labelValuesErrors.Inc()
 				sendPrometheusError(w, r, err)
 				return true
@@ -204,11 +212,31 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, "%s", `{}`)
 		return true
 	}
+
+	if path == "/vmalert" {
+		// vmalert access via incomplete url without `/` in the end. Redirecto to complete url.
+		// Use relative redirect, since, since the hostname and path prefix may be incorrect if VictoriaMetrics
+		// is hidden behind vmauth or similar proxy.
+		httpserver.Redirect(w, "vmalert/")
+		return true
+	}
+	if strings.HasPrefix(path, "/vmalert/") {
+		vmalertRequests.Inc()
+		if len(*vmalertProxyURL) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, "%s", `{"status":"error","msg":"for accessing vmalert flag '-vmalert.proxyURL' must be configured"}`)
+			return true
+		}
+		proxyVMAlertRequests(w, r)
+		return true
+	}
+
 	switch path {
 	case "/api/v1/query":
 		queryRequests.Inc()
 		httpserver.EnableCORS(w, r)
-		if err := prometheus.QueryHandler(startTime, w, r); err != nil {
+		if err := prometheus.QueryHandler(qt, startTime, w, r); err != nil {
 			queryErrors.Inc()
 			sendPrometheusError(w, r, err)
 			return true
@@ -217,7 +245,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	case "/api/v1/query_range":
 		queryRangeRequests.Inc()
 		httpserver.EnableCORS(w, r)
-		if err := prometheus.QueryRangeHandler(startTime, w, r); err != nil {
+		if err := prometheus.QueryRangeHandler(qt, startTime, w, r); err != nil {
 			queryRangeErrors.Inc()
 			sendPrometheusError(w, r, err)
 			return true
@@ -226,7 +254,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	case "/api/v1/series":
 		seriesRequests.Inc()
 		httpserver.EnableCORS(w, r)
-		if err := prometheus.SeriesHandler(startTime, w, r); err != nil {
+		if err := prometheus.SeriesHandler(qt, startTime, w, r); err != nil {
 			seriesErrors.Inc()
 			sendPrometheusError(w, r, err)
 			return true
@@ -244,24 +272,16 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	case "/api/v1/labels":
 		labelsRequests.Inc()
 		httpserver.EnableCORS(w, r)
-		if err := prometheus.LabelsHandler(startTime, w, r); err != nil {
+		if err := prometheus.LabelsHandler(qt, startTime, w, r); err != nil {
 			labelsErrors.Inc()
-			sendPrometheusError(w, r, err)
-			return true
-		}
-		return true
-	case "/api/v1/labels/count":
-		labelsCountRequests.Inc()
-		httpserver.EnableCORS(w, r)
-		if err := prometheus.LabelsCountHandler(startTime, w, r); err != nil {
-			labelsCountErrors.Inc()
 			sendPrometheusError(w, r, err)
 			return true
 		}
 		return true
 	case "/api/v1/status/tsdb":
 		statusTSDBRequests.Inc()
-		if err := prometheus.TSDBStatusHandler(startTime, w, r); err != nil {
+		httpserver.EnableCORS(w, r)
+		if err := prometheus.TSDBStatusHandler(qt, startTime, w, r); err != nil {
 			statusTSDBErrors.Inc()
 			sendPrometheusError(w, r, err)
 			return true
@@ -273,6 +293,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/api/v1/status/top_queries":
 		topQueriesRequests.Inc()
+		httpserver.EnableCORS(w, r)
 		if err := prometheus.QueryStatsHandler(startTime, w, r); err != nil {
 			topQueriesErrors.Inc()
 			sendPrometheusError(w, r, fmt.Errorf("cannot query status endpoint: %w", err))
@@ -402,20 +423,33 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/api/v1/rules", "/rules":
-		// Return dumb placeholder for https://prometheus.io/docs/prometheus/latest/querying/api/#rules
 		rulesRequests.Inc()
+		if len(*vmalertProxyURL) > 0 {
+			proxyVMAlertRequests(w, r)
+			return true
+		}
+		// Return dumb placeholder for https://prometheus.io/docs/prometheus/latest/querying/api/#rules
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, "%s", `{"status":"success","data":{"groups":[]}}`)
+		fmt.Fprint(w, `{"status":"success","data":{"groups":[]}}`)
 		return true
 	case "/api/v1/alerts", "/alerts":
-		// Return dumb placeholder for https://prometheus.io/docs/prometheus/latest/querying/api/#alerts
 		alertsRequests.Inc()
+		if len(*vmalertProxyURL) > 0 {
+			proxyVMAlertRequests(w, r)
+			return true
+		}
+		// Return dumb placeholder for https://prometheus.io/docs/prometheus/latest/querying/api/#alerts
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, "%s", `{"status":"success","data":{"alerts":[]}}`)
+		fmt.Fprint(w, `{"status":"success","data":{"alerts":[]}}`)
 		return true
 	case "/api/v1/metadata":
 		// Return dumb placeholder for https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metric-metadata
 		metadataRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, "%s", `{"status":"success","data":{}}`)
+		return true
+	case "/api/v1/status/buildinfo":
+		buildInfoRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, "%s", `{"status":"success","data":{}}`)
 		return true
@@ -466,6 +500,12 @@ func sendPrometheusError(w http.ResponseWriter, r *http.Request, err error) {
 		statusCode = esc.StatusCode
 	}
 	w.WriteHeader(statusCode)
+
+	var ure *promql.UserReadableError
+	if errors.As(err, &ure) {
+		prometheus.WriteErrorResponse(w, statusCode, ure)
+		return
+	}
 	prometheus.WriteErrorResponse(w, statusCode, err)
 }
 
@@ -489,9 +529,6 @@ var (
 
 	labelsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/labels"}`)
 	labelsErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/labels"}`)
-
-	labelsCountRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/labels/count"}`)
-	labelsCountErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/labels/count"}`)
 
 	statusTSDBRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/status/tsdb"}`)
 	statusTSDBErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/status/tsdb"}`)
@@ -549,10 +586,46 @@ var (
 	graphiteTagsDelSeriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/tags/delSeries"}`)
 	graphiteTagsDelSeriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/tags/delSeries"}`)
 
-	graphiteFunctionsRequests = metrics.NewCounter(`vm_http_request_total{path="/functions"}`)
+	graphiteFunctionsRequests = metrics.NewCounter(`vm_http_requests_total{path="/functions"}`)
 
-	rulesRequests          = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/rules"}`)
-	alertsRequests         = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/alerts"}`)
+	vmalertRequests = metrics.NewCounter(`vm_http_requests_total{path="/vmalert"}`)
+	rulesRequests   = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/rules"}`)
+	alertsRequests  = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/alerts"}`)
+
 	metadataRequests       = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/metadata"}`)
+	buildInfoRequests      = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/buildinfo"}`)
 	queryExemplarsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/query_exemplars"}`)
 )
+
+func proxyVMAlertRequests(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		err := recover()
+		if err == nil || err == http.ErrAbortHandler {
+			// Suppress http.ErrAbortHandler panic.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1353
+			return
+		}
+		// Forward other panics to the caller.
+		panic(err)
+	}()
+	r.Host = vmalertProxyHost
+	vmalertProxy.ServeHTTP(w, r)
+}
+
+var (
+	vmalertProxyHost string
+	vmalertProxy     *httputil.ReverseProxy
+)
+
+// initVMAlertProxy must be called after flag.Parse(), since it uses command-line flags.
+func initVMAlertProxy() {
+	if len(*vmalertProxyURL) == 0 {
+		return
+	}
+	proxyURL, err := url.Parse(*vmalertProxyURL)
+	if err != nil {
+		logger.Fatalf("cannot parse -vmalert.proxyURL=%q: %s", *vmalertProxyURL, err)
+	}
+	vmalertProxyHost = proxyURL.Host
+	vmalertProxy = httputil.NewSingleHostReverseProxy(proxyURL)
+}

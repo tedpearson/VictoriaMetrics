@@ -3,17 +3,40 @@ package promql
 import (
 	"testing"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metricsql"
 )
 
+func TestRollupResultCacheInitStop(t *testing.T) {
+	t.Run("inmemory", func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			InitRollupResultCache("")
+			StopRollupResultCache()
+		}
+	})
+	t.Run("file-based", func(t *testing.T) {
+		cacheFilePath := "test-rollup-result-cache"
+		for i := 0; i < 3; i++ {
+			InitRollupResultCache(cacheFilePath)
+			StopRollupResultCache()
+		}
+		fs.MustRemoveAll(cacheFilePath)
+		fs.MustRemoveAll(cacheFilePath + ".key.prefix")
+	})
+}
+
 func TestRollupResultCache(t *testing.T) {
+	InitRollupResultCache("")
+	defer StopRollupResultCache()
+
 	ResetRollupResultCache()
 	window := int64(456)
 	ec := &EvalConfig{
-		Start: 1000,
-		End:   2000,
-		Step:  200,
+		Start:              1000,
+		End:                2000,
+		Step:               200,
+		MaxPointsPerSeries: 1e4,
 
 		MayCache: true,
 	}
@@ -34,7 +57,7 @@ func TestRollupResultCache(t *testing.T) {
 
 	// Try obtaining an empty value.
 	t.Run("empty", func(t *testing.T) {
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != ec.Start {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, ec.Start)
 		}
@@ -52,8 +75,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1400 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1400)
 		}
@@ -73,8 +96,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, ae, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, ae, window)
+		rollupResultCacheV.Put(nil, ec, ae, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, ae, window)
 		if newStart != 1400 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1400)
 		}
@@ -96,8 +119,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{333, 0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1000 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1000)
 		}
@@ -115,8 +138,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1000 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1000)
 		}
@@ -134,8 +157,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1000 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1000)
 		}
@@ -153,8 +176,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1000 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1000)
 		}
@@ -172,8 +195,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2, 3, 4, 5, 6, 7},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 2200 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 2200)
 		}
@@ -195,8 +218,8 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{1, 2, 3, 4, 5, 6},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 2200 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 2200)
 		}
@@ -220,8 +243,8 @@ func TestRollupResultCache(t *testing.T) {
 			}
 			tss = append(tss, ts)
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss)
-		tssResult, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss)
+		tssResult, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 2200 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 2200)
 		}
@@ -249,10 +272,10 @@ func TestRollupResultCache(t *testing.T) {
 				Values:     []float64{0, 1, 2},
 			},
 		}
-		rollupResultCacheV.Put(ec, fe, window, tss1)
-		rollupResultCacheV.Put(ec, fe, window, tss2)
-		rollupResultCacheV.Put(ec, fe, window, tss3)
-		tss, newStart := rollupResultCacheV.Get(ec, fe, window)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss1)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss2)
+		rollupResultCacheV.Put(nil, ec, fe, window, tss3)
+		tss, newStart := rollupResultCacheV.Get(nil, ec, fe, window)
 		if newStart != 1400 {
 			t.Fatalf("unexpected newStart; got %d; want %d", newStart, 1400)
 		}
@@ -269,9 +292,10 @@ func TestRollupResultCache(t *testing.T) {
 
 func TestMergeTimeseries(t *testing.T) {
 	ec := &EvalConfig{
-		Start: 1000,
-		End:   2000,
-		Step:  200,
+		Start:              1000,
+		End:                2000,
+		Step:               200,
+		MaxPointsPerSeries: 1e4,
 	}
 	bStart := int64(1400)
 

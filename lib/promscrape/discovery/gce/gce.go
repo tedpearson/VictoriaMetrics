@@ -9,7 +9,7 @@ import (
 // SDCheckInterval defines interval for targets refresh.
 var SDCheckInterval = flag.Duration("promscrape.gceSDCheckInterval", time.Minute, "Interval for checking for changes in gce. "+
 	"This works only if gce_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config for details")
+	"See https://docs.victoriametrics.com/sd_configs.html#gce_sd_configs for details")
 
 // SDConfig represents service discovery config for gce.
 //
@@ -26,7 +26,7 @@ type SDConfig struct {
 
 // ZoneYAML holds info about zones.
 type ZoneYAML struct {
-	zones []string
+	Zones []string
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler
@@ -50,8 +50,13 @@ func (z *ZoneYAML) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	default:
 		return fmt.Errorf("unexpected type unmarshaled for ZoneYAML: %T; contents: %#v", v, v)
 	}
-	z.zones = zones
+	z.Zones = zones
 	return nil
+}
+
+// MarshalYAML implements yaml.Marshaler
+func (z ZoneYAML) MarshalYAML() (interface{}, error) {
+	return z.Zones, nil
 }
 
 // GetLabels returns gce labels according to sdc.

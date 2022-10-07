@@ -15,16 +15,19 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/mergeset"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	retentionPeriod   = flagutil.NewDuration("retentionPeriod", 1, "Data with timestamps outside the retentionPeriod is automatically deleted")
+	retentionPeriod   = flagutil.NewDuration("retentionPeriod", "1", "Data with timestamps outside the retentionPeriod is automatically deleted")
 	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
 	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
 	forceFlushAuthKey = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
+	snapshotsMaxAge   = flagutil.NewDuration("snapshotsMaxAge", "0", "Automatically delete snapshots older than -snapshotsMaxAge if it is set to non-zero duration. Make sure that backup process has enough time to finish the backup before the corresponding snapshot is automatically deleted")
 
 	precisionBits = flag.Int("precisionBits", 64, "The number of precision bits to store per each value. Lower precision bits improves data compression at the cost of precision loss")
 
@@ -34,8 +37,11 @@ var (
 	finalMergeDelay = flag.Duration("finalMergeDelay", 0, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
 		"Final merge may require additional disk IO and CPU resources. Final merge may increase query speed and reduce disk space usage in some cases. "+
 		"Zero value disables final merge")
-	bigMergeConcurrency   = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
-	smallMergeConcurrency = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
+	bigMergeConcurrency     = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
+	smallMergeConcurrency   = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
+	retentionTimezoneOffset = flag.Duration("retentionTimezoneOffset", 0, "The offset for performing indexdb rotation. "+
+		"If set to 0, then the indexdb rotation is performed at 4am UTC time per each -retentionPeriod. "+
+		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 
 	logNewSeries = flag.Bool("logNewSeries", false, "Whether to log new series. This option is for debug purposes only. It can lead to performance issues "+
 		"when big number of new series are ingested into VictoriaMetrics")
@@ -43,11 +49,18 @@ var (
 		"When set, then /api/v1/query_range would return '503 Service Unavailable' error for queries with 'from' value outside -retentionPeriod. "+
 		"This may be useful when multiple data sources with distinct retentions are hidden behind query-tee")
 	maxHourlySeries = flag.Int("storage.maxHourlySeries", 0, "The maximum number of unique series can be added to the storage during the last hour. "+
-		"Excess series are logged and dropped. This can be useful for limiting series cardinality. See also -storage.maxDailySeries")
+		"Excess series are logged and dropped. This can be useful for limiting series cardinality. See https://docs.victoriametrics.com/#cardinality-limiter . "+
+		"See also -storage.maxDailySeries")
 	maxDailySeries = flag.Int("storage.maxDailySeries", 0, "The maximum number of unique series can be added to the storage during the last 24 hours. "+
-		"Excess series are logged and dropped. This can be useful for limiting series churn rate. See also -storage.maxHourlySeries")
+		"Excess series are logged and dropped. This can be useful for limiting series churn rate. See https://docs.victoriametrics.com/#cardinality-limiter . "+
+		"See also -storage.maxHourlySeries")
 
 	minFreeDiskSpaceBytes = flagutil.NewBytes("storage.minFreeDiskSpaceBytes", 10e6, "The minimum free disk space at -storageDataPath after which the storage stops accepting new data")
+
+	cacheSizeStorageTSID        = flagutil.NewBytes("storage.cacheSizeStorageTSID", 0, "Overrides max size for storage/tsid cache. See https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#cache-tuning")
+	cacheSizeIndexDBIndexBlocks = flagutil.NewBytes("storage.cacheSizeIndexDBIndexBlocks", 0, "Overrides max size for indexdb/indexBlocks cache. See https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#cache-tuning")
+	cacheSizeIndexDBDataBlocks  = flagutil.NewBytes("storage.cacheSizeIndexDBDataBlocks", 0, "Overrides max size for indexdb/dataBlocks cache. See https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#cache-tuning")
+	cacheSizeIndexDBTagFilters  = flagutil.NewBytes("storage.cacheSizeIndexDBTagFilters", 0, "Overrides max size for indexdb/tagFilters cache. See https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#cache-tuning")
 )
 
 // CheckTimeRange returns true if the given tr is denied for querying.
@@ -68,7 +81,7 @@ func CheckTimeRange(tr storage.TimeRange) error {
 // Init initializes vmstorage.
 func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	InitWithoutMetrics(resetCacheIfNeeded)
-	registerStorageMetrics()
+	registerStorageMetrics(Storage)
 }
 
 // InitWithoutMetrics must be called instead of Init inside tests.
@@ -84,8 +97,16 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	storage.SetFinalMergeDelay(*finalMergeDelay)
 	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
 	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
+	storage.SetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
+	storage.SetTSIDCacheSize(cacheSizeStorageTSID.N)
+	storage.SetTagFilterCacheSize(cacheSizeIndexDBTagFilters.N)
+	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.N)
+	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.N)
 
+	if retentionPeriod.Msecs < 24*3600*1000 {
+		logger.Fatalf("-retentionPeriod cannot be smaller than a day; got %s", retentionPeriod)
+	}
 	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
@@ -94,9 +115,10 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *DataPath, retentionPeriod, err)
 	}
 	Storage = strg
+	initStaleSnapshotsRemover(strg)
 
 	var m storage.Metrics
-	Storage.UpdateMetrics(&m)
+	strg.UpdateMetrics(&m)
 	tm := &m.TableMetrics
 	partsCount := tm.SmallPartsCount + tm.BigPartsCount
 	blocksCount := tm.SmallBlocksCount + tm.BigBlocksCount
@@ -135,101 +157,70 @@ func AddRows(mrs []storage.MetricRow) error {
 var errReadOnly = errors.New("the storage is in read-only mode; check -storage.minFreeDiskSpaceBytes command-line flag value")
 
 // RegisterMetricNames registers all the metrics from mrs in the storage.
-func RegisterMetricNames(mrs []storage.MetricRow) error {
+func RegisterMetricNames(qt *querytracer.Tracer, mrs []storage.MetricRow) error {
 	WG.Add(1)
-	err := Storage.RegisterMetricNames(mrs)
+	err := Storage.RegisterMetricNames(qt, mrs)
 	WG.Done()
 	return err
 }
 
-// DeleteMetrics deletes metrics matching tfss.
+// DeleteSeries deletes series matching tfss.
 //
-// Returns the number of deleted metrics.
-func DeleteMetrics(tfss []*storage.TagFilters) (int, error) {
+// Returns the number of deleted series.
+func DeleteSeries(qt *querytracer.Tracer, tfss []*storage.TagFilters) (int, error) {
 	WG.Add(1)
-	n, err := Storage.DeleteMetrics(tfss)
+	n, err := Storage.DeleteSeries(qt, tfss)
 	WG.Done()
 	return n, err
 }
 
 // SearchMetricNames returns metric names for the given tfss on the given tr.
-func SearchMetricNames(tfss []*storage.TagFilters, tr storage.TimeRange, maxMetrics int, deadline uint64) ([]storage.MetricName, error) {
+func SearchMetricNames(qt *querytracer.Tracer, tfss []*storage.TagFilters, tr storage.TimeRange, maxMetrics int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	mns, err := Storage.SearchMetricNames(tfss, tr, maxMetrics, deadline)
+	metricNames, err := Storage.SearchMetricNames(qt, tfss, tr, maxMetrics, deadline)
 	WG.Done()
-	return mns, err
+	return metricNames, err
 }
 
-// SearchTagKeysOnTimeRange searches for tag keys on tr.
-func SearchTagKeysOnTimeRange(tr storage.TimeRange, maxTagKeys int, deadline uint64) ([]string, error) {
+// SearchLabelNamesWithFiltersOnTimeRange searches for tag keys matching the given tfss on tr.
+func SearchLabelNamesWithFiltersOnTimeRange(qt *querytracer.Tracer, tfss []*storage.TagFilters, tr storage.TimeRange, maxTagKeys, maxMetrics int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	keys, err := Storage.SearchTagKeysOnTimeRange(tr, maxTagKeys, deadline)
+	labelNames, err := Storage.SearchLabelNamesWithFiltersOnTimeRange(qt, tfss, tr, maxTagKeys, maxMetrics, deadline)
 	WG.Done()
-	return keys, err
+	return labelNames, err
 }
 
-// SearchTagKeys searches for tag keys
-func SearchTagKeys(maxTagKeys int, deadline uint64) ([]string, error) {
+// SearchLabelValuesWithFiltersOnTimeRange searches for label values for the given labelName, tfss and tr.
+func SearchLabelValuesWithFiltersOnTimeRange(qt *querytracer.Tracer, labelName string, tfss []*storage.TagFilters,
+	tr storage.TimeRange, maxLabelValues, maxMetrics int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	keys, err := Storage.SearchTagKeys(maxTagKeys, deadline)
+	labelValues, err := Storage.SearchLabelValuesWithFiltersOnTimeRange(qt, labelName, tfss, tr, maxLabelValues, maxMetrics, deadline)
 	WG.Done()
-	return keys, err
-}
-
-// SearchTagValuesOnTimeRange searches for tag values for the given tagKey on tr.
-func SearchTagValuesOnTimeRange(tagKey []byte, tr storage.TimeRange, maxTagValues int, deadline uint64) ([]string, error) {
-	WG.Add(1)
-	values, err := Storage.SearchTagValuesOnTimeRange(tagKey, tr, maxTagValues, deadline)
-	WG.Done()
-	return values, err
-}
-
-// SearchTagValues searches for tag values for the given tagKey
-func SearchTagValues(tagKey []byte, maxTagValues int, deadline uint64) ([]string, error) {
-	WG.Add(1)
-	values, err := Storage.SearchTagValues(tagKey, maxTagValues, deadline)
-	WG.Done()
-	return values, err
+	return labelValues, err
 }
 
 // SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.
 //
 // This allows implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find or similar APIs.
-func SearchTagValueSuffixes(tr storage.TimeRange, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+func SearchTagValueSuffixes(qt *querytracer.Tracer, tr storage.TimeRange, tagKey, tagValuePrefix string, delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	suffixes, err := Storage.SearchTagValueSuffixes(tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
+	suffixes, err := Storage.SearchTagValueSuffixes(qt, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
 	WG.Done()
 	return suffixes, err
 }
 
 // SearchGraphitePaths returns all the metric names matching the given Graphite query.
-func SearchGraphitePaths(tr storage.TimeRange, query []byte, maxPaths int, deadline uint64) ([]string, error) {
+func SearchGraphitePaths(qt *querytracer.Tracer, tr storage.TimeRange, query []byte, maxPaths int, deadline uint64) ([]string, error) {
 	WG.Add(1)
-	paths, err := Storage.SearchGraphitePaths(tr, query, maxPaths, deadline)
+	paths, err := Storage.SearchGraphitePaths(qt, tr, query, maxPaths, deadline)
 	WG.Done()
 	return paths, err
 }
 
-// SearchTagEntries searches for tag entries.
-func SearchTagEntries(maxTagKeys, maxTagValues int, deadline uint64) ([]storage.TagEntry, error) {
+// GetTSDBStatus returns TSDB status for given filters on the given date.
+func GetTSDBStatus(qt *querytracer.Tracer, tfss []*storage.TagFilters, date uint64, focusLabel string, topN, maxMetrics int, deadline uint64) (*storage.TSDBStatus, error) {
 	WG.Add(1)
-	tagEntries, err := Storage.SearchTagEntries(maxTagKeys, maxTagValues, deadline)
-	WG.Done()
-	return tagEntries, err
-}
-
-// GetTSDBStatusForDate returns TSDB status for the given date.
-func GetTSDBStatusForDate(date uint64, topN int, deadline uint64) (*storage.TSDBStatus, error) {
-	WG.Add(1)
-	status, err := Storage.GetTSDBStatusWithFiltersForDate(nil, date, topN, deadline)
-	WG.Done()
-	return status, err
-}
-
-// GetTSDBStatusWithFiltersForDate returns TSDB status for given filters on the given date.
-func GetTSDBStatusWithFiltersForDate(tfss []*storage.TagFilters, date uint64, topN int, deadline uint64) (*storage.TSDBStatus, error) {
-	WG.Add(1)
-	status, err := Storage.GetTSDBStatusWithFiltersForDate(tfss, date, topN, deadline)
+	status, err := Storage.GetTSDBStatus(qt, tfss, date, focusLabel, topN, maxMetrics, deadline)
 	WG.Done()
 	return status, err
 }
@@ -247,6 +238,7 @@ func Stop() {
 	logger.Infof("gracefully closing the storage at %s", *DataPath)
 	startTime := time.Now()
 	WG.WaitAndBlock()
+	stopStaleSnapshotsRemover()
 	Storage.MustClose()
 	logger.Infof("successfully closed the storage in %.3f seconds", time.Since(startTime).Seconds())
 
@@ -366,9 +358,44 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	}
 }
 
+func initStaleSnapshotsRemover(strg *storage.Storage) {
+	staleSnapshotsRemoverCh = make(chan struct{})
+	if snapshotsMaxAge.Msecs <= 0 {
+		return
+	}
+	snapshotsMaxAgeDur := time.Duration(snapshotsMaxAge.Msecs) * time.Millisecond
+	staleSnapshotsRemoverWG.Add(1)
+	go func() {
+		defer staleSnapshotsRemoverWG.Done()
+		t := time.NewTicker(11 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-staleSnapshotsRemoverCh:
+				return
+			case <-t.C:
+			}
+			if err := strg.DeleteStaleSnapshots(snapshotsMaxAgeDur); err != nil {
+				// Use logger.Errorf instead of logger.Fatalf in the hope the error is temporary.
+				logger.Errorf("cannot delete stale snapshots: %s", err)
+			}
+		}
+	}()
+}
+
+func stopStaleSnapshotsRemover() {
+	close(staleSnapshotsRemoverCh)
+	staleSnapshotsRemoverWG.Wait()
+}
+
+var (
+	staleSnapshotsRemoverCh chan struct{}
+	staleSnapshotsRemoverWG sync.WaitGroup
+)
+
 var activeForceMerges = metrics.NewCounter("vm_active_force_merges")
 
-func registerStorageMetrics() {
+func registerStorageMetrics(strg *storage.Storage) {
 	mCache := &storage.Metrics{}
 	var mCacheLock sync.Mutex
 	var lastUpdateTime time.Time
@@ -380,7 +407,7 @@ func registerStorageMetrics() {
 			return mCache
 		}
 		var mc storage.Metrics
-		Storage.UpdateMetrics(&mc)
+		strg.UpdateMetrics(&mc)
 		mCache = &mc
 		lastUpdateTime = time.Now()
 		return mCache
@@ -401,7 +428,7 @@ func registerStorageMetrics() {
 		return float64(minFreeDiskSpaceBytes.N)
 	})
 	metrics.NewGauge(fmt.Sprintf(`vm_storage_is_read_only{path=%q}`, *DataPath), func() float64 {
-		if Storage.IsReadOnly() {
+		if strg.IsReadOnly() {
 			return 1
 		}
 		return 0
@@ -463,6 +490,9 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_new_timeseries_created_total`, func() float64 {
 		return float64(idbm().NewTimeseriesCreated)
 	})
+	metrics.NewGauge(`vm_timeseries_repopulated_total`, func() float64 {
+		return float64(idbm().TimeseriesRepopulated)
+	})
 	metrics.NewGauge(`vm_missing_tsids_for_metric_id_total`, func() float64 {
 		return float64(idbm().MissingTSIDsForMetricID)
 	})
@@ -487,6 +517,13 @@ func registerStorageMetrics() {
 	})
 	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb"}`, func() float64 {
 		return float64(idbm().AssistedMerges)
+	})
+
+	metrics.NewGauge(`vm_indexdb_items_added_total`, func() float64 {
+		return float64(idbm().ItemsAdded)
+	})
+	metrics.NewGauge(`vm_indexdb_items_added_size_bytes_total`, func() float64 {
+		return float64(idbm().ItemsAddedSizeBytes)
 	})
 
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/686
@@ -591,12 +628,29 @@ func registerStorageMetrics() {
 		return float64(m().SlowMetricNameLoads)
 	})
 
-	metrics.NewGauge(`vm_hourly_series_limit_rows_dropped_total`, func() float64 {
-		return float64(m().HourlySeriesLimitRowsDropped)
-	})
-	metrics.NewGauge(`vm_daily_series_limit_rows_dropped_total`, func() float64 {
-		return float64(m().DailySeriesLimitRowsDropped)
-	})
+	if *maxHourlySeries > 0 {
+		metrics.NewGauge(`vm_hourly_series_limit_current_series`, func() float64 {
+			return float64(m().HourlySeriesLimitCurrentSeries)
+		})
+		metrics.NewGauge(`vm_hourly_series_limit_max_series`, func() float64 {
+			return float64(m().HourlySeriesLimitMaxSeries)
+		})
+		metrics.NewGauge(`vm_hourly_series_limit_rows_dropped_total`, func() float64 {
+			return float64(m().HourlySeriesLimitRowsDropped)
+		})
+	}
+
+	if *maxDailySeries > 0 {
+		metrics.NewGauge(`vm_daily_series_limit_current_series`, func() float64 {
+			return float64(m().DailySeriesLimitCurrentSeries)
+		})
+		metrics.NewGauge(`vm_daily_series_limit_max_series`, func() float64 {
+			return float64(m().DailySeriesLimitMaxSeries)
+		})
+		metrics.NewGauge(`vm_daily_series_limit_rows_dropped_total`, func() float64 {
+			return float64(m().DailySeriesLimitRowsDropped)
+		})
+	}
 
 	metrics.NewGauge(`vm_timestamps_blocks_merged_total`, func() float64 {
 		return float64(m().TimestampsBlocksMerged)
@@ -669,6 +723,10 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_cache_entries{type="storage/regexps"}`, func() float64 {
 		return float64(storage.RegexpCacheSize())
 	})
+	metrics.NewGauge(`vm_cache_entries{type="storage/regexpPrefixes"}`, func() float64 {
+		return float64(storage.RegexpPrefixesCacheSize())
+	})
+
 	metrics.NewGauge(`vm_cache_entries{type="storage/prefetchedMetricIDs"}`, func() float64 {
 		return float64(m().PrefetchedMetricIDsSize)
 	})
@@ -703,6 +761,12 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/tagFilters"}`, func() float64 {
 		return float64(idbm().TagFiltersCacheSizeBytes)
 	})
+	metrics.NewGauge(`vm_cache_size_bytes{type="storage/regexps"}`, func() float64 {
+		return float64(storage.RegexpCacheSizeBytes())
+	})
+	metrics.NewGauge(`vm_cache_size_bytes{type="storage/regexpPrefixes"}`, func() float64 {
+		return float64(storage.RegexpPrefixesCacheSizeBytes())
+	})
 	metrics.NewGauge(`vm_cache_size_bytes{type="storage/prefetchedMetricIDs"}`, func() float64 {
 		return float64(m().PrefetchedMetricIDsSizeBytes)
 	})
@@ -727,6 +791,12 @@ func registerStorageMetrics() {
 	})
 	metrics.NewGauge(`vm_cache_size_max_bytes{type="indexdb/tagFilters"}`, func() float64 {
 		return float64(idbm().TagFiltersCacheSizeMaxBytes)
+	})
+	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/regexps"}`, func() float64 {
+		return float64(storage.RegexpCacheMaxSizeBytes())
+	})
+	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/regexpPrefixes"}`, func() float64 {
+		return float64(storage.RegexpPrefixesCacheMaxSizeBytes())
 	})
 
 	metrics.NewGauge(`vm_cache_requests_total{type="storage/tsid"}`, func() float64 {
@@ -753,6 +823,9 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_cache_requests_total{type="storage/regexps"}`, func() float64 {
 		return float64(storage.RegexpCacheRequests())
 	})
+	metrics.NewGauge(`vm_cache_requests_total{type="storage/regexpPrefixes"}`, func() float64 {
+		return float64(storage.RegexpPrefixesCacheRequests())
+	})
 
 	metrics.NewGauge(`vm_cache_misses_total{type="storage/tsid"}`, func() float64 {
 		return float64(m().TSIDCacheMisses)
@@ -778,6 +851,9 @@ func registerStorageMetrics() {
 	metrics.NewGauge(`vm_cache_misses_total{type="storage/regexps"}`, func() float64 {
 		return float64(storage.RegexpCacheMisses())
 	})
+	metrics.NewGauge(`vm_cache_misses_total{type="storage/regexpPrefixes"}`, func() float64 {
+		return float64(storage.RegexpPrefixesCacheMisses())
+	})
 
 	metrics.NewGauge(`vm_deleted_metrics_total{type="indexdb"}`, func() float64 {
 		return float64(idbm().DeletedMetricsCount)
@@ -788,6 +864,10 @@ func registerStorageMetrics() {
 	})
 	metrics.NewGauge(`vm_cache_collisions_total{type="storage/metricName"}`, func() float64 {
 		return float64(m().MetricNameCacheCollisions)
+	})
+
+	metrics.NewGauge(`vm_next_retention_seconds`, func() float64 {
+		return float64(m().NextRetentionSeconds)
 	})
 }
 

@@ -6,6 +6,7 @@ export interface SetupTooltip {
     metrics: MetricResult[],
     series: Series[],
     tooltip: HTMLDivElement,
+    unit?: string,
     tooltipOffset: {
         left: number,
         top: number
@@ -37,4 +38,27 @@ export interface LegendItem {
     color: string;
     checked: boolean;
     freeFormFields: {[key: string]: string};
+}
+
+export interface BarSeriesItem {
+    which: number[],
+    ori: number,
+    dir: number,
+    radius: number,
+    disp: Disp
+}
+
+export interface Disp {
+    stroke: Stroke,
+    fill: Fill,
+}
+
+export interface Stroke {
+    unit: number,
+    values: (u: { data: number[][]; }) => string[],
+}
+
+export interface Fill {
+    unit: number,
+    values: (u: { data: number[][]; }) => string[],
 }

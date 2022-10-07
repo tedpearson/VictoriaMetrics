@@ -2,7 +2,6 @@ package netstorage
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sync"
 
@@ -109,7 +108,7 @@ func (tbf *tmpBlocksFile) WriteBlockRefData(b []byte) (tmpBlockAddr, error) {
 
 	// Slow path: flush the data from tbf.buf to file.
 	if tbf.f == nil {
-		f, err := ioutil.TempFile(tmpBlocksDir, "")
+		f, err := os.CreateTemp(tmpBlocksDir, "")
 		if err != nil {
 			return addr, err
 		}
@@ -122,6 +121,11 @@ func (tbf *tmpBlocksFile) WriteBlockRefData(b []byte) (tmpBlockAddr, error) {
 		return addr, fmt.Errorf("cannot write block to %q: %w", tbf.f.Name(), err)
 	}
 	return addr, nil
+}
+
+// Len() returnt tbf size in bytes.
+func (tbf *tmpBlocksFile) Len() uint64 {
+	return tbf.offset
 }
 
 func (tbf *tmpBlocksFile) Finalize() error {
@@ -149,7 +153,7 @@ func (tbf *tmpBlocksFile) MustReadBlockRefAt(partRef storage.PartRef, addr tmpBl
 	} else {
 		bb := tmpBufPool.Get()
 		defer tmpBufPool.Put(bb)
-		bb.B = bytesutil.ResizeNoCopy(bb.B, addr.size)
+		bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, addr.size)
 		tbf.r.MustReadAt(bb.B, int64(addr.offset))
 		buf = bb.B
 	}

@@ -132,7 +132,7 @@ func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 				m := map[string]string{
 					"__address__": addr,
 				}
-				p.appendCommonLabels(m)
+				p.appendCommonLabels(m, gw)
 				p.appendContainerLabels(m, c, &cp)
 				if svc != nil {
 					svc.appendCommonLabels(m)
@@ -153,27 +153,34 @@ func appendEndpointLabelsForAddresses(ms []map[string]string, gw *groupWatcher, 
 				p = o.(*Pod)
 			}
 		}
-		m := getEndpointLabelsForAddressAndPort(podPortsSeen, eps, ea, epp, p, svc, ready)
+		m := getEndpointLabelsForAddressAndPort(gw, podPortsSeen, eps, ea, epp, p, svc, ready)
 		ms = append(ms, m)
 	}
 	return ms
 }
 
-func getEndpointLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort, p *Pod, svc *Service, ready string) map[string]string {
+func getEndpointLabelsForAddressAndPort(gw *groupWatcher, podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort,
+	p *Pod, svc *Service, ready string) map[string]string {
 	m := getEndpointLabels(eps.Metadata, ea, epp, ready)
 	if svc != nil {
 		svc.appendCommonLabels(m)
 	}
+	// See https://github.com/prometheus/prometheus/issues/10284
 	eps.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_endpoints", m)
 	if ea.TargetRef.Kind != "Pod" || p == nil {
 		return m
 	}
-	p.appendCommonLabels(m)
+	p.appendCommonLabels(m, gw)
+	// always add pod targetRef, even if epp port doesn't match container port
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2134
+	if _, ok := podPortsSeen[p]; !ok {
+		podPortsSeen[p] = []int{}
+	}
 	for _, c := range p.Spec.Containers {
 		for _, cp := range c.Ports {
 			if cp.ContainerPort == epp.Port {
-				p.appendContainerLabels(m, c, &cp)
 				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
+				p.appendContainerLabels(m, c, &cp)
 				break
 			}
 		}

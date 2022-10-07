@@ -13,6 +13,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
@@ -25,8 +26,26 @@ var (
 		`This option is DEPRECATED in favor of {__graphite__="a.*.c"} syntax for selecting metrics matching the given Graphite metrics filter`)
 )
 
+// UserReadableError is a type of error which supposed to be returned to the user without additional context.
+type UserReadableError struct {
+	// Err is the error which needs to be returned to the user.
+	Err error
+}
+
+// Unwrap returns ure.Err.
+//
+// This is used by standard errors package. See https://golang.org/pkg/errors
+func (ure *UserReadableError) Unwrap() error {
+	return ure.Err
+}
+
+// Error satisfies Error interface
+func (ure *UserReadableError) Error() string {
+	return ure.Err.Error()
+}
+
 // Exec executes q for the given ec.
-func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
+func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
 	if querystats.Enabled() {
 		startTime := time.Now()
 		defer querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
@@ -40,24 +59,28 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 	}
 
 	qid := activeQueriesV.Add(ec, q)
-	rv, err := evalExpr(ec, e)
+	rv, err := evalExpr(qt, ec, e)
 	activeQueriesV.Remove(qid)
 	if err != nil {
 		return nil, err
 	}
-
 	if isFirstPointOnly {
 		// Remove all the points except the first one from every time series.
 		for _, ts := range rv {
 			ts.Values = ts.Values[:1]
 			ts.Timestamps = ts.Timestamps[:1]
 		}
+		qt.Printf("leave only the first point in every series")
 	}
-
 	maySort := maySortResults(e, rv)
 	result, err := timeseriesToResult(rv, maySort)
 	if err != nil {
 		return nil, err
+	}
+	if maySort {
+		qt.Printf("sort series by metric name and labels")
+	} else {
+		qt.Printf("do not sort series by metric name and labels")
 	}
 	if n := ec.RoundDigits; n < 100 {
 		for i := range result {
@@ -66,8 +89,9 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 				values[j] = decimal.RoundToDecimalDigits(v, n)
 			}
 		}
+		qt.Printf("round series values to %d decimal digits after the point", n)
 	}
-	return result, err
+	return result, nil
 }
 
 func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
@@ -75,7 +99,8 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 	case *metricsql.FuncExpr:
 		switch strings.ToLower(v.Name) {
 		case "sort", "sort_desc",
-			"sort_by_label", "sort_by_label_desc":
+			"sort_by_label", "sort_by_label_desc",
+			"sort_by_label_numeric", "sort_by_label_numeric_desc":
 			return false
 		}
 	case *metricsql.AggrFuncExpr:
@@ -90,7 +115,7 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 }
 
 func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, error) {
-	tss = removeNaNs(tss)
+	tss = removeEmptySeries(tss)
 	result := make([]netstorage.Result, len(tss))
 	m := make(map[string]struct{}, len(tss))
 	bb := bbPool.Get()
@@ -143,7 +168,7 @@ func metricNameLess(a, b *storage.MetricName) bool {
 	return len(ats) < len(bts)
 }
 
-func removeNaNs(tss []*timeseries) []*timeseries {
+func removeEmptySeries(tss []*timeseries) []*timeseries {
 	rvs := tss[:0]
 	for _, ts := range tss {
 		allNans := true

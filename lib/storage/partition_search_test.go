@@ -168,7 +168,8 @@ func testPartitionSearchEx(t *testing.T, ptt int64, tr TimeRange, partsCount, ma
 
 	// Create partition from rowss and test search on it.
 	retentionMsecs := timestampFromTime(time.Now()) - ptr.MinTimestamp + 3600*1000
-	pt, err := createPartition(ptt, "./small-table", "./big-table", nilGetDeletedMetricIDs, retentionMsecs)
+	var isReadOnly uint32
+	pt, err := createPartition(ptt, "./small-table", "./big-table", nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
 	if err != nil {
 		t.Fatalf("cannot create partition: %s", err)
 	}
@@ -192,7 +193,7 @@ func testPartitionSearchEx(t *testing.T, ptt int64, tr TimeRange, partsCount, ma
 	pt.MustClose()
 
 	// Open the created partition and test search on it.
-	pt, err = openPartition(smallPartsPath, bigPartsPath, nilGetDeletedMetricIDs, retentionMsecs)
+	pt, err = openPartition(smallPartsPath, bigPartsPath, nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
 	if err != nil {
 		t.Fatalf("cannot open partition: %s", err)
 	}
@@ -244,7 +245,7 @@ func testPartitionSearchSerial(pt *partition, tsids []TSID, tr TimeRange, rbsExp
 	pts.Init(pt, tsids, tr)
 	for pts.NextBlock() {
 		var b Block
-		pts.BlockRef.MustReadBlock(&b, true)
+		pts.BlockRef.MustReadBlock(&b)
 		bs = append(bs, b)
 	}
 	if err := pts.Error(); err != nil {

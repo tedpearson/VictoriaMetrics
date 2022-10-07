@@ -1,5 +1,11 @@
 import {MetricBase} from "../api/types";
 
+declare global {
+  interface Window {
+    __VMUI_PREDEFINED_DASHBOARDS__: string[];
+  }
+}
+
 export interface TimeParams {
   start: number; // timestamp in seconds
   end: number; // timestamp in seconds
@@ -33,4 +39,57 @@ export enum ErrorTypes {
   emptyServer = "Please enter Server URL",
   validServer = "Please provide a valid Server URL",
   validQuery = "Please enter a valid Query and execute it"
+}
+
+export interface PanelSettings {
+  title?: string;
+  description?: string;
+  unit?: string;
+  expr: string[];
+  alias?: string[];
+  showLegend?: boolean;
+  width?: number
+}
+
+export interface DashboardRow {
+  title?: string;
+  panels: PanelSettings[];
+}
+
+export interface DashboardSettings {
+  title?: string;
+  filename: string;
+  rows: DashboardRow[];
+}
+
+export interface RelativeTimeOption {
+  id: string,
+  duration: string,
+  until: () => Date,
+  title: string,
+  isDefault?: boolean,
+}
+
+export interface TopQuery {
+  accountID: number
+  avgDurationSeconds: number
+  count: number
+  projectID: number
+  query: string
+  timeRangeSeconds: number
+  sumDurationSeconds: number
+  timeRangeHours: number
+}
+
+export interface TopQueryStats {
+  "search.queryStats.lastQueriesCount": number
+  "search.queryStats.minQueryDuration": string
+}
+
+export interface TopQueriesData extends TopQueryStats{
+  maxLifetime: string
+  topN: string
+  topByAvgDuration: TopQuery[]
+  topByCount: TopQuery[]
+  topBySumDuration: TopQuery[]
 }

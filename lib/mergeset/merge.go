@@ -114,19 +114,20 @@ again:
 	default:
 	}
 
-	bsr := heap.Pop(&bsm.bsrHeap).(*blockStreamReader)
+	bsr := bsm.bsrHeap[0]
 
-	var nextItem []byte
+	var nextItem string
 	hasNextItem := false
-	if len(bsm.bsrHeap) > 0 {
-		nextItem = bsm.bsrHeap[0].bh.firstItem
+	if len(bsm.bsrHeap) > 1 {
+		bsr := bsm.bsrHeap.getNextReader()
+		nextItem = bsr.CurrItem()
 		hasNextItem = true
 	}
 	items := bsr.Block.items
 	data := bsr.Block.data
-	for bsr.blockItemIdx < len(bsr.Block.items) {
-		item := items[bsr.blockItemIdx].Bytes(data)
-		if hasNextItem && string(item) > string(nextItem) {
+	for bsr.currItemIdx < len(bsr.Block.items) {
+		item := items[bsr.currItemIdx].Bytes(data)
+		if hasNextItem && string(item) > nextItem {
 			break
 		}
 		if !bsm.ib.Add(item) {
@@ -134,24 +135,24 @@ again:
 			bsm.flushIB(bsw, ph, itemsMerged)
 			continue
 		}
-		bsr.blockItemIdx++
+		bsr.currItemIdx++
 	}
-	if bsr.blockItemIdx == len(bsr.Block.items) {
+	if bsr.currItemIdx == len(bsr.Block.items) {
 		// bsr.Block is fully read. Proceed to the next block.
 		if bsr.Next() {
-			heap.Push(&bsm.bsrHeap, bsr)
+			heap.Fix(&bsm.bsrHeap, 0)
 			goto again
 		}
 		if err := bsr.Error(); err != nil {
 			return fmt.Errorf("cannot read storageBlock: %w", err)
 		}
+		heap.Pop(&bsm.bsrHeap)
 		goto again
 	}
 
 	// The next item in the bsr.Block exceeds nextItem.
-	// Adjust bsr.bh.firstItem and return bsr to heap.
-	bsr.bh.firstItem = append(bsr.bh.firstItem[:0], bsr.Block.items[bsr.blockItemIdx].String(bsr.Block.data)...)
-	heap.Push(&bsm.bsrHeap, bsr)
+	// Return bsr to heap.
+	heap.Fix(&bsm.bsrHeap, 0)
 	goto again
 }
 
@@ -201,6 +202,21 @@ func (bsm *blockStreamMerger) flushIB(bsw *blockStreamWriter, ph *partHeader, it
 
 type bsrHeap []*blockStreamReader
 
+func (bh bsrHeap) getNextReader() *blockStreamReader {
+	if len(bh) < 2 {
+		return nil
+	}
+	if len(bh) < 3 {
+		return bh[1]
+	}
+	a := bh[1]
+	b := bh[2]
+	if a.CurrItem() <= b.CurrItem() {
+		return a
+	}
+	return b
+}
+
 func (bh *bsrHeap) Len() int {
 	return len(*bh)
 }
@@ -212,7 +228,7 @@ func (bh *bsrHeap) Swap(i, j int) {
 
 func (bh *bsrHeap) Less(i, j int) bool {
 	x := *bh
-	return string(x[i].bh.firstItem) < string(x[j].bh.firstItem)
+	return x[i].CurrItem() < x[j].CurrItem()
 }
 
 func (bh *bsrHeap) Pop() interface{} {

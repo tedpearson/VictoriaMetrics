@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/appmetrics"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -30,17 +31,21 @@ import (
 )
 
 var (
-	tlsEnable   = flag.Bool("tls", false, "Whether to enable TLS (aka HTTPS) for incoming requests. -tlsCertFile and -tlsKeyFile must be set if -tls is set")
-	tlsCertFile = flag.String("tlsCertFile", "", "Path to file with TLS certificate. Used only if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower")
-	tlsKeyFile  = flag.String("tlsKeyFile", "", "Path to file with TLS key. Used only if -tls is set")
+	tlsEnable       = flag.Bool("tls", false, "Whether to enable TLS for incoming HTTP requests at -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set")
+	tlsCertFile     = flag.String("tlsCertFile", "", "Path to file with TLS certificate if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated")
+	tlsKeyFile      = flag.String("tlsKeyFile", "", "Path to file with TLS key if -tls is set. The provided key file is automatically re-read every second, so it can be dynamically updated")
+	tlsCipherSuites = flagutil.NewArrayString("tlsCipherSuites", "Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants")
+	tlsMinVersion   = flag.String("tlsMinVersion", "", "Optional minimum TLS version to use for incoming requests over HTTPS if -tls is set. "+
+		"Supported values: TLS10, TLS11, TLS12, TLS13")
 
 	pathPrefix = flag.String("http.pathPrefix", "", "An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, "+
 		"then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. "+
 		"See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus")
 	httpAuthUsername = flag.String("httpAuth.username", "", "Username for HTTP Basic Auth. The authentication is disabled if empty. See also -httpAuth.password")
 	httpAuthPassword = flag.String("httpAuth.password", "", "Password for HTTP Basic Auth. The authentication is disabled if -httpAuth.username is empty")
-	metricsAuthKey   = flag.String("metricsAuthKey", "", "Auth key for /metrics. It must be passed via authKey query arg. It overrides httpAuth.* settings")
-	pprofAuthKey     = flag.String("pprofAuthKey", "", "Auth key for /debug/pprof. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	metricsAuthKey   = flag.String("metricsAuthKey", "", "Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	flagsAuthKey     = flag.String("flagsAuthKey", "", "Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	pprofAuthKey     = flag.String("pprofAuthKey", "", "Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings")
 
 	disableResponseCompression  = flag.Bool("http.disableResponseCompression", false, "Disable compression of HTTP responses to save CPU resources. By default compression is enabled to save network bandwidth")
 	maxGracefulShutdownDuration = flag.Duration("http.maxGracefulShutdownDuration", 7*time.Second, `The maximum duration for a graceful shutdown of the HTTP server. A highly loaded server may require increased value for a graceful shutdown`)
@@ -90,23 +95,17 @@ func Serve(addr string, rh RequestHandler) {
 	}
 	logger.Infof("starting http server at %s://%s/", scheme, hostAddr)
 	logger.Infof("pprof handlers are exposed at %s://%s/debug/pprof/", scheme, hostAddr)
-	lnTmp, err := netutil.NewTCPListener(scheme, addr)
+	var tlsConfig *tls.Config
+	if *tlsEnable {
+		tc, err := netutil.GetServerTLSConfig(*tlsCertFile, *tlsKeyFile, *tlsMinVersion, *tlsCipherSuites)
+		if err != nil {
+			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q: %s", *tlsCertFile, *tlsKeyFile, *tlsMinVersion, err)
+		}
+		tlsConfig = tc
+	}
+	ln, err := netutil.NewTCPListener(scheme, addr, tlsConfig)
 	if err != nil {
 		logger.Fatalf("cannot start http server at %s: %s", addr, err)
-	}
-	ln := net.Listener(lnTmp)
-
-	if *tlsEnable {
-		cert, err := tls.LoadX509KeyPair(*tlsCertFile, *tlsKeyFile)
-		if err != nil {
-			logger.Fatalf("cannot load TLS cert from tlsCertFile=%q, tlsKeyFile=%q: %s", *tlsCertFile, *tlsKeyFile, err)
-		}
-		cfg := &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			PreferServerCipherSuites: true,
-		}
-		ln = tls.NewListener(ln, cfg)
 	}
 	serveWithListener(addr, ln, rh)
 }
@@ -239,13 +238,27 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		connTimeoutClosedConns.Inc()
 		w.Header().Set("Connection", "close")
 	}
-	path, err := getCanonicalPath(r.URL.Path)
-	if err != nil {
-		Errorf(w, r, "cannot get canonical path: %s", err)
-		unsupportedRequestErrors.Inc()
-		return
+	path := r.URL.Path
+	prefix := GetPathPrefix()
+	if prefix != "" {
+		// Trim -http.pathPrefix from path
+		prefixNoTrailingSlash := strings.TrimSuffix(prefix, "/")
+		if path == prefixNoTrailingSlash {
+			// Redirect to url with / at the end.
+			// This is needed for proper handling of relative urls in web browsers.
+			// Intentionally ignore query args, since it is expected that the requested url
+			// is composed by a human, so it doesn't contain query args.
+			Redirect(w, prefix)
+			return
+		}
+		if !strings.HasPrefix(path, prefix) {
+			Errorf(w, r, "missing -http.pathPrefix=%q in the requested path %q", *pathPrefix, path)
+			unsupportedRequestErrors.Inc()
+			return
+		}
+		path = path[len(prefix)-1:]
+		r.URL.Path = path
 	}
-	r.URL.Path = path
 	switch r.URL.Path {
 	case "/health":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -285,10 +298,14 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		}
 		startTime := time.Now()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		WritePrometheusMetrics(w)
+		appmetrics.WritePrometheusMetrics(w)
 		metricsHandlerDuration.UpdateDuration(startTime)
 		return
 	case "/flags":
+		if len(*flagsAuthKey) > 0 && r.FormValue("authKey") != *flagsAuthKey {
+			http.Error(w, "The provided authKey doesn't match -flagsAuthKey", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		flagutil.WriteFlags(w)
 		return
@@ -325,24 +342,6 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		unsupportedRequestErrors.Inc()
 		return
 	}
-}
-
-func getCanonicalPath(path string) (string, error) {
-	if len(*pathPrefix) == 0 || path == "/" {
-		return path, nil
-	}
-	if *pathPrefix == path {
-		return "/", nil
-	}
-	prefix := *pathPrefix
-	if !strings.HasSuffix(prefix, "/") {
-		prefix = prefix + "/"
-	}
-	if !strings.HasPrefix(path, prefix) {
-		return "", fmt.Errorf("missing `-pathPrefix=%q` in the requested path: %q", *pathPrefix, path)
-	}
-	path = path[len(prefix)-1:]
-	return path, nil
 }
 
 func checkBasicAuth(w http.ResponseWriter, r *http.Request) bool {
@@ -643,7 +642,17 @@ func IsTLS() bool {
 
 // GetPathPrefix - returns http server path prefix.
 func GetPathPrefix() string {
-	return *pathPrefix
+	prefix := *pathPrefix
+	if prefix == "" {
+		return ""
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix
 }
 
 // WriteAPIHelp writes pathList to w in HTML format.
@@ -670,4 +679,16 @@ func GetRequestURI(r *http.Request) string {
 		delimiter = "&"
 	}
 	return requestURI + delimiter + queryArgs
+}
+
+// Redirect redirects to the given url.
+func Redirect(w http.ResponseWriter, url string) {
+	// Do not use http.Redirect, since it breaks relative redirects
+	// if the http.Request.URL contains unexpected url.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2918
+	w.Header().Set("Location", url)
+	// Use http.StatusFound instead of http.StatusMovedPermanently,
+	// since browsers can cache incorrect redirects returned with StatusMovedPermanently.
+	// This may require browser cache cleaning after the incorrect redirect is fixed.
+	w.WriteHeader(http.StatusFound)
 }

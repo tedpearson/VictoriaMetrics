@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,9 +23,6 @@ import (
 // See https://graphite.readthedocs.io/en/stable/tags.html#removing-series-from-the-tagdb
 func TagsDelSeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
 	paths := r.Form["path"]
 	totalDeleted := 0
 	var row graphiteparser.Row
@@ -54,8 +50,8 @@ func TagsDelSeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 			})
 		}
 		tfss := joinTagFilterss(tfs, etfs)
-		sq := storage.NewSearchQuery(0, ct, tfss)
-		n, err := netstorage.DeleteSeries(sq, deadline)
+		sq := storage.NewSearchQuery(0, ct, tfss, 0)
+		n, err := netstorage.DeleteSeries(nil, sq, deadline)
 		if err != nil {
 			return fmt.Errorf("cannot delete series for %q: %w", sq, err)
 		}
@@ -86,9 +82,8 @@ func TagsTagMultiSeriesHandler(startTime time.Time, w http.ResponseWriter, r *ht
 }
 
 func registerMetrics(startTime time.Time, w http.ResponseWriter, r *http.Request, isJSONResponse bool) error {
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
+	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	_ = deadline // TODO: use the deadline as in the cluster branch
 	paths := r.Form["path"]
 	var row graphiteparser.Row
 	var labels []prompb.Label
@@ -134,7 +129,7 @@ func registerMetrics(startTime time.Time, w http.ResponseWriter, r *http.Request
 		mr.MetricNameRaw = storage.MarshalMetricNameRaw(mr.MetricNameRaw[:0], labels)
 		mr.Timestamp = ct
 	}
-	if err := vmstorage.RegisterMetricNames(mrs); err != nil {
+	if err := vmstorage.RegisterMetricNames(nil, mrs); err != nil {
 		return fmt.Errorf("cannot register paths: %w", err)
 	}
 
@@ -163,10 +158,7 @@ var (
 // See https://graphite.readthedocs.io/en/stable/tags.html#auto-complete-support
 func TagsAutoCompleteValuesHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	limit, err := getInt(r, "limit")
+	limit, err := searchutils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
@@ -186,21 +178,21 @@ func TagsAutoCompleteValuesHandler(startTime time.Time, w http.ResponseWriter, r
 		return fmt.Errorf("cannot setup tag filters: %w", err)
 	}
 	if len(exprs) == 0 && len(etfs) == 0 {
-		// Fast path: there are no `expr` filters, so use netstorage.GetGraphiteTagValues.
+		// Fast path: there are no `expr` filters, so use netstorage.GraphiteTagValues.
 		// Escape special chars in tagPrefix as Graphite does.
 		// See https://github.com/graphite-project/graphite-web/blob/3ad279df5cb90b211953e39161df416e54a84948/webapp/graphite/tags/base.py#L228
 		filter := regexp.QuoteMeta(valuePrefix)
-		tagValues, err = netstorage.GetGraphiteTagValues(tag, filter, limit, deadline)
+		tagValues, err = netstorage.GraphiteTagValues(nil, tag, filter, limit, deadline)
 		if err != nil {
 			return err
 		}
 	} else {
 		// Slow path: use netstorage.SearchMetricNames for applying `expr` filters.
-		sq, err := getSearchQueryForExprs(startTime, etfs, exprs)
+		sq, err := getSearchQueryForExprs(startTime, etfs, exprs, limit*10)
 		if err != nil {
 			return err
 		}
-		mns, err := netstorage.SearchMetricNames(sq, deadline)
+		metricNames, err := netstorage.SearchMetricNames(nil, sq, deadline)
 		if err != nil {
 			return fmt.Errorf("cannot fetch metric names for %q: %w", sq, err)
 		}
@@ -208,7 +200,11 @@ func TagsAutoCompleteValuesHandler(startTime time.Time, w http.ResponseWriter, r
 		if tag == "name" {
 			tag = "__name__"
 		}
-		for _, mn := range mns {
+		var mn storage.MetricName
+		for _, metricName := range metricNames {
+			if err := mn.UnmarshalString(metricName); err != nil {
+				return fmt.Errorf("cannot unmarshal metricName=%q: %w", metricName, err)
+			}
 			tagValue := mn.GetTagValue(tag)
 			if len(tagValue) == 0 {
 				continue
@@ -252,10 +248,7 @@ var tagsAutoCompleteValuesDuration = metrics.NewSummary(`vm_request_duration_sec
 // See https://graphite.readthedocs.io/en/stable/tags.html#auto-complete-support
 func TagsAutoCompleteTagsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	limit, err := getInt(r, "limit")
+	limit, err := searchutils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
@@ -271,27 +264,31 @@ func TagsAutoCompleteTagsHandler(startTime time.Time, w http.ResponseWriter, r *
 		return fmt.Errorf("cannot setup tag filters: %w", err)
 	}
 	if len(exprs) == 0 && len(etfs) == 0 {
-		// Fast path: there are no `expr` filters, so use netstorage.GetGraphiteTags.
+		// Fast path: there are no `expr` filters, so use netstorage.GraphiteTags.
 
 		// Escape special chars in tagPrefix as Graphite does.
 		// See https://github.com/graphite-project/graphite-web/blob/3ad279df5cb90b211953e39161df416e54a84948/webapp/graphite/tags/base.py#L181
 		filter := regexp.QuoteMeta(tagPrefix)
-		labels, err = netstorage.GetGraphiteTags(filter, limit, deadline)
+		labels, err = netstorage.GraphiteTags(nil, filter, limit, deadline)
 		if err != nil {
 			return err
 		}
 	} else {
 		// Slow path: use netstorage.SearchMetricNames for applying `expr` filters.
-		sq, err := getSearchQueryForExprs(startTime, etfs, exprs)
+		sq, err := getSearchQueryForExprs(startTime, etfs, exprs, limit*10)
 		if err != nil {
 			return err
 		}
-		mns, err := netstorage.SearchMetricNames(sq, deadline)
+		metricNames, err := netstorage.SearchMetricNames(nil, sq, deadline)
 		if err != nil {
 			return fmt.Errorf("cannot fetch metric names for %q: %w", sq, err)
 		}
 		m := make(map[string]struct{})
-		for _, mn := range mns {
+		var mn storage.MetricName
+		for _, metricName := range metricNames {
+			if err := mn.UnmarshalString(metricName); err != nil {
+				return fmt.Errorf("cannot unmarshal metricName=%q: %w", metricName, err)
+			}
 			m["name"] = struct{}{}
 			for _, tag := range mn.Tags {
 				m[string(tag.Key)] = struct{}{}
@@ -334,10 +331,7 @@ var tagsAutoCompleteTagsDuration = metrics.NewSummary(`vm_request_duration_secon
 // See https://graphite.readthedocs.io/en/stable/tags.html#exploring-tags
 func TagsFindSeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	limit, err := getInt(r, "limit")
+	limit, err := searchutils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
@@ -349,15 +343,18 @@ func TagsFindSeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.R
 	if err != nil {
 		return fmt.Errorf("cannot setup tag filters: %w", err)
 	}
-	sq, err := getSearchQueryForExprs(startTime, etfs, exprs)
+	sq, err := getSearchQueryForExprs(startTime, etfs, exprs, limit*10)
 	if err != nil {
 		return err
 	}
-	mns, err := netstorage.SearchMetricNames(sq, deadline)
+	metricNames, err := netstorage.SearchMetricNames(nil, sq, deadline)
 	if err != nil {
 		return fmt.Errorf("cannot fetch metric names for %q: %w", sq, err)
 	}
-	paths := getCanonicalPaths(mns)
+	paths, err := getCanonicalPaths(metricNames)
+	if err != nil {
+		return fmt.Errorf("cannot obtain canonical paths: %w", err)
+	}
 	if limit > 0 && limit < len(paths) {
 		paths = paths[:limit]
 	}
@@ -373,14 +370,18 @@ func TagsFindSeriesHandler(startTime time.Time, w http.ResponseWriter, r *http.R
 	return nil
 }
 
-func getCanonicalPaths(mns []storage.MetricName) []string {
-	paths := make([]string, 0, len(mns))
-	for _, mn := range mns {
+func getCanonicalPaths(metricNames []string) ([]string, error) {
+	paths := make([]string, 0, len(metricNames))
+	var mn storage.MetricName
+	for _, metricName := range metricNames {
+		if err := mn.UnmarshalString(metricName); err != nil {
+			return nil, fmt.Errorf("cannot unmarshal metricName=%q: %w", metricName, err)
+		}
 		path := getCanonicalPath(&mn)
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	return paths
+	return paths, nil
 }
 
 func getCanonicalPath(mn *storage.MetricName) string {
@@ -405,15 +406,12 @@ var tagsFindSeriesDuration = metrics.NewSummary(`vm_request_duration_seconds{pat
 // See https://graphite.readthedocs.io/en/stable/tags.html#exploring-tags
 func TagValuesHandler(startTime time.Time, tagName string, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	limit, err := getInt(r, "limit")
+	limit, err := searchutils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
 	filter := r.FormValue("filter")
-	tagValues, err := netstorage.GetGraphiteTagValues(tagName, filter, limit, deadline)
+	tagValues, err := netstorage.GraphiteTagValues(nil, tagName, filter, limit, deadline)
 	if err != nil {
 		return err
 	}
@@ -436,15 +434,12 @@ var tagValuesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/t
 // See https://graphite.readthedocs.io/en/stable/tags.html#exploring-tags
 func TagsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	if err := r.ParseForm(); err != nil {
-		return fmt.Errorf("cannot parse form values: %w", err)
-	}
-	limit, err := getInt(r, "limit")
+	limit, err := searchutils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
 	filter := r.FormValue("filter")
-	labels, err := netstorage.GetGraphiteTags(filter, limit, deadline)
+	labels, err := netstorage.GraphiteTags(nil, filter, limit, deadline)
 	if err != nil {
 		return err
 	}
@@ -462,26 +457,14 @@ func TagsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) er
 
 var tagsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/tags"}`)
 
-func getInt(r *http.Request, argName string) (int, error) {
-	argValue := r.FormValue(argName)
-	if len(argValue) == 0 {
-		return 0, nil
-	}
-	n, err := strconv.Atoi(argValue)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse %q=%q: %w", argName, argValue, err)
-	}
-	return n, nil
-}
-
-func getSearchQueryForExprs(startTime time.Time, etfs [][]storage.TagFilter, exprs []string) (*storage.SearchQuery, error) {
+func getSearchQueryForExprs(startTime time.Time, etfs [][]storage.TagFilter, exprs []string, maxMetrics int) (*storage.SearchQuery, error) {
 	tfs, err := exprsToTagFilters(exprs)
 	if err != nil {
 		return nil, err
 	}
 	ct := startTime.UnixNano() / 1e6
 	tfss := joinTagFilterss(tfs, etfs)
-	sq := storage.NewSearchQuery(0, ct, tfss)
+	sq := storage.NewSearchQuery(0, ct, tfss, maxMetrics)
 	return sq, nil
 }
 

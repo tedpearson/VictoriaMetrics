@@ -306,9 +306,6 @@ func (p *parser) parseWithArgExpr() (*withArgExpr, error) {
 		return nil, fmt.Errorf(`withArgExpr: unexpected token %q; want "ident"`, p.lex.Token)
 	}
 	wa.Name = unescapeIdent(p.lex.Token)
-	if isAggrFunc(wa.Name) || IsRollupFunc(wa.Name) || IsTransformFunc(wa.Name) || isWith(wa.Name) {
-		return nil, fmt.Errorf(`withArgExpr: cannot use reserved name %q`, wa.Name)
-	}
 	if err := p.lex.Next(); err != nil {
 		return nil, err
 	}
@@ -682,16 +679,20 @@ func expandWithExpr(was []*withArgExpr, e Expr) (Expr, error) {
 			return nil, err
 		}
 		wa := getWithArgExpr(was, t.Name)
-		if wa == nil {
-			fe := *t
-			fe.Args = args
-			return &fe, nil
+		if wa != nil {
+			return expandWithExprExt(was, wa, args)
 		}
-		return expandWithExprExt(was, wa, args)
+		fe := *t
+		fe.Args = args
+		return &fe, nil
 	case *AggrFuncExpr:
 		args, err := expandWithArgs(was, t.Args)
 		if err != nil {
 			return nil, err
+		}
+		wa := getWithArgExpr(was, t.Name)
+		if wa != nil {
+			return expandWithExprExt(was, wa, args)
 		}
 		modifierArgs, err := expandModifierArgs(was, t.Modifier.Args)
 		if err != nil {
@@ -1836,7 +1837,7 @@ func (lf *LabelFilter) AppendString(dst []byte) []byte {
 // MetricExpr represents MetricsQL metric with optional filters, i.e. `foo{...}`.
 type MetricExpr struct {
 	// LabelFilters contains a list of label filters from curly braces.
-	// Metric name if present must be the first.
+	// Filter or metric name must be the first if present.
 	LabelFilters []LabelFilter
 
 	// labelFilters must be expanded to LabelFilters by expandWithExpr.
@@ -1884,6 +1885,9 @@ func (me *MetricExpr) hasNonEmptyMetricGroup() bool {
 	if len(me.LabelFilters) == 0 {
 		return false
 	}
-	lf := &me.LabelFilters[0]
+	return me.LabelFilters[0].isMetricNameFilter()
+}
+
+func (lf *LabelFilter) isMetricNameFilter() bool {
 	return lf.Label == "__name__" && !lf.IsNegative && !lf.IsRegexp
 }

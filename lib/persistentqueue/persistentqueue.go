@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
@@ -221,14 +220,14 @@ func tryOpeningQueue(path, name string, chunkFileSize, maxBlockSize, maxPendingB
 	}
 
 	// Locate reader and writer chunks in the path.
-	fis, err := ioutil.ReadDir(path)
+	des, err := os.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read contents of the directory %q: %w", path, err)
 	}
-	for _, fi := range fis {
-		fname := fi.Name()
+	for _, de := range des {
+		fname := de.Name()
 		filepath := path + "/" + fname
-		if fi.IsDir() {
+		if de.IsDir() {
 			logger.Errorf("skipping unknown directory %q", filepath)
 			continue
 		}
@@ -499,7 +498,7 @@ func (q *queue) readBlock(dst []byte) ([]byte, error) {
 again:
 	// Read block len.
 	header := headerBufPool.Get()
-	header.B = bytesutil.ResizeNoCopy(header.B, 8)
+	header.B = bytesutil.ResizeNoCopyMayOverallocate(header.B, 8)
 	err := q.readFull(header.B)
 	blockLen := encoding.UnmarshalUint64(header.B)
 	headerBufPool.Put(header)
@@ -520,7 +519,7 @@ again:
 
 	// Read block contents.
 	dstLen := len(dst)
-	dst = bytesutil.ResizeWithCopy(dst, dstLen+int(blockLen))
+	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, dstLen+int(blockLen))
 	if err := q.readFull(dst[dstLen:]); err != nil {
 		logger.Errorf("skipping corrupted %q, since contents with size %d bytes cannot be read from it: %s", q.readerPath, blockLen, err)
 		if err := q.skipBrokenChunkFile(); err != nil {
@@ -671,7 +670,7 @@ func (mi *metainfo) WriteToFile(path string) error {
 	if err != nil {
 		return fmt.Errorf("cannot marshal persistent queue metainfo %#v: %w", mi, err)
 	}
-	if err := ioutil.WriteFile(path, data, 0600); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("cannot write persistent queue metainfo to %q: %w", path, err)
 	}
 	fs.MustSyncPath(path)
@@ -680,7 +679,7 @@ func (mi *metainfo) WriteToFile(path string) error {
 
 func (mi *metainfo) ReadFromFile(path string) error {
 	mi.Reset()
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return err

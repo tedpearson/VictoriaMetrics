@@ -6,27 +6,31 @@ import (
 	"log"
 	"sync"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
-	"github.com/cheggaaa/pb/v3"
 )
 
 type influxProcessor struct {
-	ic        *influx.Client
-	im        *vm.Importer
-	cc        int
-	separator string
+	ic          *influx.Client
+	im          *vm.Importer
+	cc          int
+	separator   string
+	skipDbLabel bool
+	promMode    bool
 }
 
-func newInfluxProcessor(ic *influx.Client, im *vm.Importer, cc int, separator string) *influxProcessor {
+func newInfluxProcessor(ic *influx.Client, im *vm.Importer, cc int, separator string, skipDbLabel bool, promMode bool) *influxProcessor {
 	if cc < 1 {
 		cc = 1
 	}
 	return &influxProcessor{
-		ic:        ic,
-		im:        im,
-		cc:        cc,
-		separator: separator,
+		ic:          ic,
+		im:          im,
+		cc:          cc,
+		separator:   separator,
+		skipDbLabel: skipDbLabel,
+		promMode:    promMode,
 	}
 }
 
@@ -44,7 +48,12 @@ func (ip *influxProcessor) run(silent, verbose bool) error {
 		return nil
 	}
 
-	bar := pb.StartNew(len(series))
+	bar := barpool.AddWithTemplate(fmt.Sprintf(barTpl, "Processing series"), len(series))
+	if err := barpool.Start(); err != nil {
+		return err
+	}
+	defer barpool.Stop()
+
 	seriesCh := make(chan *influx.Series)
 	errCh := make(chan error)
 	ip.im.ResetStats()
@@ -78,19 +87,25 @@ func (ip *influxProcessor) run(silent, verbose bool) error {
 	close(seriesCh)
 	wg.Wait()
 	ip.im.Close()
+	close(errCh)
 	// drain import errors channel
 	for vmErr := range ip.im.Errors() {
 		if vmErr.Err != nil {
 			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, verbose))
 		}
 	}
-	bar.Finish()
+	for err := range errCh {
+		return fmt.Errorf("import process failed: %s", err)
+	}
+
 	log.Println("Import finished!")
 	log.Print(ip.im.Stats())
 	return nil
 }
 
 const dbLabel = "db"
+const nameLabel = "__name__"
+const valueField = "value"
 
 func (ip *influxProcessor) do(s *influx.Series) error {
 	cr, err := ip.ic.FetchDataPoints(s)
@@ -112,14 +127,15 @@ func (ip *influxProcessor) do(s *influx.Series) error {
 	for i, lp := range s.LabelPairs {
 		if lp.Name == dbLabel {
 			containsDBLabel = true
-			break
+		} else if lp.Name == nameLabel && s.Field == valueField && ip.promMode {
+			name = lp.Value
 		}
 		labels[i] = vm.LabelPair{
 			Name:  lp.Name,
 			Value: lp.Value,
 		}
 	}
-	if !containsDBLabel {
+	if !containsDBLabel && !ip.skipDbLabel {
 		labels = append(labels, vm.LabelPair{
 			Name:  dbLabel,
 			Value: ip.ic.Database(),
@@ -138,11 +154,14 @@ func (ip *influxProcessor) do(s *influx.Series) error {
 		if len(time) < 1 {
 			continue
 		}
-		ip.im.Input() <- &vm.TimeSeries{
+		ts := vm.TimeSeries{
 			Name:       name,
 			LabelPairs: labels,
 			Timestamps: time,
 			Values:     values,
+		}
+		if err := ip.im.Input(&ts); err != nil {
+			return err
 		}
 	}
 }

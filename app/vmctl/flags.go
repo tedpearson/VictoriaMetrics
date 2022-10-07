@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/urfave/cli/v2"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/stepper"
 )
 
 const (
@@ -36,6 +38,7 @@ const (
 	vmBatchSize          = "vm-batch-size"
 	vmSignificantFigures = "vm-significant-figures"
 	vmRoundDigits        = "vm-round-digits"
+	vmDisableProgressBar = "vm-disable-progress-bar"
 
 	// also used in vm-native
 	vmExtraLabel = "vm-extra-label"
@@ -108,6 +111,10 @@ var (
 			Name: vmRateLimit,
 			Usage: "Optional data transfer rate limit in bytes per second.\n" +
 				"By default the rate limit is disabled. It can be useful for limiting load on configured via '--vmAddr' destination.",
+		},
+		&cli.BoolFlag{
+			Name:  vmDisableProgressBar,
+			Usage: "Whether to disable progress bar per each worker during the import.",
 		},
 	}
 )
@@ -196,6 +203,8 @@ const (
 	influxFilterTimeStart           = "influx-filter-time-start"
 	influxFilterTimeEnd             = "influx-filter-time-end"
 	influxMeasurementFieldSeparator = "influx-measurement-field-separator"
+	influxSkipDatabaseLabel         = "influx-skip-database-label"
+	influxPrometheusMode            = "influx-prometheus-mode"
 )
 
 var (
@@ -253,6 +262,16 @@ var (
 			Usage: "The {separator} symbol used to concatenate {measurement} and {field} names into series name {measurement}{separator}{field}.",
 			Value: "_",
 		},
+		&cli.BoolFlag{
+			Name:  influxSkipDatabaseLabel,
+			Usage: "Wether to skip adding the label 'db' to timeseries.",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  influxPrometheusMode,
+			Usage: "Wether to restore the original timeseries name previously written from Prometheus to InfluxDB v1 via remote_write.",
+			Value: false,
+		},
 	}
 )
 
@@ -301,6 +320,7 @@ const (
 	vmNativeFilterMatch     = "vm-native-filter-match"
 	vmNativeFilterTimeStart = "vm-native-filter-time-start"
 	vmNativeFilterTimeEnd   = "vm-native-filter-time-end"
+	vmNativeStepInterval    = "vm-native-step-interval"
 
 	vmNativeSrcAddr     = "vm-native-src-addr"
 	vmNativeSrcUser     = "vm-native-src-user"
@@ -327,6 +347,10 @@ var (
 		&cli.StringFlag{
 			Name:  vmNativeFilterTimeEnd,
 			Usage: "The time filter may contain either unix timestamp in seconds or RFC3339 values. E.g. '2020-01-01T20:07:00Z'",
+		},
+		&cli.StringFlag{
+			Name:  vmNativeStepInterval,
+			Usage: fmt.Sprintf("Split export data into chunks. Requires setting --%s. Valid values are '%s','%s','%s'.", vmNativeFilterTimeStart, stepper.StepMonth, stepper.StepDay, stepper.StepHour),
 		},
 		&cli.StringFlag{
 			Name: vmNativeSrcAddr,

@@ -63,17 +63,17 @@ func (bsw *blockStreamWriter) reset() {
 	bsw.mrFirstItemCaught = false
 }
 
-func (bsw *blockStreamWriter) InitFromInmemoryPart(ip *inmemoryPart) {
+func (bsw *blockStreamWriter) InitFromInmemoryPart(mp *inmemoryPart) {
 	bsw.reset()
 
 	// Use the minimum compression level for in-memory blocks,
 	// since they are going to be re-compressed during the merge into file-based blocks.
 	bsw.compressLevel = -5 // See https://github.com/facebook/zstd/releases/tag/v1.3.4
 
-	bsw.metaindexWriter = &ip.metaindexData
-	bsw.indexWriter = &ip.indexData
-	bsw.itemsWriter = &ip.itemsData
-	bsw.lensWriter = &ip.lensData
+	bsw.metaindexWriter = &mp.metaindexData
+	bsw.indexWriter = &mp.indexData
+	bsw.itemsWriter = &mp.itemsData
+	bsw.lensWriter = &mp.lensData
 }
 
 // InitFromFilePart initializes bsw from a file-based part on the given path.
@@ -94,7 +94,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	metaindexPath := path + "/metaindex.bin"
 	metaindexFile, err := filestream.Create(metaindexPath, false)
 	if err != nil {
-		fs.MustRemoveAll(path)
+		fs.MustRemoveDirAtomic(path)
 		return fmt.Errorf("cannot create metaindex file: %w", err)
 	}
 
@@ -102,7 +102,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	indexFile, err := filestream.Create(indexPath, nocache)
 	if err != nil {
 		metaindexFile.MustClose()
-		fs.MustRemoveAll(path)
+		fs.MustRemoveDirAtomic(path)
 		return fmt.Errorf("cannot create index file: %w", err)
 	}
 
@@ -111,7 +111,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	if err != nil {
 		metaindexFile.MustClose()
 		indexFile.MustClose()
-		fs.MustRemoveAll(path)
+		fs.MustRemoveDirAtomic(path)
 		return fmt.Errorf("cannot create items file: %w", err)
 	}
 
@@ -121,7 +121,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 		metaindexFile.MustClose()
 		indexFile.MustClose()
 		itemsFile.MustClose()
-		fs.MustRemoveAll(path)
+		fs.MustRemoveDirAtomic(path)
 		return fmt.Errorf("cannot create lens file: %w", err)
 	}
 

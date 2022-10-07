@@ -17,7 +17,11 @@ type blockStreamReader struct {
 	// Block contains the current block if Next returned true.
 	Block inmemoryBlock
 
-	blockItemIdx int
+	// isInmemoryBlock is set to true if bsr was initialized with InitFromInmemoryBlock().
+	isInmemoryBlock bool
+
+	// The index of the current item in the Block, which is returned from CurrItem()
+	currItemIdx int
 
 	path string
 
@@ -66,7 +70,8 @@ type blockStreamReader struct {
 
 func (bsr *blockStreamReader) reset() {
 	bsr.Block.Reset()
-	bsr.blockItemIdx = 0
+	bsr.isInmemoryBlock = false
+	bsr.currItemIdx = 0
 	bsr.path = ""
 	bsr.ph.Reset()
 	bsr.mrs = nil
@@ -98,20 +103,28 @@ func (bsr *blockStreamReader) String() string {
 	return bsr.ph.String()
 }
 
-// InitFromInmemoryPart initializes bsr from the given ip.
-func (bsr *blockStreamReader) InitFromInmemoryPart(ip *inmemoryPart) {
+// InitFromInmemoryBlock initializes bsr from the given ib.
+func (bsr *blockStreamReader) InitFromInmemoryBlock(ib *inmemoryBlock) {
+	bsr.reset()
+	bsr.Block.CopyFrom(ib)
+	bsr.Block.SortItems()
+	bsr.isInmemoryBlock = true
+}
+
+// InitFromInmemoryPart initializes bsr from the given mp.
+func (bsr *blockStreamReader) InitFromInmemoryPart(mp *inmemoryPart) {
 	bsr.reset()
 
 	var err error
-	bsr.mrs, err = unmarshalMetaindexRows(bsr.mrs[:0], ip.metaindexData.NewReader())
+	bsr.mrs, err = unmarshalMetaindexRows(bsr.mrs[:0], mp.metaindexData.NewReader())
 	if err != nil {
 		logger.Panicf("BUG: cannot unmarshal metaindex rows from inmemory part: %s", err)
 	}
 
-	bsr.ph.CopyFrom(&ip.ph)
-	bsr.indexReader = ip.indexData.NewReader()
-	bsr.itemsReader = ip.itemsData.NewReader()
-	bsr.lensReader = ip.lensData.NewReader()
+	bsr.ph.CopyFrom(&mp.ph)
+	bsr.indexReader = mp.indexData.NewReader()
+	bsr.itemsReader = mp.itemsData.NewReader()
+	bsr.lensReader = mp.lensData.NewReader()
 
 	if bsr.ph.itemsCount <= 0 {
 		logger.Panicf("BUG: source inmemoryPart must contain at least a single item")
@@ -178,16 +191,25 @@ func (bsr *blockStreamReader) InitFromFilePart(path string) error {
 //
 // It closes *Reader files passed to Init.
 func (bsr *blockStreamReader) MustClose() {
-	bsr.indexReader.MustClose()
-	bsr.itemsReader.MustClose()
-	bsr.lensReader.MustClose()
-
+	if !bsr.isInmemoryBlock {
+		bsr.indexReader.MustClose()
+		bsr.itemsReader.MustClose()
+		bsr.lensReader.MustClose()
+	}
 	bsr.reset()
+}
+
+func (bsr *blockStreamReader) CurrItem() string {
+	return bsr.Block.items[bsr.currItemIdx].String(bsr.Block.data)
 }
 
 func (bsr *blockStreamReader) Next() bool {
 	if bsr.err != nil {
 		return false
+	}
+	if bsr.isInmemoryBlock {
+		bsr.err = io.EOF
+		return true
 	}
 
 	if bsr.bhIdx >= len(bsr.bhs) {
@@ -211,13 +233,13 @@ func (bsr *blockStreamReader) Next() bool {
 	bsr.bh = &bsr.bhs[bsr.bhIdx]
 	bsr.bhIdx++
 
-	bsr.sb.itemsData = bytesutil.ResizeNoCopy(bsr.sb.itemsData, int(bsr.bh.itemsBlockSize))
+	bsr.sb.itemsData = bytesutil.ResizeNoCopyMayOverallocate(bsr.sb.itemsData, int(bsr.bh.itemsBlockSize))
 	if err := fs.ReadFullData(bsr.itemsReader, bsr.sb.itemsData); err != nil {
 		bsr.err = fmt.Errorf("cannot read compressed items block with size %d: %w", bsr.bh.itemsBlockSize, err)
 		return false
 	}
 
-	bsr.sb.lensData = bytesutil.ResizeNoCopy(bsr.sb.lensData, int(bsr.bh.lensBlockSize))
+	bsr.sb.lensData = bytesutil.ResizeNoCopyMayOverallocate(bsr.sb.lensData, int(bsr.bh.lensBlockSize))
 	if err := fs.ReadFullData(bsr.lensReader, bsr.sb.lensData); err != nil {
 		bsr.err = fmt.Errorf("cannot read compressed lens block with size %d: %w", bsr.bh.lensBlockSize, err)
 		return false
@@ -233,7 +255,7 @@ func (bsr *blockStreamReader) Next() bool {
 		bsr.err = fmt.Errorf("too many blocks read: %d; must be smaller than partHeader.blocksCount %d", bsr.blocksRead, bsr.ph.blocksCount)
 		return false
 	}
-	bsr.blockItemIdx = 0
+	bsr.currItemIdx = 0
 	bsr.itemsRead += uint64(len(bsr.Block.items))
 	if bsr.itemsRead > bsr.ph.itemsCount {
 		bsr.err = fmt.Errorf("too many items read: %d; must be smaller than partHeader.itemsCount %d", bsr.itemsRead, bsr.ph.itemsCount)
@@ -260,7 +282,7 @@ func (bsr *blockStreamReader) readNextBHS() error {
 	bsr.mrIdx++
 
 	// Read compressed index block.
-	bsr.packedBuf = bytesutil.ResizeNoCopy(bsr.packedBuf, int(mr.indexBlockSize))
+	bsr.packedBuf = bytesutil.ResizeNoCopyMayOverallocate(bsr.packedBuf, int(mr.indexBlockSize))
 	if err := fs.ReadFullData(bsr.indexReader, bsr.packedBuf); err != nil {
 		return fmt.Errorf("cannot read compressed index block with size %d: %w", mr.indexBlockSize, err)
 	}

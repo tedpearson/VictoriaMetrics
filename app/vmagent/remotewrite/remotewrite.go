@@ -22,14 +22,14 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
 	"github.com/VictoriaMetrics/metrics"
-	xxhash "github.com/cespare/xxhash/v2"
+	"github.com/cespare/xxhash/v2"
 )
 
 var (
-	remoteWriteURLs = flagutil.NewArray("remoteWrite.url", "Remote storage URL to write data to. It must support Prometheus remote_write API. "+
+	remoteWriteURLs = flagutil.NewArrayString("remoteWrite.url", "Remote storage URL to write data to. It must support Prometheus remote_write API. "+
 		"It is recommended using VictoriaMetrics as remote storage. Example url: http://<victoriametrics-host>:8428/api/v1/write . "+
 		"Pass multiple -remoteWrite.url flags in order to replicate data to multiple remote storage systems. See also -remoteWrite.multitenantURL")
-	remoteWriteMultitenantURLs = flagutil.NewArray("remoteWrite.multitenantURL", "Base path for multitenant remote storage URL to write data to. "+
+	remoteWriteMultitenantURLs = flagutil.NewArrayString("remoteWrite.multitenantURL", "Base path for multitenant remote storage URL to write data to. "+
 		"See https://docs.victoriametrics.com/vmagent.html#multitenancy for details. Example url: http://<vminsert>:8480 . "+
 		"Pass multiple -remoteWrite.multitenantURL flags in order to replicate data to multiple remote storage systems. See also -remoteWrite.url")
 	tmpDataPath = flag.String("remoteWrite.tmpDataPath", "vmagent-remotewrite-data", "Path to directory where temporary data for remote write component is stored. "+
@@ -38,9 +38,9 @@ var (
 		"isn't enough for sending high volume of collected data to remote storage. Default value is 2 * numberOfAvailableCPUs")
 	showRemoteWriteURL = flag.Bool("remoteWrite.showURL", false, "Whether to show -remoteWrite.url in the exported metrics. "+
 		"It is hidden by default, since it can contain sensitive info such as auth key")
-	maxPendingBytesPerURL = flagutil.NewBytes("remoteWrite.maxDiskUsagePerURL", 0, "The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath "+
+	maxPendingBytesPerURL = flagutil.NewArrayBytes("remoteWrite.maxDiskUsagePerURL", "The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath "+
 		"for each -remoteWrite.url. When buffer size reaches the configured maximum, then old data is dropped when adding new data to the buffer. "+
-		"Buffered data is stored in ~500MB chunks, so the minimum practical value for this flag is 500000000. "+
+		"Buffered data is stored in ~500MB chunks, so the minimum practical value for this flag is 500MB. "+
 		"Disk usage is unlimited if the value is set to 0")
 	significantFigures = flagutil.NewArrayInt("remoteWrite.significantFigures", "The number of significant figures to leave in metric values before writing them "+
 		"to remote storage. See https://en.wikipedia.org/wiki/Significant_figures . Zero value saves all the significant figures. "+
@@ -234,15 +234,11 @@ func Stop() {
 
 // Push sends wr to remote storage systems set via `-remoteWrite.url`.
 //
-// Note that wr may be modified by Push due to relabeling and rounding.
-func Push(wr *prompbmarshal.WriteRequest) {
-	PushWithAuthToken(nil, wr)
-}
-
-// PushWithAuthToken sends wr to remote storage systems set via `-remoteWrite.multitenantURL`.
+// If at is nil, then the data is pushed to the configured `-remoteWrite.url`.
+// If at isn't nil, the the data is pushed to the configured `-remoteWrite.multitenantURL`.
 //
 // Note that wr may be modified by Push due to relabeling and rounding.
-func PushWithAuthToken(at *auth.Token, wr *prompbmarshal.WriteRequest) {
+func Push(at *auth.Token, wr *prompbmarshal.WriteRequest) {
 	if at == nil && len(*remoteWriteMultitenantURLs) > 0 {
 		// Write data to default tenant if at isn't set while -remoteWrite.multitenantURL is set.
 		at = defaultAuthToken
@@ -252,7 +248,7 @@ func PushWithAuthToken(at *auth.Token, wr *prompbmarshal.WriteRequest) {
 		rwctxs = rwctxsDefault
 	} else {
 		if len(*remoteWriteMultitenantURLs) == 0 {
-			logger.Panicf("BUG: remoteWriteMultitenantURLs must be non-empty for non-nil at")
+			logger.Panicf("BUG: -remoteWrite.multitenantURL command-line flag must be set when __tenant_id__=%q label is set", at)
 		}
 		rwctxsMapLock.Lock()
 		tenantID := tenantmetrics.TenantID{
@@ -274,6 +270,8 @@ func PushWithAuthToken(at *auth.Token, wr *prompbmarshal.WriteRequest) {
 		rctx = getRelabelCtx()
 	}
 	tss := wr.Timeseries
+	rowsCount := getRowsCount(tss)
+	globalRowsPushedBeforeRelabel.Add(rowsCount)
 	maxSamplesPerBlock := *maxRowsPerBlock
 	// Allow up to 10x of labels per each block on average.
 	maxLabelsPerBlock := 10 * maxSamplesPerBlock
@@ -298,9 +296,10 @@ func PushWithAuthToken(at *auth.Token, wr *prompbmarshal.WriteRequest) {
 			tss = nil
 		}
 		if rctx != nil {
-			tssBlockLen := len(tssBlock)
+			rowsCountBeforeRelabel := getRowsCount(tssBlock)
 			tssBlock = rctx.applyRelabeling(tssBlock, labelsGlobal, pcsGlobal)
-			globalRelabelMetricsDropped.Add(tssBlockLen - len(tssBlock))
+			rowsCountAfterRelabel := getRowsCount(tssBlock)
+			rowsDroppedByGlobalRelabel.Add(rowsCountBeforeRelabel - rowsCountAfterRelabel)
 		}
 		sortLabelsIfNeeded(tssBlock)
 		tssBlock = limitSeriesCardinality(tssBlock)
@@ -414,7 +413,10 @@ func labelsToString(labels []prompbmarshal.Label) string {
 	return string(b)
 }
 
-var globalRelabelMetricsDropped = metrics.NewCounter("vmagent_remotewrite_global_relabel_metrics_dropped_total")
+var (
+	globalRowsPushedBeforeRelabel = metrics.NewCounter("vmagent_remotewrite_global_rows_pushed_before_relabel_total")
+	rowsDroppedByGlobalRelabel    = metrics.NewCounter("vmagent_remotewrite_global_relabel_metrics_dropped_total")
+)
 
 type remoteWriteCtx struct {
 	idx        int
@@ -423,7 +425,8 @@ type remoteWriteCtx struct {
 	pss        []*pendingSeries
 	pssNextIdx uint64
 
-	relabelMetricsDropped *metrics.Counter
+	rowsPushedAfterRelabel *metrics.Counter
+	rowsDroppedByRelabel   *metrics.Counter
 }
 
 func newRemoteWriteCtx(argIdx int, at *auth.Token, remoteWriteURL *url.URL, maxInmemoryBlocks int, sanitizedURL string) *remoteWriteCtx {
@@ -433,7 +436,8 @@ func newRemoteWriteCtx(argIdx int, at *auth.Token, remoteWriteURL *url.URL, maxI
 	pqURL.Fragment = ""
 	h := xxhash.Sum64([]byte(pqURL.String()))
 	queuePath := fmt.Sprintf("%s/persistent-queue/%d_%016X", *tmpDataPath, argIdx+1, h)
-	fq := persistentqueue.MustOpenFastQueue(queuePath, sanitizedURL, maxInmemoryBlocks, maxPendingBytesPerURL.N)
+	maxPendingBytes := maxPendingBytesPerURL.GetOptionalArgOrDefault(argIdx, 0)
+	fq := persistentqueue.MustOpenFastQueue(queuePath, sanitizedURL, maxInmemoryBlocks, maxPendingBytes)
 	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_pending_data_bytes{path=%q, url=%q}`, queuePath, sanitizedURL), func() float64 {
 		return float64(fq.GetPendingBytes())
 	})
@@ -467,7 +471,8 @@ func newRemoteWriteCtx(argIdx int, at *auth.Token, remoteWriteURL *url.URL, maxI
 		c:   c,
 		pss: pss,
 
-		relabelMetricsDropped: metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_relabel_metrics_dropped_total{path=%q, url=%q}`, queuePath, sanitizedURL)),
+		rowsPushedAfterRelabel: metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_rows_pushed_after_relabel_total{path=%q, url=%q}`, queuePath, sanitizedURL)),
+		rowsDroppedByRelabel:   metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_relabel_metrics_dropped_total{path=%q, url=%q}`, queuePath, sanitizedURL)),
 	}
 }
 
@@ -483,7 +488,8 @@ func (rwctx *remoteWriteCtx) MustStop() {
 	rwctx.fq.MustClose()
 	rwctx.fq = nil
 
-	rwctx.relabelMetricsDropped = nil
+	rwctx.rowsPushedAfterRelabel = nil
+	rwctx.rowsDroppedByRelabel = nil
 }
 
 func (rwctx *remoteWriteCtx) Push(tss []prompbmarshal.TimeSeries) {
@@ -499,12 +505,15 @@ func (rwctx *remoteWriteCtx) Push(tss []prompbmarshal.TimeSeries) {
 		// and https://github.com/VictoriaMetrics/VictoriaMetrics/issues/599
 		v = tssRelabelPool.Get().(*[]prompbmarshal.TimeSeries)
 		tss = append(*v, tss...)
-		tssLen := len(tss)
+		rowsCountBeforeRelabel := getRowsCount(tss)
 		tss = rctx.applyRelabeling(tss, nil, pcs)
-		rwctx.relabelMetricsDropped.Add(tssLen - len(tss))
+		rowsCountAfterRelabel := getRowsCount(tss)
+		rwctx.rowsDroppedByRelabel.Add(rowsCountBeforeRelabel - rowsCountAfterRelabel)
 	}
 	pss := rwctx.pss
 	idx := atomic.AddUint64(&rwctx.pssNextIdx, 1) % uint64(len(pss))
+	rowsCount := getRowsCount(tss)
+	rwctx.rowsPushedAfterRelabel.Add(rowsCount)
 	pss[idx].Push(tss)
 	if rctx != nil {
 		*v = prompbmarshal.ResetTimeSeries(tss)
@@ -518,4 +527,12 @@ var tssRelabelPool = &sync.Pool{
 		a := []prompbmarshal.TimeSeries{}
 		return &a
 	},
+}
+
+func getRowsCount(tss []prompbmarshal.TimeSeries) int {
+	rowsCount := 0
+	for _, ts := range tss {
+		rowsCount += len(ts.Samples)
+	}
+	return rowsCount
 }

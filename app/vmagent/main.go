@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/vmimport"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
@@ -35,6 +37,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
@@ -43,7 +46,7 @@ var (
 	httpListenAddr = flag.String("httpListenAddr", ":8429", "TCP address to listen for http connections. "+
 		"Set this flag to empty value in order to disable listening on any port. This mode may be useful for running multiple vmagent instances on the same server. "+
 		"Note that /targets and /metrics pages aren't available if -httpListenAddr=''")
-	influxListenAddr = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8189 must be set. Doesn't work if empty. "+
+	influxListenAddr = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8089 must be set. Doesn't work if empty. "+
 		"This flag isn't needed when ingesting data over HTTP - just send it to http://<vmagent>:8429/write")
 	graphiteListenAddr = flag.String("graphiteListenAddr", "", "TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty")
 	opentsdbListenAddr = flag.String("opentsdbListenAddr", "", "TCP and UDP address to listen for OpentTSDB metrics. "+
@@ -53,7 +56,7 @@ var (
 	configAuthKey          = flag.String("configAuthKey", "", "Authorization key for accessing /config page. It must be passed via authKey query arg")
 	dryRun                 = flag.Bool("dryRun", false, "Whether to check only config files without running vmagent. The following files are checked: "+
 		"-promscrape.config, -remoteWrite.relabelConfig, -remoteWrite.urlRelabelConfig . "+
-		"Unknown config entries are allowed in -promscrape.config by default. This can be changed with -promscrape.config.strictParse")
+		"Unknown config entries aren't allowed in -promscrape.config by default. This can be changed by passing -promscrape.config.strictParse=false command-line flag")
 )
 
 var (
@@ -61,6 +64,12 @@ var (
 	graphiteServer     *graphiteserver.Server
 	opentsdbServer     *opentsdbserver.Server
 	opentsdbhttpServer *opentsdbhttpserver.Server
+)
+
+var (
+	//go:embed static
+	staticFiles  embed.FS
+	staticServer = http.FileServer(http.FS(staticFiles))
 )
 
 func main() {
@@ -71,6 +80,7 @@ func main() {
 	remotewrite.InitSecretFlags()
 	buildinfo.Init()
 	logger.Init()
+	pushmetrics.Init()
 
 	if promscrape.IsDryRun() {
 		if err := promscrape.CheckConfig(); err != nil {
@@ -104,10 +114,12 @@ func main() {
 		graphiteServer = graphiteserver.MustStart(*graphiteListenAddr, graphite.InsertHandler)
 	}
 	if len(*opentsdbListenAddr) > 0 {
-		opentsdbServer = opentsdbserver.MustStart(*opentsdbListenAddr, opentsdb.InsertHandler, opentsdbhttp.InsertHandler)
+		httpInsertHandler := getOpenTSDBHTTPInsertHandler()
+		opentsdbServer = opentsdbserver.MustStart(*opentsdbListenAddr, opentsdb.InsertHandler, httpInsertHandler)
 	}
 	if len(*opentsdbHTTPListenAddr) > 0 {
-		opentsdbhttpServer = opentsdbhttpserver.MustStart(*opentsdbHTTPListenAddr, opentsdbhttp.InsertHandler)
+		httpInsertHandler := getOpenTSDBHTTPInsertHandler()
+		opentsdbhttpServer = opentsdbhttpserver.MustStart(*opentsdbHTTPListenAddr, httpInsertHandler)
 	}
 
 	promscrape.Init(remotewrite.Push)
@@ -149,16 +161,52 @@ func main() {
 	logger.Infof("successfully stopped vmagent in %.3f seconds", time.Since(startTime).Seconds())
 }
 
+func getOpenTSDBHTTPInsertHandler() func(req *http.Request) error {
+	if !remotewrite.MultitenancyEnabled() {
+		return func(req *http.Request) error {
+			path := strings.Replace(req.URL.Path, "//", "/", -1)
+			if path != "/api/put" {
+				return fmt.Errorf("unsupported path requested: %q; expecting '/api/put'", path)
+			}
+			return opentsdbhttp.InsertHandler(nil, req)
+		}
+	}
+	return func(req *http.Request) error {
+		path := strings.Replace(req.URL.Path, "//", "/", -1)
+		at, err := getAuthTokenFromPath(path)
+		if err != nil {
+			return fmt.Errorf("cannot obtain auth token from path %q: %w", path, err)
+		}
+		return opentsdbhttp.InsertHandler(at, req)
+	}
+}
+
+func getAuthTokenFromPath(path string) (*auth.Token, error) {
+	p, err := httpserver.ParsePath(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse multitenant path: %w", err)
+	}
+	if p.Prefix != "insert" {
+		return nil, fmt.Errorf(`unsupported multitenant prefix: %q; expected "insert"`, p.Prefix)
+	}
+	if p.Suffix != "opentsdb/api/put" {
+		return nil, fmt.Errorf("unsupported path requested: %q; expecting 'opentsdb/api/put'", p.Suffix)
+	}
+	return auth.NewToken(p.AuthToken)
+}
+
 func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Path == "/" {
 		if r.Method != "GET" {
 			return false
 		}
+		w.Header().Add("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, "<h2>vmagent</h2>")
 		fmt.Fprintf(w, "See docs at <a href='https://docs.victoriametrics.com/vmagent.html'>https://docs.victoriametrics.com/vmagent.html</a></br>")
 		fmt.Fprintf(w, "Useful endpoints:</br>")
 		httpserver.WriteAPIHelp(w, [][2]string{
-			{"targets", "discovered targets list"},
+			{"targets", "status for discovered active targets"},
+			{"service-discovery", "labels before and after relabeling for discovered targets"},
 			{"api/v1/targets", "advanced information about discovered targets in JSON format"},
 			{"config", "-promscrape.config contents"},
 			{"metrics", "available service metrics"},
@@ -169,8 +217,13 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	path := strings.Replace(r.URL.Path, "//", "/", -1)
+	if strings.HasPrefix(path, "datadog/") {
+		// Trim suffix from paths starting from /datadog/ in order to support legacy DataDog agent.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/2670
+		path = strings.TrimSuffix(path, "/")
+	}
 	switch path {
-	case "/api/v1/write":
+	case "/prometheus/api/v1/write", "/api/v1/write":
 		prometheusWriteRequests.Inc()
 		if err := promremotewrite.InsertHandler(nil, r); err != nil {
 			prometheusWriteErrors.Inc()
@@ -179,7 +232,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/api/v1/import":
+	case "/prometheus/api/v1/import", "/api/v1/import":
 		vmimportRequests.Inc()
 		if err := vmimport.InsertHandler(nil, r); err != nil {
 			vmimportErrors.Inc()
@@ -188,7 +241,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/api/v1/import/csv":
+	case "/prometheus/api/v1/import/csv", "/api/v1/import/csv":
 		csvimportRequests.Inc()
 		if err := csvimport.InsertHandler(nil, r); err != nil {
 			csvimportErrors.Inc()
@@ -197,7 +250,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/api/v1/import/prometheus":
+	case "/prometheus/api/v1/import/prometheus", "/api/v1/import/prometheus":
 		prometheusimportRequests.Inc()
 		if err := prometheusimport.InsertHandler(nil, r); err != nil {
 			prometheusimportErrors.Inc()
@@ -206,7 +259,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/api/v1/import/native":
+	case "/prometheus/api/v1/import/native", "/api/v1/import/native":
 		nativeimportRequests.Inc()
 		if err := native.InsertHandler(nil, r); err != nil {
 			nativeimportErrors.Inc()
@@ -215,7 +268,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/write", "/api/v2/write":
+	case "/influx/write", "/influx/api/v2/write", "/write", "/api/v2/write":
 		influxWriteRequests.Inc()
 		if err := influx.InsertHandlerForHTTP(nil, r); err != nil {
 			influxWriteErrors.Inc()
@@ -224,7 +277,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case "/query":
+	case "/influx/query", "/query":
 		influxQueryRequests.Inc()
 		influxutils.WriteDatabaseNames(w)
 		return true
@@ -253,16 +306,39 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
-	case "/datadog/intake/":
+	case "/datadog/intake":
 		datadogIntakeRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{}`)
 		return true
-	case "/targets":
+	case "/datadog/api/v1/metadata":
+		datadogMetadataRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{}`)
+		return true
+	case "/prometheus/targets", "/targets":
 		promscrapeTargetsRequests.Inc()
 		promscrape.WriteHumanReadableTargetsStatus(w, r)
 		return true
-	case "/config":
+	case "/prometheus/service-discovery", "/service-discovery":
+		promscrapeServiceDiscoveryRequests.Inc()
+		promscrape.WriteServiceDiscovery(w, r)
+		return true
+	case "/prometheus/api/v1/targets", "/api/v1/targets":
+		promscrapeAPIV1TargetsRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		state := r.FormValue("state")
+		promscrape.WriteAPIV1Targets(w, state)
+		return true
+	case "/prometheus/target_response", "/target_response":
+		promscrapeTargetResponseRequests.Inc()
+		if err := promscrape.WriteTargetResponse(w, r); err != nil {
+			promscrapeTargetResponseErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		return true
+	case "/prometheus/config", "/config":
 		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
 			err := &httpserver.ErrorWithStatusCode{
 				Err:        fmt.Errorf("The provided authKey doesn't match -configAuthKey"),
@@ -275,13 +351,23 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		promscrape.WriteConfigData(w)
 		return true
-	case "/api/v1/targets":
-		promscrapeAPIV1TargetsRequests.Inc()
+	case "/prometheus/api/v1/status/config", "/api/v1/status/config":
+		// See https://prometheus.io/docs/prometheus/latest/querying/api/#config
+		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
+			err := &httpserver.ErrorWithStatusCode{
+				Err:        fmt.Errorf("The provided authKey doesn't match -configAuthKey"),
+				StatusCode: http.StatusUnauthorized,
+			}
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		promscrapeStatusConfigRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
-		state := r.FormValue("state")
-		promscrape.WriteAPIV1Targets(w, state)
+		var bb bytesutil.ByteBuffer
+		promscrape.WriteConfigData(&bb)
+		fmt.Fprintf(w, `{"status":"success","data":{"yaml":%q}}`, bb.B)
 		return true
-	case "/-/reload":
+	case "/prometheus/-/reload", "/-/reload":
 		promscrapeConfigReloadRequests.Inc()
 		procutil.SelfSIGHUP()
 		w.WriteHeader(http.StatusOK)
@@ -296,11 +382,16 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 			w.Write([]byte("OK"))
 		}
 		return true
+	default:
+		if strings.HasPrefix(r.URL.Path, "/static") {
+			staticServer.ServeHTTP(w, r)
+			return true
+		}
+		if remotewrite.MultitenancyEnabled() {
+			return processMultitenantRequest(w, r, path)
+		}
+		return false
 	}
-	if remotewrite.MultitenancyEnabled() {
-		return processMultitenantRequest(w, r, path)
-	}
-	return false
 }
 
 func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path string) bool {
@@ -317,6 +408,11 @@ func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path stri
 	if err != nil {
 		httpserver.Errorf(w, r, "cannot obtain auth token: %s", err)
 		return true
+	}
+	if strings.HasPrefix(p.Suffix, "datadog/") {
+		// Trim suffix from paths starting from /datadog/ in order to support legacy DataDog agent.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/2670
+		p.Suffix = strings.TrimSuffix(p.Suffix, "/")
 	}
 	switch p.Suffix {
 	case "prometheus/", "prometheus", "prometheus/api/v1/write":
@@ -401,8 +497,13 @@ func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path stri
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
-	case "datadog/intake/":
+	case "datadog/intake":
 		datadogIntakeRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{}`)
+		return true
+	case "datadog/api/v1/metadata":
+		datadogMetadataRequests.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{}`)
 		return true
@@ -438,12 +539,18 @@ var (
 
 	datadogValidateRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/validate", protocol="datadog"}`)
 	datadogCheckRunRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/check_run", protocol="datadog"}`)
-	datadogIntakeRequests   = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/intake/", protocol="datadog"}`)
+	datadogIntakeRequests   = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/intake", protocol="datadog"}`)
+	datadogMetadataRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/metadata", protocol="datadog"}`)
 
-	promscrapeTargetsRequests      = metrics.NewCounter(`vmagent_http_requests_total{path="/targets"}`)
-	promscrapeAPIV1TargetsRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/api/v1/targets"}`)
+	promscrapeTargetsRequests          = metrics.NewCounter(`vmagent_http_requests_total{path="/targets"}`)
+	promscrapeServiceDiscoveryRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/service-discovery"}`)
+	promscrapeAPIV1TargetsRequests     = metrics.NewCounter(`vmagent_http_requests_total{path="/api/v1/targets"}`)
 
-	promscrapeConfigRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/config"}`)
+	promscrapeTargetResponseRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/target_response"}`)
+	promscrapeTargetResponseErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/target_response"}`)
+
+	promscrapeConfigRequests       = metrics.NewCounter(`vmagent_http_requests_total{path="/config"}`)
+	promscrapeStatusConfigRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/api/v1/status/config"}`)
 
 	promscrapeConfigReloadRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/-/reload"}`)
 )

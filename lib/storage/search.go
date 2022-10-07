@@ -3,11 +3,13 @@ package storage
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
 )
 
@@ -66,19 +68,14 @@ type PartRef struct {
 }
 
 // MustReadBlock reads block from br to dst.
-//
-// if fetchData is false, then only block header is read, otherwise all the data is read.
-func (br *BlockRef) MustReadBlock(dst *Block, fetchData bool) {
+func (br *BlockRef) MustReadBlock(dst *Block) {
 	dst.Reset()
 	dst.bh = br.bh
-	if !fetchData {
-		return
-	}
 
-	dst.timestampsData = bytesutil.ResizeNoCopy(dst.timestampsData, int(br.bh.TimestampsBlockSize))
+	dst.timestampsData = bytesutil.ResizeNoCopyMayOverallocate(dst.timestampsData, int(br.bh.TimestampsBlockSize))
 	br.p.timestampsFile.MustReadAt(dst.timestampsData, int64(br.bh.TimestampsBlockOffset))
 
-	dst.valuesData = bytesutil.ResizeNoCopy(dst.valuesData, int(br.bh.ValuesBlockSize))
+	dst.valuesData = bytesutil.ResizeNoCopyMayOverallocate(dst.valuesData, int(br.bh.ValuesBlockSize))
 	br.p.valuesFile.MustReadAt(dst.valuesData, int64(br.bh.ValuesBlockOffset))
 }
 
@@ -138,7 +135,9 @@ func (s *Search) reset() {
 // MustClose must be called when the search is done.
 //
 // Init returns the upper bound on the number of found time series.
-func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
+func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) int {
+	qt = qt.NewChild("init series search: filters=%s, timeRange=%s", tfss, &tr)
+	defer qt.Done()
 	if s.needClosing {
 		logger.Panicf("BUG: missing MustClose call before the next call to Init")
 	}
@@ -149,15 +148,15 @@ func (s *Search) Init(storage *Storage, tfss []*TagFilters, tr TimeRange, maxMet
 	s.deadline = deadline
 	s.needClosing = true
 
-	tsids, err := storage.searchTSIDs(tfss, tr, maxMetrics, deadline)
+	tsids, err := storage.searchTSIDs(qt, tfss, tr, maxMetrics, deadline)
 	if err == nil {
-		err = storage.prefetchMetricNames(tsids, deadline)
+		err = storage.prefetchMetricNames(qt, tsids, deadline)
 	}
 	// It is ok to call Init on error from storage.searchTSIDs.
 	// Init must be called before returning because it will fail
 	// on Seach.MustClose otherwise.
 	s.ts.Init(storage.tb, tsids, tr)
-
+	qt.Printf("search for parts with data for %d series", len(tsids))
 	if err != nil {
 		s.err = err
 		return 0
@@ -226,17 +225,35 @@ func (s *Search) NextMetricBlock() bool {
 
 // SearchQuery is used for sending search queries from vmselect to vmstorage.
 type SearchQuery struct {
+	// The time range for searching time series
 	MinTimestamp int64
 	MaxTimestamp int64
-	TagFilterss  [][]TagFilter
+
+	// Tag filters for the search query
+	TagFilterss [][]TagFilter
+
+	// The maximum number of time series the search query can return.
+	MaxMetrics int
+}
+
+// GetTimeRange returns time range for the given sq.
+func (sq *SearchQuery) GetTimeRange() TimeRange {
+	return TimeRange{
+		MinTimestamp: sq.MinTimestamp,
+		MaxTimestamp: sq.MaxTimestamp,
+	}
 }
 
 // NewSearchQuery creates new search query for the given args.
-func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter) *SearchQuery {
+func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter, maxMetrics int) *SearchQuery {
+	if maxMetrics <= 0 {
+		maxMetrics = 2e9
+	}
 	return &SearchQuery{
 		MinTimestamp: start,
 		MaxTimestamp: end,
 		TagFilterss:  tagFilterss,
+		MaxMetrics:   maxMetrics,
 	}
 }
 
@@ -250,9 +267,25 @@ type TagFilter struct {
 
 // String returns string representation of tf.
 func (tf *TagFilter) String() string {
-	var bb bytesutil.ByteBuffer
-	fmt.Fprintf(&bb, "{Key=%q, Value=%q, IsNegative: %v, IsRegexp: %v}", tf.Key, tf.Value, tf.IsNegative, tf.IsRegexp)
-	return string(bb.B)
+	op := tf.getOp()
+	value := bytesutil.LimitStringLen(string(tf.Value), 60)
+	if len(tf.Key) == 0 {
+		return fmt.Sprintf("__name__%s%q", op, value)
+	}
+	return fmt.Sprintf("%s%s%q", tf.Key, op, value)
+}
+
+func (tf *TagFilter) getOp() string {
+	if tf.IsNegative {
+		if tf.IsRegexp {
+			return "!~"
+		}
+		return "!="
+	}
+	if tf.IsRegexp {
+		return "=~"
+	}
+	return "="
 }
 
 // Marshal appends marshaled tf to dst and returns the result.
@@ -315,17 +348,21 @@ func (tf *TagFilter) Unmarshal(src []byte) ([]byte, error) {
 
 // String returns string representation of the search query.
 func (sq *SearchQuery) String() string {
-	var bb bytesutil.ByteBuffer
-	fmt.Fprintf(&bb, "MinTimestamp=%s, MaxTimestamp=%s, TagFilters=[\n",
-		timestampToTime(sq.MinTimestamp), timestampToTime(sq.MaxTimestamp))
-	for _, tagFilters := range sq.TagFilterss {
-		for _, tf := range tagFilters {
-			fmt.Fprintf(&bb, "%s", tf.String())
-		}
-		fmt.Fprintf(&bb, "\n")
+	a := make([]string, len(sq.TagFilterss))
+	for i, tfs := range sq.TagFilterss {
+		a[i] = tagFiltersToString(tfs)
 	}
-	fmt.Fprintf(&bb, "]")
-	return string(bb.B)
+	start := TimestampToHumanReadableFormat(sq.MinTimestamp)
+	end := TimestampToHumanReadableFormat(sq.MaxTimestamp)
+	return fmt.Sprintf("filters=%s, timeRange=[%s..%s]", a, start, end)
+}
+
+func tagFiltersToString(tfs []TagFilter) string {
+	a := make([]string, len(tfs))
+	for i, tf := range tfs {
+		a[i] = tf.String()
+	}
+	return "{" + strings.Join(a, ",") + "}"
 }
 
 // Marshal appends marshaled sq to dst and returns the result.

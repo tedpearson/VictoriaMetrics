@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -65,8 +66,8 @@ func (tag *Tag) copyFrom(src *Tag) {
 	tag.Value = append(tag.Value[:0], src.Value...)
 }
 
-func marshalTagValueNoTrailingTagSeparator(dst, src []byte) []byte {
-	dst = marshalTagValue(dst, src)
+func marshalTagValueNoTrailingTagSeparator(dst []byte, src string) []byte {
+	dst = marshalTagValue(dst, bytesutil.ToUnsafeBytes(src))
 	// Remove trailing tagSeparatorChar
 	return dst[:len(dst)-1]
 }
@@ -370,7 +371,7 @@ func (mn *MetricName) Marshal(dst []byte) []byte {
 		tag := &mn.Tags[i]
 		requiredSize += len(tag.Key) + len(tag.Value) + 2
 	}
-	dst = bytesutil.ResizeWithCopy(dst, requiredSize)[:dstLen]
+	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, requiredSize)[:dstLen]
 
 	// Marshal MetricGroup
 	dst = marshalTagValue(dst, mn.MetricGroup)
@@ -382,6 +383,14 @@ func (mn *MetricName) Marshal(dst []byte) []byte {
 		dst = t.Marshal(dst)
 	}
 	return dst
+}
+
+// UnmarshalString unmarshals mn from s
+func (mn *MetricName) UnmarshalString(s string) error {
+	b := bytesutil.ToUnsafeBytes(s)
+	err := mn.Unmarshal(b)
+	runtime.KeepAlive(s)
+	return err
 }
 
 // Unmarshal unmarshals mn from src.
@@ -477,7 +486,7 @@ func MarshalMetricNameRaw(dst []byte, labels []prompb.Label) []byte {
 		dstSize += len(label.Value)
 		dstSize += 4
 	}
-	dst = bytesutil.ResizeWithCopy(dst, dstSize)[:dstLen]
+	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, dstSize)[:dstLen]
 
 	// Marshal labels to dst.
 	for i := range labels {
@@ -607,6 +616,12 @@ func unmarshalBytesFast(src []byte) ([]byte, []byte, error) {
 }
 
 // sortTags sorts tags in mn to canonical form needed for storing in the index.
+//
+// The sortTags tries moving job-like tag to mn.Tags[0], while instance-like tag to mn.Tags[1].
+// See commonTagKeys list for job-like and instance-like tags.
+// This guarantees that indexdb entries for the same (job, instance) are located
+// close to each other on disk. This reduces disk seeks and disk read IO when metrics
+// for a particular job and/or instance are read from the disk.
 //
 // The function also de-duplicates tags with identical keys in mn. The last tag value
 // for duplicate tags wins.

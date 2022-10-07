@@ -3,7 +3,6 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,7 +64,7 @@ const finalPartsToMerge = 3
 // The number of shards for rawRow entries per partition.
 //
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
-var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 7) / 8
+var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 3) / 4
 
 // getMaxRawRowsPerShard returns the maximum number of rows that haven't been converted into parts yet.
 func getMaxRawRowsPerShard() int {
@@ -125,6 +124,10 @@ type partition struct {
 	// data retention in milliseconds.
 	// Used for deleting data outside the retention during background merge.
 	retentionMsecs int64
+
+	// Whether the storage is in read-only mode.
+	// Background merge is stopped in read-only mode.
+	isReadOnly *uint32
 
 	// Name is the name of the partition in the form YYYY_MM.
 	name string
@@ -199,7 +202,8 @@ func (pw *partWrapper) decRef() {
 
 // createPartition creates new partition for the given timestamp and the given paths
 // to small and big partitions.
-func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*partition, error) {
+func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string,
+	getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) (*partition, error) {
 	name := timestampToPartitionName(timestamp)
 	smallPartsPath := filepath.Clean(smallPartitionsPath) + "/" + name
 	bigPartsPath := filepath.Clean(bigPartitionsPath) + "/" + name
@@ -212,7 +216,7 @@ func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath str
 		return nil, fmt.Errorf("cannot create directories for big parts %q: %w", bigPartsPath, err)
 	}
 
-	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
+	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
 	pt.tr.fromPartitionTimestamp(timestamp)
 	pt.startMergeWorkers()
 	pt.startRawRowsFlusher()
@@ -232,13 +236,13 @@ func (pt *partition) Drop() {
 	// Wait until all the pending transaction deletions are finished before removing partition directories.
 	pendingTxnDeletionsWG.Wait()
 
-	fs.MustRemoveAll(pt.smallPartsPath)
-	fs.MustRemoveAll(pt.bigPartsPath)
+	fs.MustRemoveDirAtomic(pt.smallPartsPath)
+	fs.MustRemoveDirAtomic(pt.bigPartsPath)
 	logger.Infof("partition %q has been dropped", pt.name)
 }
 
 // openPartition opens the existing partition from the given paths.
-func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*partition, error) {
+func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) (*partition, error) {
 	smallPartsPath = filepath.Clean(smallPartsPath)
 	bigPartsPath = filepath.Clean(bigPartsPath)
 
@@ -262,7 +266,7 @@ func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func
 		return nil, fmt.Errorf("cannot open big parts from %q: %w", bigPartsPath, err)
 	}
 
-	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
+	pt := newPartition(name, smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
 	pt.smallParts = smallParts
 	pt.bigParts = bigParts
 	if err := pt.tr.fromPartitionName(name); err != nil {
@@ -276,7 +280,7 @@ func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func
 	return pt, nil
 }
 
-func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) *partition {
+func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) *partition {
 	p := &partition{
 		name:           name,
 		smallPartsPath: smallPartsPath,
@@ -284,6 +288,7 @@ func newPartition(name, smallPartsPath, bigPartsPath string, getDeletedMetricIDs
 
 		getDeletedMetricIDs: getDeletedMetricIDs,
 		retentionMsecs:      retentionMsecs,
+		isReadOnly:          isReadOnly,
 
 		mergeIdx: uint64(time.Now().UnixNano()),
 		stopCh:   make(chan struct{}),
@@ -481,7 +486,7 @@ func (rrs *rawRowsShard) addRows(pt *partition, rows []rawRow) {
 
 func (pt *partition) flushRowsToParts(rows []rawRow) {
 	maxRows := getMaxRawRowsPerShard()
-	var wg sync.WaitGroup
+	wg := getWaitGroup()
 	for len(rows) > 0 {
 		n := maxRows
 		if n > len(rows) {
@@ -495,7 +500,22 @@ func (pt *partition) flushRowsToParts(rows []rawRow) {
 		rows = rows[n:]
 	}
 	wg.Wait()
+	putWaitGroup(wg)
 }
+
+func getWaitGroup() *sync.WaitGroup {
+	v := wgPool.Get()
+	if v == nil {
+		return &sync.WaitGroup{}
+	}
+	return v.(*sync.WaitGroup)
+}
+
+func putWaitGroup(wg *sync.WaitGroup) {
+	wgPool.Put(wg)
+}
+
+var wgPool sync.Pool
 
 func (pt *partition) addRowsPart(rows []rawRow) {
 	if len(rows) == 0 {
@@ -548,7 +568,7 @@ func (pt *partition) addRowsPart(rows []rawRow) {
 		atomic.AddUint64(&pt.smallAssistedMerges, 1)
 		return
 	}
-	if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) {
+	if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) || errors.Is(err, errReadOnlyMode) {
 		return
 	}
 	logger.Panicf("FATAL: cannot merge small parts: %s", err)
@@ -815,8 +835,7 @@ func (pt *partition) ForceMergeAllParts() error {
 	maxOutBytes := fs.MustGetFreeSpace(pt.bigPartsPath)
 	if newPartSize > maxOutBytes {
 		freeSpaceNeededBytes := newPartSize - maxOutBytes
-		logger.WithThrottler("forceMerge", time.Minute).Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes",
-			pt.name, freeSpaceNeededBytes)
+		forceMergeLogger.Warnf("cannot initiate force merge for the partition %s; additional space needed: %d bytes", pt.name, freeSpaceNeededBytes)
 		return nil
 	}
 
@@ -826,6 +845,8 @@ func (pt *partition) ForceMergeAllParts() error {
 	}
 	return nil
 }
+
+var forceMergeLogger = logger.WithThrottler("forceMerge", time.Minute)
 
 func appendAllPartsToMerge(dst, src []*partWrapper) []*partWrapper {
 	for _, pw := range src {
@@ -848,9 +869,17 @@ func hasActiveMerges(pws []*partWrapper) bool {
 }
 
 var (
-	bigMergeWorkersCount   = (cgroup.AvailableCPUs() + 1) / 2
-	smallMergeWorkersCount = (cgroup.AvailableCPUs() + 1) / 2
+	bigMergeWorkersCount   = getDefaultMergeConcurrency(4)
+	smallMergeWorkersCount = getDefaultMergeConcurrency(16)
 )
+
+func getDefaultMergeConcurrency(max int) int {
+	v := (cgroup.AvailableCPUs() + 1) / 2
+	if v > max {
+		v = max
+	}
+	return v
+}
 
 // SetBigMergeWorkersCount sets the maximum number of concurrent mergers for big blocks.
 //
@@ -926,7 +955,7 @@ func (pt *partition) partsMerger(mergerFunc func(isFinal bool) error) error {
 			// The merger has been stopped.
 			return nil
 		}
-		if !errors.Is(err, errNothingToMerge) {
+		if !errors.Is(err, errNothingToMerge) && !errors.Is(err, errReadOnlyMode) {
 			return err
 		}
 		if finalMergeDelaySeconds > 0 && fasttime.UnixTimestamp()-lastMergeTime > finalMergeDelaySeconds {
@@ -978,7 +1007,18 @@ func getMaxOutBytes(path string, workersCount int) uint64 {
 	return maxOutBytes
 }
 
+func (pt *partition) canBackgroundMerge() bool {
+	return atomic.LoadUint32(pt.isReadOnly) == 0
+}
+
+var errReadOnlyMode = fmt.Errorf("storage is in readonly mode")
+
 func (pt *partition) mergeBigParts(isFinal bool) error {
+	if !pt.canBackgroundMerge() {
+		// Do not perform merge in read-only mode, since this may result in disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return errReadOnlyMode
+	}
 	maxOutBytes := getMaxOutBytes(pt.bigPartsPath, bigMergeWorkersCount)
 
 	pt.partsLock.Lock()
@@ -990,6 +1030,11 @@ func (pt *partition) mergeBigParts(isFinal bool) error {
 }
 
 func (pt *partition) mergeSmallParts(isFinal bool) error {
+	if !pt.canBackgroundMerge() {
+		// Do not perform merge in read-only mode, since this may result in disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return errReadOnlyMode
+	}
 	// Try merging small parts to a big part at first.
 	maxBigPartOutBytes := getMaxOutBytes(pt.bigPartsPath, bigMergeWorkersCount)
 	pt.partsLock.Lock()
@@ -1255,6 +1300,13 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}) erro
 
 func getCompressLevelForRowsCount(rowsCount, blocksCount uint64) int {
 	avgRowsPerBlock := rowsCount / blocksCount
+	// See https://github.com/facebook/zstd/releases/tag/v1.3.4 about negative compression levels.
+	if avgRowsPerBlock <= 10 {
+		return -5
+	}
+	if avgRowsPerBlock <= 50 {
+		return -2
+	}
 	if avgRowsPerBlock <= 200 {
 		return -1
 	}
@@ -1342,17 +1394,14 @@ func (pt *partition) removeStaleParts() {
 	}
 
 	// Physically remove stale parts under snapshotLock in order to provide
-	// consistent snapshots with partition.CreateSnapshot().
+	// consistent snapshots with table.CreateSnapshot().
 	pt.snapshotLock.RLock()
-	var removeWG sync.WaitGroup
 	for pw := range m {
 		logger.Infof("removing part %q, since its data is out of the configured retention (%d secs)", pw.p.path, pt.retentionMsecs/1000)
-		removeWG.Add(1)
-		fs.MustRemoveAllWithDoneCallback(pw.p.path, removeWG.Done)
+		fs.MustRemoveDirAtomic(pw.p.path)
 	}
-	removeWG.Wait()
 	// There is no need in calling fs.MustSyncPath() on pt.smallPartsPath and pt.bigPartsPath,
-	// since they should be automatically called inside fs.MustRemoveAllWithDoneCallback.
+	// since they should be automatically called inside fs.MustRemoveDirAtomic().
 
 	pt.snapshotLock.RUnlock()
 
@@ -1502,6 +1551,7 @@ func openParts(pathPrefix1, pathPrefix2, path string) ([]*partWrapper, error) {
 	if err := fs.MkdirAllIfNotExist(path); err != nil {
 		return nil, err
 	}
+	fs.MustRemoveTemporaryDirs(path)
 	d, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open directory %q: %w", path, err)
@@ -1516,9 +1566,9 @@ func openParts(pathPrefix1, pathPrefix2, path string) ([]*partWrapper, error) {
 	}
 
 	txnDir := path + "/txn"
-	fs.MustRemoveAll(txnDir)
+	fs.MustRemoveDirAtomic(txnDir)
 	tmpDir := path + "/tmp"
-	fs.MustRemoveAll(tmpDir)
+	fs.MustRemoveDirAtomic(tmpDir)
 	if err := createPartitionDirs(path); err != nil {
 		return nil, fmt.Errorf("cannot create directories for partition %q: %w", path, err)
 	}
@@ -1544,7 +1594,7 @@ func openParts(pathPrefix1, pathPrefix2, path string) ([]*partWrapper, error) {
 		if fs.IsEmptyDir(partPath) {
 			// Remove empty directory, which can be left after unclean shutdown on NFS.
 			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1142
-			fs.MustRemoveAll(partPath)
+			fs.MustRemoveDirAtomic(partPath)
 			continue
 		}
 		startTime := time.Now()
@@ -1690,7 +1740,7 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 	txnLock.RLock()
 	defer txnLock.RUnlock()
 
-	data, err := ioutil.ReadFile(txnPath)
+	data, err := os.ReadFile(txnPath)
 	if err != nil {
 		return fmt.Errorf("cannot read transaction file: %w", err)
 	}
@@ -1709,14 +1759,12 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 	}
 
 	// Remove old paths. It is OK if certain paths don't exist.
-	var removeWG sync.WaitGroup
 	for _, path := range rmPaths {
 		path, err := validatePath(pathPrefix1, pathPrefix2, path)
 		if err != nil {
 			return fmt.Errorf("invalid path to remove: %w", err)
 		}
-		removeWG.Add(1)
-		fs.MustRemoveAllWithDoneCallback(path, removeWG.Done)
+		fs.MustRemoveDirAtomic(path)
 	}
 
 	// Move the new part to new directory.
@@ -1745,8 +1793,7 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 		}
 	} else {
 		// Just remove srcPath.
-		removeWG.Add(1)
-		fs.MustRemoveAllWithDoneCallback(srcPath, removeWG.Done)
+		fs.MustRemoveDirAtomic(srcPath)
 	}
 
 	// Flush pathPrefix* directory metadata to the underying storage,
@@ -1757,12 +1804,9 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 	pendingTxnDeletionsWG.Add(1)
 	go func() {
 		defer pendingTxnDeletionsWG.Done()
-		// Remove the transaction file only after all the source paths are deleted.
-		// This is required for NFS mounts. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
-		removeWG.Wait()
 
 		// There is no need in calling fs.MustSyncPath for pathPrefix* after parts' removal,
-		// since it is already called by fs.MustRemoveAllWithDoneCallback.
+		// since it is already called by fs.MustRemoveDirAtomic.
 
 		if err := os.Remove(txnPath); err != nil {
 			logger.Errorf("cannot remove transaction file %q: %s", txnPath, err)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"math/rand"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -11,14 +10,15 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 )
 
 func TestMain(m *testing.M) {
-	u, _ := url.Parse("https://victoriametrics.com/path")
-	notifier.InitTemplateFunc(u)
+	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, true); err != nil {
+		os.Exit(1)
+	}
 	os.Exit(m.Run())
 }
 
@@ -29,7 +29,7 @@ func TestManagerEmptyRulesDir(t *testing.T) {
 	m := &manager{groups: make(map[uint64]*Group)}
 	cfg := loadCfg(t, []string{"foo/bar"}, true, true)
 	if err := m.update(context.Background(), cfg, false); err != nil {
-		t.Fatalf("expected to load succesfully with empty rules dir; got err instead: %v", err)
+		t.Fatalf("expected to load successfully with empty rules dir; got err instead: %v", err)
 	}
 }
 
@@ -40,16 +40,16 @@ func TestManagerUpdateConcurrent(t *testing.T) {
 	m := &manager{
 		groups:         make(map[uint64]*Group),
 		querierBuilder: &fakeQuerier{},
-		notifiers:      []notifier.Notifier{&fakeNotifier{}},
+		notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&fakeNotifier{}} },
 	}
 	paths := []string{
 		"config/testdata/dir/rules0-good.rules",
 		"config/testdata/dir/rules0-bad.rules",
 		"config/testdata/dir/rules1-good.rules",
 		"config/testdata/dir/rules1-bad.rules",
-		"config/testdata/rules0-good.rules",
-		"config/testdata/rules1-good.rules",
-		"config/testdata/rules2-good.rules",
+		"config/testdata/rules/rules0-good.rules",
+		"config/testdata/rules/rules1-good.rules",
+		"config/testdata/rules/rules2-good.rules",
 	}
 	evalInterval := *evaluationInterval
 	defer func() { *evaluationInterval = evalInterval }()
@@ -68,7 +68,7 @@ func TestManagerUpdateConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				rnd := rand.Intn(len(paths))
-				cfg, err := config.Parse([]string{paths[rnd]}, true, true)
+				cfg, err := config.Parse([]string{paths[rnd]}, notifier.ValidateTemplates, true)
 				if err != nil { // update can fail and this is expected
 					continue
 				}
@@ -125,13 +125,13 @@ func TestManagerUpdate(t *testing.T) {
 	}{
 		{
 			name:       "update good rules",
-			initPath:   "config/testdata/rules0-good.rules",
+			initPath:   "config/testdata/rules/rules0-good.rules",
 			updatePath: "config/testdata/dir/rules1-good.rules",
 			want: []*Group{
 				{
 					File:     "config/testdata/dir/rules1-good.rules",
 					Name:     "duplicatedGroupDiffFiles",
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules: []Rule{
 						&AlertingRule{
@@ -150,20 +150,20 @@ func TestManagerUpdate(t *testing.T) {
 		},
 		{
 			name:       "update good rules from 1 to 2 groups",
-			initPath:   "config/testdata/dir/rules1-good.rules",
-			updatePath: "config/testdata/rules0-good.rules",
+			initPath:   "config/testdata/dir/rules/rules1-good.rules",
+			updatePath: "config/testdata/rules/rules0-good.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Rules:    []Rule{VMRows},
 					Interval: defaultEvalInterval,
 				},
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Interval: defaultEvalInterval,
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Name:     "TestGroup", Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
@@ -172,21 +172,21 @@ func TestManagerUpdate(t *testing.T) {
 		},
 		{
 			name:       "update with one bad rule file",
-			initPath:   "config/testdata/rules0-good.rules",
+			initPath:   "config/testdata/rules/rules0-good.rules",
 			updatePath: "config/testdata/dir/rules2-bad.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules:    []Rule{VMRows},
 				},
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Interval: defaultEvalInterval,
 					Name:     "TestGroup",
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
@@ -196,19 +196,19 @@ func TestManagerUpdate(t *testing.T) {
 		{
 			name:       "update empty dir rules from 0 to 2 groups",
 			initPath:   "config/testdata/empty/*",
-			updatePath: "config/testdata/rules0-good.rules",
+			updatePath: "config/testdata/rules/rules0-good.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules:    []Rule{VMRows},
 				},
 				{
-					File:     "config/testdata/rules0-good.rules",
+					File:     "config/testdata/rules/rules0-good.rules",
 					Interval: defaultEvalInterval,
-					Type:     datasource.NewPrometheusType(),
+					Type:     config.NewPrometheusType(),
 					Name:     "TestGroup", Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
@@ -223,7 +223,7 @@ func TestManagerUpdate(t *testing.T) {
 			m := &manager{
 				groups:         make(map[uint64]*Group),
 				querierBuilder: &fakeQuerier{},
-				notifiers:      []notifier.Notifier{&fakeNotifier{}},
+				notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&fakeNotifier{}} },
 			}
 
 			cfgInit := loadCfg(t, []string{tc.initPath}, true, true)
@@ -231,7 +231,7 @@ func TestManagerUpdate(t *testing.T) {
 				t.Fatalf("failed to complete initial rules update: %s", err)
 			}
 
-			cfgUpdate, err := config.Parse([]string{tc.updatePath}, true, true)
+			cfgUpdate, err := config.Parse([]string{tc.updatePath}, notifier.ValidateTemplates, true)
 			if err == nil { // update can fail and that's expected
 				_ = m.update(ctx, cfgUpdate, false)
 			}
@@ -311,8 +311,10 @@ func TestManagerUpdateNegative(t *testing.T) {
 			m := &manager{
 				groups:         make(map[uint64]*Group),
 				querierBuilder: &fakeQuerier{},
-				notifiers:      tc.notifiers,
 				rw:             tc.rw,
+			}
+			if tc.notifiers != nil {
+				m.notifiers = func() []notifier.Notifier { return tc.notifiers }
 			}
 			err := m.update(context.Background(), []config.Group{tc.cfg}, false)
 			if err == nil {
@@ -327,7 +329,11 @@ func TestManagerUpdateNegative(t *testing.T) {
 
 func loadCfg(t *testing.T, path []string, validateAnnotations, validateExpressions bool) []config.Group {
 	t.Helper()
-	cfg, err := config.Parse(path, validateAnnotations, validateExpressions)
+	var validateTplFn config.ValidateTplFn
+	if validateAnnotations {
+		validateTplFn = notifier.ValidateTemplates
+	}
+	cfg, err := config.Parse(path, validateTplFn, validateExpressions)
 	if err != nil {
 		t.Fatal(err)
 	}

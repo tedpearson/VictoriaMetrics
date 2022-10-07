@@ -3,7 +3,6 @@ package mergeset
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -75,10 +74,12 @@ type Table struct {
 	// aligned to 8 bytes on 32-bit architectures.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
 
-	activeMerges   uint64
-	mergesCount    uint64
-	itemsMerged    uint64
-	assistedMerges uint64
+	activeMerges        uint64
+	mergesCount         uint64
+	itemsMerged         uint64
+	assistedMerges      uint64
+	itemsAdded          uint64
+	itemsAddedSizeBytes uint64
 
 	mergeIdx uint64
 
@@ -89,6 +90,7 @@ type Table struct {
 	needFlushCallbackCall uint32
 
 	prepareBlock PrepareBlockCallback
+	isReadOnly   *uint32
 
 	partsLock sync.Mutex
 	parts     []*partWrapper
@@ -125,9 +127,16 @@ type rawItemsShards struct {
 // The number of shards for rawItems per table.
 //
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
-var rawItemsShardsPerTable = cgroup.AvailableCPUs()
+var rawItemsShardsPerTable = func() int {
+	cpus := cgroup.AvailableCPUs()
+	multiplier := cpus
+	if multiplier > 16 {
+		multiplier = 16
+	}
+	return (cpus*multiplier + 1) / 2
+}()
 
-const maxBlocksPerShard = 512
+const maxBlocksPerShard = 256
 
 func (riss *rawItemsShards) init() {
 	riss.shards = make([]rawItemsShard, rawItemsShardsPerTable)
@@ -227,7 +236,9 @@ func (pw *partWrapper) decRef() {
 	}
 
 	if pw.mp != nil {
-		putInmemoryPart(pw.mp)
+		// Do not return pw.mp to pool via putInmemoryPart(),
+		// since pw.mp size may be too big compared to other entries stored in the pool.
+		// This may result in increased memory usage because of high fragmentation.
 		pw.mp = nil
 	}
 	pw.p.MustClose()
@@ -243,7 +254,7 @@ func (pw *partWrapper) decRef() {
 // to persistent storage.
 //
 // The table is created if it doesn't exist yet.
-func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback) (*Table, error) {
+func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *uint32) (*Table, error) {
 	path = filepath.Clean(path)
 	logger.Infof("opening table %q...", path)
 	startTime := time.Now()
@@ -269,6 +280,7 @@ func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallb
 		path:          path,
 		flushCallback: flushCallback,
 		prepareBlock:  prepareBlock,
+		isReadOnly:    isReadOnly,
 		parts:         pws,
 		mergeIdx:      uint64(time.Now().UnixNano()),
 		flockF:        flockF,
@@ -387,10 +399,12 @@ func (tb *Table) Path() string {
 
 // TableMetrics contains essential metrics for the Table.
 type TableMetrics struct {
-	ActiveMerges   uint64
-	MergesCount    uint64
-	ItemsMerged    uint64
-	AssistedMerges uint64
+	ActiveMerges        uint64
+	MergesCount         uint64
+	ItemsMerged         uint64
+	AssistedMerges      uint64
+	ItemsAdded          uint64
+	ItemsAddedSizeBytes uint64
 
 	PendingItems uint64
 
@@ -421,6 +435,8 @@ func (tb *Table) UpdateMetrics(m *TableMetrics) {
 	m.MergesCount += atomic.LoadUint64(&tb.mergesCount)
 	m.ItemsMerged += atomic.LoadUint64(&tb.itemsMerged)
 	m.AssistedMerges += atomic.LoadUint64(&tb.assistedMerges)
+	m.ItemsAdded += atomic.LoadUint64(&tb.itemsAdded)
+	m.ItemsAddedSizeBytes += atomic.LoadUint64(&tb.itemsAddedSizeBytes)
 
 	m.PendingItems += uint64(tb.rawItems.Len())
 
@@ -455,6 +471,12 @@ func (tb *Table) AddItems(items [][]byte) error {
 	if err := tb.rawItems.addItems(tb, items); err != nil {
 		return fmt.Errorf("cannot insert data into %q: %w", tb.path, err)
 	}
+	atomic.AddUint64(&tb.itemsAdded, uint64(len(items)))
+	n := 0
+	for _, item := range items {
+		n += len(item)
+	}
+	atomic.AddUint64(&tb.itemsAddedSizeBytes, uint64(n))
 	return nil
 }
 
@@ -687,7 +709,7 @@ func (tb *Table) mergeRawItemsBlocks(ibs []*inmemoryBlock, isFinal bool) {
 			atomic.AddUint64(&tb.assistedMerges, 1)
 			continue
 		}
-		if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) {
+		if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) || errors.Is(err, errReadOnlyMode) {
 			return
 		}
 		logger.Panicf("FATAL: cannot merge small parts: %s", err)
@@ -695,23 +717,28 @@ func (tb *Table) mergeRawItemsBlocks(ibs []*inmemoryBlock, isFinal bool) {
 }
 
 func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
-	// Convert ibs into inmemoryPart's
-	mps := make([]*inmemoryPart, 0, len(ibs))
+	atomic.AddUint64(&tb.mergesCount, 1)
+	atomic.AddUint64(&tb.activeMerges, 1)
+	defer atomic.AddUint64(&tb.activeMerges, ^uint64(0))
+
+	// Prepare blockStreamReaders for source blocks.
+	bsrs := make([]*blockStreamReader, 0, len(ibs))
 	for _, ib := range ibs {
 		if len(ib.items) == 0 {
 			continue
 		}
-		mp := getInmemoryPart()
-		mp.Init(ib)
+		bsr := getBlockStreamReader()
+		bsr.InitFromInmemoryBlock(ib)
 		putInmemoryBlock(ib)
-		mps = append(mps, mp)
+		bsrs = append(bsrs, bsr)
 	}
-	if len(mps) == 0 {
+	if len(bsrs) == 0 {
 		return nil
 	}
-	if len(mps) == 1 {
+	if len(bsrs) == 1 {
 		// Nothing to merge. Just return a single inmemory part.
-		mp := mps[0]
+		mp := &inmemoryPart{}
+		mp.Init(&bsrs[0].Block)
 		p := mp.NewPart()
 		return &partWrapper{
 			p:        p,
@@ -719,28 +746,10 @@ func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
 			refCount: 1,
 		}
 	}
-	defer func() {
-		// Return source inmemoryParts to pool.
-		for _, mp := range mps {
-			putInmemoryPart(mp)
-		}
-	}()
-
-	atomic.AddUint64(&tb.mergesCount, 1)
-	atomic.AddUint64(&tb.activeMerges, 1)
-	defer atomic.AddUint64(&tb.activeMerges, ^uint64(0))
-
-	// Prepare blockStreamReaders for source parts.
-	bsrs := make([]*blockStreamReader, 0, len(mps))
-	for _, mp := range mps {
-		bsr := getBlockStreamReader()
-		bsr.InitFromInmemoryPart(mp)
-		bsrs = append(bsrs, bsr)
-	}
 
 	// Prepare blockStreamWriter for destination part.
 	bsw := getBlockStreamWriter()
-	mpDst := getInmemoryPart()
+	mpDst := &inmemoryPart{}
 	bsw.InitFromInmemoryPart(mpDst)
 
 	// Merge parts.
@@ -775,7 +784,19 @@ func (tb *Table) startPartMergers() {
 	}
 }
 
+func (tb *Table) canBackgroundMerge() bool {
+	return atomic.LoadUint32(tb.isReadOnly) == 0
+}
+
+var errReadOnlyMode = fmt.Errorf("storage is in readonly mode")
+
 func (tb *Table) mergeExistingParts(isFinal bool) error {
+	if !tb.canBackgroundMerge() {
+		// Do not perform background merge in read-only mode
+		// in order to prevent from disk space shortage.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
+		return errReadOnlyMode
+	}
 	n := fs.MustGetFreeSpace(tb.path)
 	// Divide free space by the max number of concurrent merges.
 	maxOutBytes := n / uint64(mergeWorkersCount)
@@ -813,7 +834,7 @@ func (tb *Table) partMerger() error {
 			// The merger has been stopped.
 			return nil
 		}
-		if !errors.Is(err, errNothingToMerge) {
+		if !errors.Is(err, errNothingToMerge) && !errors.Is(err, errReadOnlyMode) {
 			return err
 		}
 		if fasttime.UnixTimestamp()-lastMergeTime > 30 {
@@ -1040,6 +1061,7 @@ func openParts(path string) ([]*partWrapper, error) {
 	if err := fs.MkdirAllIfNotExist(path); err != nil {
 		return nil, err
 	}
+	fs.MustRemoveTemporaryDirs(path)
 	d, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open difrectory: %w", err)
@@ -1054,13 +1076,13 @@ func openParts(path string) ([]*partWrapper, error) {
 	}
 
 	txnDir := path + "/txn"
-	fs.MustRemoveAll(txnDir)
+	fs.MustRemoveDirAtomic(txnDir)
 	if err := fs.MkdirAllFailIfExist(txnDir); err != nil {
 		return nil, fmt.Errorf("cannot create %q: %w", txnDir, err)
 	}
 
 	tmpDir := path + "/tmp"
-	fs.MustRemoveAll(tmpDir)
+	fs.MustRemoveDirAtomic(tmpDir)
 	if err := fs.MkdirAllFailIfExist(tmpDir); err != nil {
 		return nil, fmt.Errorf("cannot create %q: %w", tmpDir, err)
 	}
@@ -1087,7 +1109,7 @@ func openParts(path string) ([]*partWrapper, error) {
 		if fs.IsEmptyDir(partPath) {
 			// Remove empty directory, which can be left after unclean shutdown on NFS.
 			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1142
-			fs.MustRemoveAll(partPath)
+			fs.MustRemoveDirAtomic(partPath)
 			continue
 		}
 		p, err := openFilePart(partPath)
@@ -1239,7 +1261,7 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix, txnPath string) error {
 	txnLock.RLock()
 	defer txnLock.RUnlock()
 
-	data, err := ioutil.ReadFile(txnPath)
+	data, err := os.ReadFile(txnPath)
 	if err != nil {
 		return fmt.Errorf("cannot read transaction file: %w", err)
 	}
@@ -1258,14 +1280,12 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix, txnPath string) error {
 	}
 
 	// Remove old paths. It is OK if certain paths don't exist.
-	var removeWG sync.WaitGroup
 	for _, path := range rmPaths {
 		path, err := validatePath(pathPrefix, path)
 		if err != nil {
 			return fmt.Errorf("invalid path to remove: %w", err)
 		}
-		removeWG.Add(1)
-		fs.MustRemoveAllWithDoneCallback(path, removeWG.Done)
+		fs.MustRemoveDirAtomic(path)
 	}
 
 	// Move the new part to new directory.
@@ -1297,9 +1317,6 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix, txnPath string) error {
 	pendingTxnDeletionsWG.Add(1)
 	go func() {
 		defer pendingTxnDeletionsWG.Done()
-		// Remove the transaction file only after all the source paths are deleted.
-		// This is required for NFS mounts. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
-		removeWG.Wait()
 		if err := os.Remove(txnPath); err != nil {
 			logger.Errorf("cannot remove transaction file %q: %s", txnPath, err)
 		}

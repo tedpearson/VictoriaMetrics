@@ -1,5 +1,5 @@
 /* eslint max-lines: 0 */
-import {DisplayType} from "../../components/Home/Configurator/DisplayTypeSwitch";
+import {DisplayType, displayTypeTabs} from "../../components/CustomPanel/Configurator/DisplayTypeSwitch";
 import {TimeParams, TimePeriod} from "../../types";
 import {
   dateFromSeconds,
@@ -7,7 +7,8 @@ import {
   getDateNowUTC,
   getDurationFromPeriod,
   getTimeperiodForDuration,
-  getDurationFromMilliseconds
+  getDurationFromMilliseconds,
+  getRelativeTime
 } from "../../utils/time";
 import {getFromStorage} from "../../utils/storage";
 import {getDefaultServer} from "../../utils/default-server-url";
@@ -17,11 +18,12 @@ import dayjs from "dayjs";
 export interface TimeState {
   duration: string;
   period: TimeParams;
+  relativeTime?: string;
 }
 
 export interface QueryHistory {
-  index: number,
-  values: string[]
+  index: number;
+  values: string[];
 }
 
 export interface AppState {
@@ -32,8 +34,9 @@ export interface AppState {
   queryHistory: QueryHistory[],
   queryControls: {
     autoRefresh: boolean;
-    autocomplete: boolean,
-    nocache: boolean
+    autocomplete: boolean;
+    nocache: boolean;
+    isTracingEnabled: boolean;
   }
 }
 
@@ -44,6 +47,7 @@ export type Action =
     | { type: "SET_QUERY_HISTORY_BY_INDEX", payload: {value: QueryHistory, queryNumber: number} }
     | { type: "SET_QUERY_HISTORY", payload: QueryHistory[] }
     | { type: "SET_DURATION", payload: string }
+    | { type: "SET_RELATIVE_TIME", payload: {id: string, duration: string, until: Date} }
     | { type: "SET_UNTIL", payload: Date }
     | { type: "SET_FROM", payload: Date }
     | { type: "SET_PERIOD", payload: TimePeriod }
@@ -52,24 +56,32 @@ export type Action =
     | { type: "TOGGLE_AUTOREFRESH"}
     | { type: "TOGGLE_AUTOCOMPLETE"}
     | { type: "NO_CACHE"}
+    | { type: "TOGGLE_QUERY_TRACING" }
 
-const duration = getQueryStringValue("g0.range_input", "1h") as string;
-const endInput = formatDateToLocal(getQueryStringValue("g0.end_input", getDateNowUTC()) as Date);
+
+const {duration, endInput, relativeTimeId} = getRelativeTime({
+  defaultDuration: getQueryStringValue("g0.range_input", "1h") as string,
+  defaultEndInput: new Date(formatDateToLocal(getQueryStringValue("g0.end_input", getDateNowUTC()) as Date)),
+});
 const query = getQueryArray();
+const queryTab = getQueryStringValue("g0.tab", 0);
+const displayType = displayTypeTabs.find(t => t.prometheusCode === queryTab || t.value === queryTab);
 
 export const initialState: AppState = {
   serverUrl: getDefaultServer(),
-  displayType: getQueryStringValue("g0.tab", "chart") as DisplayType,
+  displayType: (displayType?.value || "chart") as DisplayType,
   query: query, // demo_memory_usage_bytes
   queryHistory: query.map(q => ({index: 0, values: [q]})),
   time: {
     duration,
-    period: getTimeperiodForDuration(duration, new Date(endInput))
+    period: getTimeperiodForDuration(duration, endInput),
+    relativeTime: relativeTimeId,
   },
   queryControls: {
     autoRefresh: false,
     autocomplete: getFromStorage("AUTOCOMPLETE") as boolean || false,
-    nocache: getFromStorage("NO_CACHE") as boolean || false,
+    nocache: false,
+    isTracingEnabled: false,
   }
 };
 
@@ -107,7 +119,18 @@ export function reducer(state: AppState, action: Action): AppState {
         time: {
           ...state.time,
           duration: action.payload,
-          period: getTimeperiodForDuration(action.payload, dateFromSeconds(state.time.period.end))
+          period: getTimeperiodForDuration(action.payload, dateFromSeconds(state.time.period.end)),
+          relativeTime: "none"
+        }
+      };
+    case "SET_RELATIVE_TIME":
+      return {
+        ...state,
+        time: {
+          ...state.time,
+          duration: action.payload.duration,
+          period: getTimeperiodForDuration(action.payload.duration, new Date(action.payload.until)),
+          relativeTime: action.payload.id,
         }
       };
     case "SET_UNTIL":
@@ -115,7 +138,8 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         time: {
           ...state.time,
-          period: getTimeperiodForDuration(state.time.duration, action.payload)
+          period: getTimeperiodForDuration(state.time.duration, action.payload),
+          relativeTime: "none"
         }
       };
     case "SET_FROM":
@@ -130,12 +154,13 @@ export function reducer(state: AppState, action: Action): AppState {
         time: {
           ...state.time,
           duration: durationFrom,
-          period: getTimeperiodForDuration(durationFrom, dayjs(state.time.period.end*1000).toDate())
+          period: getTimeperiodForDuration(durationFrom, dayjs(state.time.period.end*1000).toDate()),
+          relativeTime: "none"
         }
       };
     case "SET_PERIOD":
       // eslint-disable-next-line no-case-declarations
-      const duration = getDurationFromPeriod(action.payload);
+      const durationPeriod = getDurationFromPeriod(action.payload);
       return {
         ...state,
         queryControls: {
@@ -144,8 +169,9 @@ export function reducer(state: AppState, action: Action): AppState {
         },
         time: {
           ...state.time,
-          duration,
-          period: getTimeperiodForDuration(duration, action.payload.to)
+          duration: durationPeriod,
+          period: getTimeperiodForDuration(durationPeriod, action.payload.to),
+          relativeTime: "none"
         }
       };
     case "TOGGLE_AUTOREFRESH":
@@ -164,6 +190,14 @@ export function reducer(state: AppState, action: Action): AppState {
           autocomplete: !state.queryControls.autocomplete
         }
       };
+    case "TOGGLE_QUERY_TRACING":
+      return {
+        ...state,
+        queryControls: {
+          ...state.queryControls,
+          isTracingEnabled: !state.queryControls.isTracingEnabled,
+        }
+      };
     case "NO_CACHE":
       return {
         ...state,
@@ -173,11 +207,17 @@ export function reducer(state: AppState, action: Action): AppState {
         }
       };
     case "RUN_QUERY":
+      // eslint-disable-next-line no-case-declarations
+      const {duration: durationRunQuery, endInput} = getRelativeTime({
+        relativeTimeId: state.time.relativeTime,
+        defaultDuration: state.time.duration,
+        defaultEndInput: dateFromSeconds(state.time.period.end),
+      });
       return {
         ...state,
         time: {
           ...state.time,
-          period: getTimeperiodForDuration(state.time.duration, dateFromSeconds(state.time.period.end))
+          period: getTimeperiodForDuration(durationRunQuery, endInput)
         }
       };
     case "RUN_QUERY_TO_NOW":

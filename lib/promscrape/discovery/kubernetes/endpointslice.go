@@ -38,8 +38,11 @@ func parseEndpointSlice(data []byte) (object, error) {
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#endpointslices
 func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []map[string]string {
+	// The associated service name is stored in kubernetes.io/service-name label.
+	// See https://kubernetes.io/docs/reference/labels-annotations-taints/#kubernetesioservice-name
+	svcName := eps.Metadata.Labels.GetByName("kubernetes.io/service-name")
 	var svc *Service
-	if o := gw.getObjectByRoleLocked("service", eps.Metadata.Namespace, eps.Metadata.Name); o != nil {
+	if o := gw.getObjectByRoleLocked("service", eps.Metadata.Namespace, svcName); o != nil {
 		svc = o.(*Service)
 	}
 	podPortsSeen := make(map[*Pod][]int)
@@ -51,7 +54,8 @@ func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []map[string]string 
 		}
 		for _, epp := range eps.Ports {
 			for _, addr := range ess.Addresses {
-				ms = append(ms, getEndpointSliceLabelsForAddressAndPort(podPortsSeen, addr, eps, ess, epp, p, svc))
+				m := getEndpointSliceLabelsForAddressAndPort(gw, podPortsSeen, addr, eps, ess, epp, p, svc)
+				ms = append(ms, m)
 			}
 
 		}
@@ -76,7 +80,7 @@ func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []map[string]string 
 				m := map[string]string{
 					"__address__": addr,
 				}
-				p.appendCommonLabels(m)
+				p.appendCommonLabels(m, gw)
 				p.appendContainerLabels(m, c, &cp)
 				if svc != nil {
 					svc.appendCommonLabels(m)
@@ -93,20 +97,28 @@ func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []map[string]string 
 // enriches labels with TargetRef
 // p appended to seen Ports
 // if TargetRef matches
-func getEndpointSliceLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, addr string, eps *EndpointSlice, ea Endpoint, epp EndpointPort, p *Pod, svc *Service) map[string]string {
+func getEndpointSliceLabelsForAddressAndPort(gw *groupWatcher, podPortsSeen map[*Pod][]int, addr string, eps *EndpointSlice, ea Endpoint, epp EndpointPort,
+	p *Pod, svc *Service) map[string]string {
 	m := getEndpointSliceLabels(eps, addr, ea, epp)
 	if svc != nil {
 		svc.appendCommonLabels(m)
 	}
+	// See https://github.com/prometheus/prometheus/issues/10284
+	eps.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_endpointslice", m)
 	if ea.TargetRef.Kind != "Pod" || p == nil {
 		return m
 	}
-	p.appendCommonLabels(m)
+	// always add pod targetRef, even if epp port doesn't match container port.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2134
+	if _, ok := podPortsSeen[p]; !ok {
+		podPortsSeen[p] = []int{}
+	}
+	p.appendCommonLabels(m, gw)
 	for _, c := range p.Spec.Containers {
 		for _, cp := range c.Ports {
 			if cp.ContainerPort == epp.Port {
-				p.appendContainerLabels(m, c, &cp)
 				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
+				p.appendContainerLabels(m, c, &cp)
 				break
 			}
 		}
@@ -117,7 +129,6 @@ func getEndpointSliceLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, addr s
 
 // //getEndpointSliceLabels builds labels for given EndpointSlice
 func getEndpointSliceLabels(eps *EndpointSlice, addr string, ea Endpoint, epp EndpointPort) map[string]string {
-
 	addr = discoveryutils.JoinHostPort(addr, epp.Port)
 	m := map[string]string{
 		"__address__":                                               addr,
@@ -140,8 +151,8 @@ func getEndpointSliceLabels(eps *EndpointSlice, addr string, ea Endpoint, epp En
 		m["__meta_kubernetes_endpointslice_endpoint_hostname"] = ea.Hostname
 	}
 	for k, v := range ea.Topology {
-		m["__meta_kubernetes_endpointslice_endpoint_topology_"+discoveryutils.SanitizeLabelName(k)] = v
-		m["__meta_kubernetes_endpointslice_endpoint_topology_present_"+discoveryutils.SanitizeLabelName(k)] = "true"
+		m[discoveryutils.SanitizeLabelName("__meta_kubernetes_endpointslice_endpoint_topology_"+k)] = v
+		m[discoveryutils.SanitizeLabelName("__meta_kubernetes_endpointslice_endpoint_topology_present_"+k)] = "true"
 	}
 	return m
 }

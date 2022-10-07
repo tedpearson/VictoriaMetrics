@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand"
 	"regexp"
 	"sort"
 	"sync"
@@ -17,18 +18,17 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/valyala/fastrand"
 )
 
 var (
-	maxTagKeysPerSearch          = flag.Int("search.maxTagKeys", 100e3, "The maximum number of tag keys returned from /api/v1/labels")
-	maxTagValuesPerSearch        = flag.Int("search.maxTagValues", 100e3, "The maximum number of tag values returned from /api/v1/label/<label_name>/values")
-	maxTagValueSuffixesPerSearch = flag.Int("search.maxTagValueSuffixesPerSearch", 100e3, "The maximum number of tag value suffixes returned from /metrics/find")
-	maxMetricsPerSearch          = flag.Int("search.maxUniqueTimeseries", 300e3, "The maximum number of unique time series each search can scan. This option allows limiting memory usage")
-	maxSamplesPerSeries          = flag.Int("search.maxSamplesPerSeries", 30e6, "The maximum number of raw samples a single query can scan per each time series. This option allows limiting memory usage")
-	maxSamplesPerQuery           = flag.Int("search.maxSamplesPerQuery", 1e9, "The maximum number of raw samples a single query can process across all time series. This protects from heavy queries, which select unexpectedly high number of raw samples. See also -search.maxSamplesPerSeries")
+	maxTagKeysPerSearch   = flag.Int("search.maxTagKeys", 100e3, "The maximum number of tag keys returned from /api/v1/labels")
+	maxTagValuesPerSearch = flag.Int("search.maxTagValues", 100e3, "The maximum number of tag values returned from /api/v1/label/<label_name>/values")
+	maxSamplesPerSeries   = flag.Int("search.maxSamplesPerSeries", 30e6, "The maximum number of raw samples a single query can scan per each time series. This option allows limiting memory usage")
+	maxSamplesPerQuery    = flag.Int("search.maxSamplesPerQuery", 1e9, "The maximum number of raw samples a single query can process across all time series. This protects from heavy queries, which select unexpectedly high number of raw samples. See also -search.maxSamplesPerSeries")
 )
 
 // Result is a single timeseries result.
@@ -51,9 +51,8 @@ func (r *Result) reset() {
 
 // Results holds results returned from ProcessSearchQuery.
 type Results struct {
-	tr        storage.TimeRange
-	fetchData bool
-	deadline  searchutils.Deadline
+	tr       storage.TimeRange
+	deadline searchutils.Deadline
 
 	packedTimeseries []packedTimeseries
 	sr               *storage.Search
@@ -82,7 +81,7 @@ type timeseriesWork struct {
 	rss      *Results
 	pts      *packedTimeseries
 	f        func(rs *Result, workerID uint) error
-	doneCh   chan error
+	err      error
 
 	rowsProcessed int
 }
@@ -92,18 +91,14 @@ func (tsw *timeseriesWork) reset() {
 	tsw.rss = nil
 	tsw.pts = nil
 	tsw.f = nil
-	if n := len(tsw.doneCh); n > 0 {
-		logger.Panicf("BUG: tsw.doneCh must be empty during reset; it contains %d items instead", n)
-	}
+	tsw.err = nil
 	tsw.rowsProcessed = 0
 }
 
 func getTimeseriesWork() *timeseriesWork {
 	v := tswPool.Get()
 	if v == nil {
-		v = &timeseriesWork{
-			doneCh: make(chan error, 1),
-		}
+		v = &timeseriesWork{}
 	}
 	return v.(*timeseriesWork)
 }
@@ -115,28 +110,6 @@ func putTimeseriesWork(tsw *timeseriesWork) {
 
 var tswPool sync.Pool
 
-func scheduleTimeseriesWork(workChs []chan *timeseriesWork, tsw *timeseriesWork) {
-	if len(workChs) == 1 {
-		// Fast path for a single worker
-		workChs[0] <- tsw
-		return
-	}
-	attempts := 0
-	for {
-		idx := fastrand.Uint32n(uint32(len(workChs)))
-		select {
-		case workChs[idx] <- tsw:
-			return
-		default:
-			attempts++
-			if attempts >= len(workChs) {
-				workChs[idx] <- tsw
-				return
-			}
-		}
-	}
-}
-
 func (tsw *timeseriesWork) do(r *Result, workerID uint) error {
 	if atomic.LoadUint32(tsw.mustStop) != 0 {
 		return nil
@@ -146,29 +119,29 @@ func (tsw *timeseriesWork) do(r *Result, workerID uint) error {
 		atomic.StoreUint32(tsw.mustStop, 1)
 		return fmt.Errorf("timeout exceeded during query execution: %s", rss.deadline.String())
 	}
-	if err := tsw.pts.Unpack(r, rss.tbf, rss.tr, rss.fetchData); err != nil {
+	if err := tsw.pts.Unpack(r, rss.tbf, rss.tr); err != nil {
 		atomic.StoreUint32(tsw.mustStop, 1)
 		return fmt.Errorf("error during time series unpacking: %w", err)
 	}
-	if len(r.Timestamps) > 0 || !rss.fetchData {
+	tsw.rowsProcessed = len(r.Timestamps)
+	if len(r.Timestamps) > 0 {
 		if err := tsw.f(r, workerID); err != nil {
 			atomic.StoreUint32(tsw.mustStop, 1)
 			return err
 		}
 	}
-	tsw.rowsProcessed = len(r.Values)
 	return nil
 }
 
-func timeseriesWorker(ch <-chan *timeseriesWork, workerID uint) {
+func timeseriesWorker(tsws []*timeseriesWork, workerID uint) {
 	v := resultPool.Get()
 	if v == nil {
 		v = &result{}
 	}
 	r := v.(*result)
-	for tsw := range ch {
+	for _, tsw := range tsws {
 		err := tsw.do(&r.rs, workerID)
-		tsw.doneCh <- err
+		tsw.err = err
 	}
 	currentTime := fasttime.UnixTimestamp()
 	if cap(r.rs.Values) > 1024*1024 && 4*len(r.rs.Values) < cap(r.rs.Values) && currentTime-r.lastResetTime > 10 {
@@ -193,34 +166,11 @@ var resultPool sync.Pool
 // Data processing is immediately stopped if f returns non-nil error.
 //
 // rss becomes unusable after the call to RunParallel.
-func (rss *Results) RunParallel(f func(rs *Result, workerID uint) error) error {
+func (rss *Results) RunParallel(qt *querytracer.Tracer, f func(rs *Result, workerID uint) error) error {
+	qt = qt.NewChild("parallel process of fetched data")
 	defer rss.mustClose()
 
-	// Spin up local workers.
-	//
-	// Do not use a global workChs with a global pool of workers, since it may lead to a deadlock in the following case:
-	// - RunParallel is called with f, which blocks without forward progress.
-	// - All the workers in the global pool became blocked in f.
-	// - workChs is filled up, so it cannot accept new work items from other RunParallel calls.
-	workers := len(rss.packedTimeseries)
-	if workers > gomaxprocs {
-		workers = gomaxprocs
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	workChs := make([]chan *timeseriesWork, workers)
-	var workChsWG sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		workChs[i] = make(chan *timeseriesWork, 16)
-		workChsWG.Add(1)
-		go func(workerID int) {
-			defer workChsWG.Done()
-			timeseriesWorker(workChs[workerID], uint(workerID))
-		}(i)
-	}
-
-	// Feed workers with work.
+	// Prepare work for workers.
 	tsws := make([]*timeseriesWork, len(rss.packedTimeseries))
 	var mustStop uint32
 	for i := range rss.packedTimeseries {
@@ -229,38 +179,85 @@ func (rss *Results) RunParallel(f func(rs *Result, workerID uint) error) error {
 		tsw.pts = &rss.packedTimeseries[i]
 		tsw.f = f
 		tsw.mustStop = &mustStop
-		scheduleTimeseriesWork(workChs, tsw)
 		tsws[i] = tsw
 	}
-	seriesProcessedTotal := len(rss.packedTimeseries)
-	rss.packedTimeseries = rss.packedTimeseries[:0]
+	// Shuffle tsws for providing the equal amount of work among workers.
+	r := getRand()
+	r.Shuffle(len(tsws), func(i, j int) {
+		tsws[i], tsws[j] = tsws[j], tsws[i]
+	})
+	putRand(r)
+
+	// Spin up up to gomaxprocs local workers and split work equally among them.
+	// This guarantees linear scalability with the increase of gomaxprocs
+	// (e.g. the number of available CPU cores).
+	itemsPerWorker := 1
+	if len(rss.packedTimeseries) > gomaxprocs {
+		itemsPerWorker = 1 + len(rss.packedTimeseries)/gomaxprocs
+	}
+	var start int
+	var i uint
+	var wg sync.WaitGroup
+	for start < len(tsws) {
+		end := start + itemsPerWorker
+		if end > len(tsws) {
+			end = len(tsws)
+		}
+		chunk := tsws[start:end]
+		wg.Add(1)
+		go func(tswsChunk []*timeseriesWork, workerID uint) {
+			defer wg.Done()
+			timeseriesWorker(tswsChunk, workerID)
+		}(chunk, i)
+		start = end
+		i++
+	}
 
 	// Wait until work is complete.
+	wg.Wait()
+
+	// Collect results.
 	var firstErr error
 	rowsProcessedTotal := 0
 	for _, tsw := range tsws {
-		if err := <-tsw.doneCh; err != nil && firstErr == nil {
+		if err := tsw.err; err != nil && firstErr == nil {
 			// Return just the first error, since other errors are likely duplicate the first error.
 			firstErr = err
 		}
+		rowsReadPerSeries.Update(float64(tsw.rowsProcessed))
 		rowsProcessedTotal += tsw.rowsProcessed
 		putTimeseriesWork(tsw)
 	}
 
-	perQueryRowsProcessed.Update(float64(rowsProcessedTotal))
-	perQuerySeriesProcessed.Update(float64(seriesProcessedTotal))
+	seriesProcessedTotal := len(rss.packedTimeseries)
+	rss.packedTimeseries = rss.packedTimeseries[:0]
+	rowsReadPerQuery.Update(float64(rowsProcessedTotal))
+	seriesReadPerQuery.Update(float64(seriesProcessedTotal))
 
-	// Shut down local workers
-	for _, workCh := range workChs {
-		close(workCh)
-	}
-	workChsWG.Wait()
+	qt.Donef("series=%d, samples=%d", seriesProcessedTotal, rowsProcessedTotal)
 
 	return firstErr
 }
 
-var perQueryRowsProcessed = metrics.NewHistogram(`vm_per_query_rows_processed_count`)
-var perQuerySeriesProcessed = metrics.NewHistogram(`vm_per_query_series_processed_count`)
+var randPool sync.Pool
+
+func getRand() *rand.Rand {
+	v := randPool.Get()
+	if v == nil {
+		v = rand.New(rand.NewSource(int64(fasttime.UnixTimestamp())))
+	}
+	return v.(*rand.Rand)
+}
+
+func putRand(r *rand.Rand) {
+	randPool.Put(r)
+}
+
+var (
+	rowsReadPerSeries  = metrics.NewHistogram(`vm_rows_read_per_series`)
+	rowsReadPerQuery   = metrics.NewHistogram(`vm_rows_read_per_query`)
+	seriesReadPerQuery = metrics.NewHistogram(`vm_series_read_per_query`)
+)
 
 var gomaxprocs = cgroup.AvailableCPUs()
 
@@ -375,14 +372,10 @@ var tmpBlockPool sync.Pool
 var unpackBatchSize = 5000
 
 // Unpack unpacks pts to dst.
-func (pts *packedTimeseries) Unpack(dst *Result, tbf *tmpBlocksFile, tr storage.TimeRange, fetchData bool) error {
+func (pts *packedTimeseries) Unpack(dst *Result, tbf *tmpBlocksFile, tr storage.TimeRange) error {
 	dst.reset()
 	if err := dst.MetricName.Unmarshal(bytesutil.ToUnsafeBytes(pts.metricName)); err != nil {
 		return fmt.Errorf("cannot unmarshal metricName %q: %w", pts.metricName, err)
-	}
-	if !fetchData {
-		// Do not spend resources on data reading and unpacking.
-		return nil
 	}
 
 	// Spin up local workers.
@@ -507,29 +500,29 @@ func mergeSortBlocks(dst *Result, sbh sortBlocksHeap, dedupInterval int64) {
 	heap.Init(&sbh)
 	for {
 		top := sbh[0]
-		heap.Pop(&sbh)
-		if len(sbh) == 0 {
+		if len(sbh) == 1 {
 			dst.Timestamps = append(dst.Timestamps, top.Timestamps[top.NextIdx:]...)
 			dst.Values = append(dst.Values, top.Values[top.NextIdx:]...)
 			putSortBlock(top)
 			break
 		}
-		sbNext := sbh[0]
+		sbNext := sbh.getNextBlock()
 		tsNext := sbNext.Timestamps[sbNext.NextIdx]
-		idxNext := len(top.Timestamps)
-		if top.Timestamps[idxNext-1] > tsNext {
-			idxNext = top.NextIdx
-			for top.Timestamps[idxNext] <= tsNext {
-				idxNext++
-			}
-		}
-		dst.Timestamps = append(dst.Timestamps, top.Timestamps[top.NextIdx:idxNext]...)
-		dst.Values = append(dst.Values, top.Values[top.NextIdx:idxNext]...)
-		if idxNext < len(top.Timestamps) {
-			top.NextIdx = idxNext
-			heap.Push(&sbh, top)
+		topTimestamps := top.Timestamps
+		topNextIdx := top.NextIdx
+		if n := equalTimestampsPrefix(topTimestamps[topNextIdx:], sbNext.Timestamps[sbNext.NextIdx:]); n > 0 && dedupInterval > 0 {
+			// Skip n replicated samples at top if deduplication is enabled.
+			top.NextIdx = topNextIdx + n
 		} else {
-			// Return top to the pool.
+			// Copy samples from top to dst with timestamps not exceeding tsNext.
+			top.NextIdx = topNextIdx + binarySearchTimestamps(topTimestamps[topNextIdx:], tsNext)
+			dst.Timestamps = append(dst.Timestamps, topTimestamps[topNextIdx:top.NextIdx]...)
+			dst.Values = append(dst.Values, top.Values[topNextIdx:top.NextIdx]...)
+		}
+		if top.NextIdx < len(topTimestamps) {
+			heap.Fix(&sbh, 0)
+		} else {
+			heap.Pop(&sbh)
 			putSortBlock(top)
 		}
 	}
@@ -541,6 +534,34 @@ func mergeSortBlocks(dst *Result, sbh sortBlocksHeap, dedupInterval int64) {
 }
 
 var dedupsDuringSelect = metrics.NewCounter(`vm_deduplicated_samples_total{type="select"}`)
+
+func equalTimestampsPrefix(a, b []int64) int {
+	for i, v := range a {
+		if i >= len(b) || v != b[i] {
+			return i
+		}
+	}
+	return len(a)
+}
+
+func binarySearchTimestamps(timestamps []int64, ts int64) int {
+	// The code has been adapted from sort.Search.
+	n := len(timestamps)
+	if n > 0 && timestamps[n-1] <= ts {
+		// Fast path for timestamps scanned in ascending order.
+		return n
+	}
+	i, j := 0, n
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if h >= 0 && h < len(timestamps) && timestamps[h] <= ts {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
 
 type sortBlock struct {
 	Timestamps []int64
@@ -557,7 +578,7 @@ func (sb *sortBlock) reset() {
 func (sb *sortBlock) unpackFrom(tmpBlock *storage.Block, tbf *tmpBlocksFile, br blockRef, tr storage.TimeRange) error {
 	tmpBlock.Reset()
 	brReal := tbf.MustReadBlockRefAt(br.partRef, br.addr)
-	brReal.MustReadBlock(tmpBlock, true)
+	brReal.MustReadBlock(tmpBlock)
 	if err := tmpBlock.UnmarshalData(); err != nil {
 		return fmt.Errorf("cannot unmarshal block: %w", err)
 	}
@@ -568,6 +589,21 @@ func (sb *sortBlock) unpackFrom(tmpBlock *storage.Block, tbf *tmpBlocksFile, br 
 }
 
 type sortBlocksHeap []*sortBlock
+
+func (sbh sortBlocksHeap) getNextBlock() *sortBlock {
+	if len(sbh) < 2 {
+		return nil
+	}
+	if len(sbh) < 3 {
+		return sbh[1]
+	}
+	a := sbh[1]
+	b := sbh[2]
+	if a.Timestamps[a.NextIdx] <= b.Timestamps[b.NextIdx] {
+		return a
+	}
+	return b
+}
 
 func (sbh sortBlocksHeap) Len() int {
 	return len(sbh)
@@ -595,44 +631,51 @@ func (sbh *sortBlocksHeap) Pop() interface{} {
 }
 
 // DeleteSeries deletes time series matching the given tagFilterss.
-func DeleteSeries(sq *storage.SearchQuery, deadline searchutils.Deadline) (int, error) {
-	tr := storage.TimeRange{
-		MinTimestamp: sq.MinTimestamp,
-		MaxTimestamp: sq.MaxTimestamp,
-	}
-	tfss, err := setupTfss(tr, sq.TagFilterss, deadline)
+func DeleteSeries(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline searchutils.Deadline) (int, error) {
+	qt = qt.NewChild("delete series: %s", sq)
+	defer qt.Done()
+	tr := sq.GetTimeRange()
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
 		return 0, err
 	}
-	return vmstorage.DeleteMetrics(tfss)
+	return vmstorage.DeleteSeries(qt, tfss)
 }
 
-// GetLabelsOnTimeRange returns labels for the given tr until the given deadline.
-func GetLabelsOnTimeRange(tr storage.TimeRange, deadline searchutils.Deadline) ([]string, error) {
+// LabelNames returns label names matching the given sq until the given deadline.
+func LabelNames(qt *querytracer.Tracer, sq *storage.SearchQuery, maxLabelNames int, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("get labels: %s", sq)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	labels, err := vmstorage.SearchTagKeysOnTimeRange(tr, *maxTagKeysPerSearch, deadline.Deadline())
+	if maxLabelNames > *maxTagKeysPerSearch || maxLabelNames <= 0 {
+		maxLabelNames = *maxTagKeysPerSearch
+	}
+	tr := sq.GetTimeRange()
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
+	if err != nil {
+		return nil, err
+	}
+	labels, err := vmstorage.SearchLabelNamesWithFiltersOnTimeRange(qt, tfss, tr, maxLabelNames, sq.MaxMetrics, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during labels search on time range: %w", err)
 	}
-	// Substitute "" with "__name__"
-	for i := range labels {
-		if labels[i] == "" {
-			labels[i] = "__name__"
-		}
-	}
 	// Sort labels like Prometheus does
 	sort.Strings(labels)
+	qt.Printf("sort %d labels", len(labels))
 	return labels, nil
 }
 
-// GetGraphiteTags returns Graphite tags until the given deadline.
-func GetGraphiteTags(filter string, limit int, deadline searchutils.Deadline) ([]string, error) {
+// GraphiteTags returns Graphite tags until the given deadline.
+func GraphiteTags(qt *querytracer.Tracer, filter string, limit int, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("get graphite tags: filter=%s, limit=%d", filter, limit)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	labels, err := GetLabels(deadline)
+	sq := storage.NewSearchQuery(0, 0, nil, 0)
+	labels, err := LabelNames(qt, sq, 0, deadline)
 	if err != nil {
 		return nil, err
 	}
@@ -672,54 +715,43 @@ func hasString(a []string, s string) bool {
 	return false
 }
 
-// GetLabels returns labels until the given deadline.
-func GetLabels(deadline searchutils.Deadline) ([]string, error) {
+// LabelValues returns label values matching the given labelName and sq until the given deadline.
+func LabelValues(qt *querytracer.Tracer, labelName string, sq *storage.SearchQuery, maxLabelValues int, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("get values for label %s: %s", labelName, sq)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	labels, err := vmstorage.SearchTagKeys(*maxTagKeysPerSearch, deadline.Deadline())
+	if maxLabelValues > *maxTagValuesPerSearch || maxLabelValues <= 0 {
+		maxLabelValues = *maxTagValuesPerSearch
+	}
+	tr := sq.GetTimeRange()
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
-		return nil, fmt.Errorf("error during labels search: %w", err)
+		return nil, err
 	}
-	// Substitute "" with "__name__"
-	for i := range labels {
-		if labels[i] == "" {
-			labels[i] = "__name__"
-		}
-	}
-	// Sort labels like Prometheus does
-	sort.Strings(labels)
-	return labels, nil
-}
-
-// GetLabelValuesOnTimeRange returns label values for the given labelName on the given tr
-// until the given deadline.
-func GetLabelValuesOnTimeRange(labelName string, tr storage.TimeRange, deadline searchutils.Deadline) ([]string, error) {
-	if deadline.Exceeded() {
-		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
-	}
-	if labelName == "__name__" {
-		labelName = ""
-	}
-	// Search for tag values
-	labelValues, err := vmstorage.SearchTagValuesOnTimeRange([]byte(labelName), tr, *maxTagValuesPerSearch, deadline.Deadline())
+	labelValues, err := vmstorage.SearchLabelValuesWithFiltersOnTimeRange(qt, labelName, tfss, tr, maxLabelValues, sq.MaxMetrics, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during label values search on time range for labelName=%q: %w", labelName, err)
 	}
 	// Sort labelValues like Prometheus does
 	sort.Strings(labelValues)
+	qt.Printf("sort %d label values", len(labelValues))
 	return labelValues, nil
 }
 
-// GetGraphiteTagValues returns tag values for the given tagName until the given deadline.
-func GetGraphiteTagValues(tagName, filter string, limit int, deadline searchutils.Deadline) ([]string, error) {
+// GraphiteTagValues returns tag values for the given tagName until the given deadline.
+func GraphiteTagValues(qt *querytracer.Tracer, tagName, filter string, limit int, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("get graphite tag values for tagName=%s, filter=%s, limit=%d", tagName, filter, limit)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
 	if tagName == "name" {
 		tagName = ""
 	}
-	tagValues, err := GetLabelValues(tagName, deadline)
+	sq := storage.NewSearchQuery(0, 0, nil, 0)
+	tagValues, err := LabelValues(qt, tagName, sq, 0, deadline)
 	if err != nil {
 		return nil, err
 	}
@@ -735,112 +767,54 @@ func GetGraphiteTagValues(tagName, filter string, limit int, deadline searchutil
 	return tagValues, nil
 }
 
-// GetLabelValues returns label values for the given labelName
-// until the given deadline.
-func GetLabelValues(labelName string, deadline searchutils.Deadline) ([]string, error) {
-	if deadline.Exceeded() {
-		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
-	}
-	if labelName == "__name__" {
-		labelName = ""
-	}
-	// Search for tag values
-	labelValues, err := vmstorage.SearchTagValues([]byte(labelName), *maxTagValuesPerSearch, deadline.Deadline())
-	if err != nil {
-		return nil, fmt.Errorf("error during label values search for labelName=%q: %w", labelName, err)
-	}
-	// Sort labelValues like Prometheus does
-	sort.Strings(labelValues)
-	return labelValues, nil
-}
-
-// GetTagValueSuffixes returns tag value suffixes for the given tagKey and the given tagValuePrefix.
+// TagValueSuffixes returns tag value suffixes for the given tagKey and the given tagValuePrefix.
 //
 // It can be used for implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find
-func GetTagValueSuffixes(tr storage.TimeRange, tagKey, tagValuePrefix string, delimiter byte, deadline searchutils.Deadline) ([]string, error) {
+func TagValueSuffixes(qt *querytracer.Tracer, tr storage.TimeRange, tagKey, tagValuePrefix string, delimiter byte, maxSuffixes int, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("get tag value suffixes for tagKey=%s, tagValuePrefix=%s, maxSuffixes=%d, timeRange=%s", tagKey, tagValuePrefix, maxSuffixes, &tr)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	suffixes, err := vmstorage.SearchTagValueSuffixes(tr, []byte(tagKey), []byte(tagValuePrefix), delimiter, *maxTagValueSuffixesPerSearch, deadline.Deadline())
+	suffixes, err := vmstorage.SearchTagValueSuffixes(qt, tr, tagKey, tagValuePrefix, delimiter, maxSuffixes, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during search for suffixes for tagKey=%q, tagValuePrefix=%q, delimiter=%c on time range %s: %w",
 			tagKey, tagValuePrefix, delimiter, tr.String(), err)
 	}
-	if len(suffixes) >= *maxTagValueSuffixesPerSearch {
+	if len(suffixes) >= maxSuffixes {
 		return nil, fmt.Errorf("more than -search.maxTagValueSuffixesPerSearch=%d tag value suffixes found for tagKey=%q, tagValuePrefix=%q, delimiter=%c on time range %s; "+
 			"either narrow down the query or increase -search.maxTagValueSuffixesPerSearch command-line flag value",
-			*maxTagValueSuffixesPerSearch, tagKey, tagValuePrefix, delimiter, tr.String())
+			maxSuffixes, tagKey, tagValuePrefix, delimiter, tr.String())
 	}
 	return suffixes, nil
 }
 
-// GetLabelEntries returns all the label entries until the given deadline.
-func GetLabelEntries(deadline searchutils.Deadline) ([]storage.TagEntry, error) {
+// TSDBStatus returns tsdb status according to https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
+//
+// It accepts aribtrary filters on time series in sq.
+func TSDBStatus(qt *querytracer.Tracer, sq *storage.SearchQuery, focusLabel string, topN int, deadline searchutils.Deadline) (*storage.TSDBStatus, error) {
+	qt = qt.NewChild("get tsdb stats: %s, focusLabel=%q, topN=%d", sq, focusLabel, topN)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
-	labelEntries, err := vmstorage.SearchTagEntries(*maxTagKeysPerSearch, *maxTagValuesPerSearch, deadline.Deadline())
+	tr := sq.GetTimeRange()
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
-		return nil, fmt.Errorf("error during label entries request: %w", err)
+		return nil, err
 	}
-
-	// Substitute "" with "__name__"
-	for i := range labelEntries {
-		e := &labelEntries[i]
-		if e.Key == "" {
-			e.Key = "__name__"
-		}
-	}
-
-	// Sort labelEntries by the number of label values in each entry.
-	sort.Slice(labelEntries, func(i, j int) bool {
-		a, b := labelEntries[i].Values, labelEntries[j].Values
-		if len(a) != len(b) {
-			return len(a) > len(b)
-		}
-		return labelEntries[i].Key > labelEntries[j].Key
-	})
-
-	return labelEntries, nil
-}
-
-// GetTSDBStatusForDate returns tsdb status according to https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
-func GetTSDBStatusForDate(deadline searchutils.Deadline, date uint64, topN int) (*storage.TSDBStatus, error) {
-	if deadline.Exceeded() {
-		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
-	}
-	status, err := vmstorage.GetTSDBStatusForDate(date, topN, deadline.Deadline())
+	date := uint64(tr.MinTimestamp) / (3600 * 24 * 1000)
+	status, err := vmstorage.GetTSDBStatus(qt, tfss, date, focusLabel, topN, sq.MaxMetrics, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("error during tsdb status request: %w", err)
 	}
 	return status, nil
 }
 
-// GetTSDBStatusWithFilters returns tsdb status according to https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
-//
-// It accepts aribtrary filters on time series in sq.
-func GetTSDBStatusWithFilters(deadline searchutils.Deadline, sq *storage.SearchQuery, topN int) (*storage.TSDBStatus, error) {
-	if deadline.Exceeded() {
-		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
-	}
-	tr := storage.TimeRange{
-		MinTimestamp: sq.MinTimestamp,
-		MaxTimestamp: sq.MaxTimestamp,
-	}
-	tfss, err := setupTfss(tr, sq.TagFilterss, deadline)
-	if err != nil {
-		return nil, err
-	}
-	date := uint64(tr.MinTimestamp) / (3600 * 24 * 1000)
-	status, err := vmstorage.GetTSDBStatusWithFiltersForDate(tfss, date, topN, deadline.Deadline())
-	if err != nil {
-		return nil, fmt.Errorf("error during tsdb status with filters request: %w", err)
-	}
-	return status, nil
-}
-
-// GetSeriesCount returns the number of unique series.
-func GetSeriesCount(deadline searchutils.Deadline) (uint64, error) {
+// SeriesCount returns the number of unique series.
+func SeriesCount(qt *querytracer.Tracer, deadline searchutils.Deadline) (uint64, error) {
+	qt = qt.NewChild("get series count")
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return 0, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
@@ -872,18 +846,18 @@ var ssPool sync.Pool
 // Data processing is immediately stopped if f returns non-nil error.
 // It is the responsibility of f to call b.UnmarshalData before reading timestamps and values from the block.
 // It is the responsibility of f to filter blocks according to the given tr.
-func ExportBlocks(sq *storage.SearchQuery, deadline searchutils.Deadline, f func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error) error {
+func ExportBlocks(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline searchutils.Deadline,
+	f func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange, workerID uint) error) error {
+	qt = qt.NewChild("export blocks: %s", sq)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return fmt.Errorf("timeout exceeded before starting data export: %s", deadline.String())
 	}
-	tr := storage.TimeRange{
-		MinTimestamp: sq.MinTimestamp,
-		MaxTimestamp: sq.MaxTimestamp,
-	}
+	tr := sq.GetTimeRange()
 	if err := vmstorage.CheckTimeRange(tr); err != nil {
 		return err
 	}
-	tfss, err := setupTfss(tr, sq.TagFilterss, deadline)
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
 		return err
 	}
@@ -894,7 +868,7 @@ func ExportBlocks(sq *storage.SearchQuery, deadline searchutils.Deadline, f func
 	sr := getStorageSearch()
 	defer putStorageSearch(sr)
 	startTime := time.Now()
-	sr.Init(vmstorage.Storage, tfss, tr, *maxMetricsPerSearch, deadline.Deadline())
+	sr.Init(qt, vmstorage.Storage, tfss, tr, sq.MaxMetrics, deadline.Deadline())
 	indexSearchDuration.UpdateDuration(startTime)
 
 	// Start workers that call f in parallel on available CPU cores.
@@ -908,10 +882,10 @@ func ExportBlocks(sq *storage.SearchQuery, deadline searchutils.Deadline, f func
 	var wg sync.WaitGroup
 	wg.Add(gomaxprocs)
 	for i := 0; i < gomaxprocs; i++ {
-		go func() {
+		go func(workerID uint) {
 			defer wg.Done()
 			for xw := range workCh {
-				if err := f(&xw.mn, &xw.b, tr); err != nil {
+				if err := f(&xw.mn, &xw.b, tr, workerID); err != nil {
 					errGlobalLock.Lock()
 					if errGlobal != nil {
 						errGlobal = err
@@ -922,11 +896,12 @@ func ExportBlocks(sq *storage.SearchQuery, deadline searchutils.Deadline, f func
 				xw.reset()
 				exportWorkPool.Put(xw)
 			}
-		}()
+		}(uint(i))
 	}
 
 	// Feed workers with work
 	blocksRead := 0
+	samples := 0
 	for sr.NextMetricBlock() {
 		blocksRead++
 		if deadline.Exceeded() {
@@ -939,13 +914,16 @@ func ExportBlocks(sq *storage.SearchQuery, deadline searchutils.Deadline, f func
 		if err := xw.mn.Unmarshal(sr.MetricBlockRef.MetricName); err != nil {
 			return fmt.Errorf("cannot unmarshal metricName for block #%d: %w", blocksRead, err)
 		}
-		sr.MetricBlockRef.BlockRef.MustReadBlock(&xw.b, true)
+		br := sr.MetricBlockRef.BlockRef
+		br.MustReadBlock(&xw.b)
+		samples += br.RowsCount()
 		workCh <- xw
 	}
 	close(workCh)
 
 	// Wait for workers to finish.
 	wg.Wait()
+	qt.Printf("export blocks=%d, samples=%d", blocksRead, samples)
 
 	// Check errors.
 	err = sr.Error()
@@ -978,48 +956,50 @@ var exportWorkPool = &sync.Pool{
 }
 
 // SearchMetricNames returns all the metric names matching sq until the given deadline.
-func SearchMetricNames(sq *storage.SearchQuery, deadline searchutils.Deadline) ([]storage.MetricName, error) {
+//
+// The returned metric names must be unmarshaled via storage.MetricName.UnmarshalString().
+func SearchMetricNames(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline searchutils.Deadline) ([]string, error) {
+	qt = qt.NewChild("fetch metric names: %s", sq)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting to search metric names: %s", deadline.String())
 	}
 
 	// Setup search.
-	tr := storage.TimeRange{
-		MinTimestamp: sq.MinTimestamp,
-		MaxTimestamp: sq.MaxTimestamp,
-	}
+	tr := sq.GetTimeRange()
 	if err := vmstorage.CheckTimeRange(tr); err != nil {
 		return nil, err
 	}
-	tfss, err := setupTfss(tr, sq.TagFilterss, deadline)
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
 		return nil, err
 	}
 
-	mns, err := vmstorage.SearchMetricNames(tfss, tr, *maxMetricsPerSearch, deadline.Deadline())
+	metricNames, err := vmstorage.SearchMetricNames(qt, tfss, tr, sq.MaxMetrics, deadline.Deadline())
 	if err != nil {
 		return nil, fmt.Errorf("cannot find metric names: %w", err)
 	}
-	return mns, nil
+	sort.Strings(metricNames)
+	qt.Printf("sort %d metric names", len(metricNames))
+	return metricNames, nil
 }
 
 // ProcessSearchQuery performs sq until the given deadline.
 //
 // Results.RunParallel or Results.Cancel must be called on the returned Results.
-func ProcessSearchQuery(sq *storage.SearchQuery, fetchData bool, deadline searchutils.Deadline) (*Results, error) {
+func ProcessSearchQuery(qt *querytracer.Tracer, sq *storage.SearchQuery, deadline searchutils.Deadline) (*Results, error) {
+	qt = qt.NewChild("fetch matching series: %s", sq)
+	defer qt.Done()
 	if deadline.Exceeded() {
 		return nil, fmt.Errorf("timeout exceeded before starting the query processing: %s", deadline.String())
 	}
 
 	// Setup search.
-	tr := storage.TimeRange{
-		MinTimestamp: sq.MinTimestamp,
-		MaxTimestamp: sq.MaxTimestamp,
-	}
+	tr := sq.GetTimeRange()
 	if err := vmstorage.CheckTimeRange(tr); err != nil {
 		return nil, err
 	}
-	tfss, err := setupTfss(tr, sq.TagFilterss, deadline)
+	tfss, err := setupTfss(qt, tr, sq.TagFilterss, sq.MaxMetrics, deadline)
 	if err != nil {
 		return nil, err
 	}
@@ -1029,7 +1009,7 @@ func ProcessSearchQuery(sq *storage.SearchQuery, fetchData bool, deadline search
 
 	sr := getStorageSearch()
 	startTime := time.Now()
-	maxSeriesCount := sr.Init(vmstorage.Storage, tfss, tr, *maxMetricsPerSearch, deadline.Deadline())
+	maxSeriesCount := sr.Init(qt, vmstorage.Storage, tfss, tr, sq.MaxMetrics, deadline.Deadline())
 	indexSearchDuration.UpdateDuration(startTime)
 	m := make(map[string][]blockRef, maxSeriesCount)
 	orderedMetricNames := make([]string, 0, maxSeriesCount)
@@ -1086,10 +1066,10 @@ func ProcessSearchQuery(sq *storage.SearchQuery, fetchData bool, deadline search
 		putStorageSearch(sr)
 		return nil, fmt.Errorf("cannot finalize temporary file: %w", err)
 	}
+	qt.Printf("fetch unique series=%d, blocks=%d, samples=%d, bytes=%d", len(m), blocksRead, samples, tbf.Len())
 
 	var rss Results
 	rss.tr = tr
-	rss.fetchData = fetchData
 	rss.deadline = deadline
 	pts := make([]packedTimeseries, len(orderedMetricNames))
 	for i, metricName := range orderedMetricNames {
@@ -1111,7 +1091,7 @@ type blockRef struct {
 	addr    tmpBlockAddr
 }
 
-func setupTfss(tr storage.TimeRange, tagFilterss [][]storage.TagFilter, deadline searchutils.Deadline) ([]*storage.TagFilters, error) {
+func setupTfss(qt *querytracer.Tracer, tr storage.TimeRange, tagFilterss [][]storage.TagFilter, maxMetrics int, deadline searchutils.Deadline) ([]*storage.TagFilters, error) {
 	tfss := make([]*storage.TagFilters, 0, len(tagFilterss))
 	for _, tagFilters := range tagFilterss {
 		tfs := storage.NewTagFilters()
@@ -1119,13 +1099,13 @@ func setupTfss(tr storage.TimeRange, tagFilterss [][]storage.TagFilter, deadline
 			tf := &tagFilters[i]
 			if string(tf.Key) == "__graphite__" {
 				query := tf.Value
-				paths, err := vmstorage.SearchGraphitePaths(tr, query, *maxMetricsPerSearch, deadline.Deadline())
+				paths, err := vmstorage.SearchGraphitePaths(qt, tr, query, maxMetrics, deadline.Deadline())
 				if err != nil {
 					return nil, fmt.Errorf("error when searching for Graphite paths for query %q: %w", query, err)
 				}
-				if len(paths) >= *maxMetricsPerSearch {
-					return nil, fmt.Errorf("more than -search.maxUniqueTimeseries=%d time series match Graphite query %q; "+
-						"either narrow down the query or increase -search.maxUniqueTimeseries command-line flag value", *maxMetricsPerSearch, query)
+				if len(paths) >= maxMetrics {
+					return nil, fmt.Errorf("more than %d time series match Graphite query %q; "+
+						"either narrow down the query or increase the corresponding -search.max* command-line flag value", maxMetrics, query)
 				}
 				tfs.AddGraphiteQuery(query, paths, tf.IsNegative)
 				continue

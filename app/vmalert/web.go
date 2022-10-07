@@ -1,15 +1,16 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/tpl"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -23,19 +24,23 @@ var (
 )
 
 func initLinks() {
-	pathPrefix := httpserver.GetPathPrefix()
 	apiLinks = [][2]string{
-		{path.Join(pathPrefix, "api/v1/groups"), "list all loaded groups and rules"},
-		{path.Join(pathPrefix, "api/v1/alerts"), "list all active alerts"},
-		{path.Join(pathPrefix, "api/v1/groupID/alertID/status"), "get alert status by ID"},
-		{path.Join(pathPrefix, "flags"), "command-line flags"},
-		{path.Join(pathPrefix, "metrics"), "list of application metrics"},
-		{path.Join(pathPrefix, "-/reload"), "reload configuration"},
+		// api links are relative since they can be used by external clients,
+		// such as Grafana, and proxied via vmselect.
+		{"api/v1/rules", "list all loaded groups and rules"},
+		{"api/v1/alerts", "list all active alerts"},
+		{fmt.Sprintf("api/v1/alert?%s=<int>&%s=<int>", paramGroupID, paramAlertID), "get alert status by group and alert ID"},
+
+		// system links
+		{"/flags", "command-line flags"},
+		{"/metrics", "list of application metrics"},
+		{"/-/reload", "reload configuration"},
 	}
 	navItems = []tpl.NavItem{
-		{Name: "vmalert", Url: pathPrefix},
-		{Name: "Groups", Url: path.Join(pathPrefix, "groups")},
-		{Name: "Alerts", Url: path.Join(pathPrefix, "alerts")},
+		{Name: "vmalert", Url: "."},
+		{Name: "Groups", Url: "groups"},
+		{Name: "Alerts", Url: "alerts"},
+		{Name: "Notifiers", Url: "notifiers"},
 		{Name: "Docs", Url: "https://docs.victoriametrics.com/vmalert.html"},
 	}
 }
@@ -44,25 +49,67 @@ type requestHandler struct {
 	m *manager
 }
 
+var (
+	//go:embed static
+	staticFiles   embed.FS
+	staticHandler = http.FileServer(http.FS(staticFiles))
+	staticServer  = http.StripPrefix("/vmalert", staticHandler)
+)
+
 func (rh *requestHandler) handler(w http.ResponseWriter, r *http.Request) bool {
 	once.Do(func() {
 		initLinks()
 	})
 
+	if strings.HasPrefix(r.URL.Path, "/vmalert/static") {
+		staticServer.ServeHTTP(w, r)
+		return true
+	}
+
 	switch r.URL.Path {
-	case "/":
+	case "/", "/vmalert", "/vmalert/":
 		if r.Method != "GET" {
+			httpserver.Errorf(w, r, "path %q supports only GET method", r.URL.Path)
 			return false
 		}
-		WriteWelcome(w)
+		WriteWelcome(w, r)
 		return true
-	case "/alerts":
-		WriteListAlerts(w, rh.groupAlerts())
+	case "/vmalert/alerts":
+		WriteListAlerts(w, r, rh.groupAlerts())
 		return true
-	case "/groups":
-		WriteListGroups(w, rh.groups())
+	case "/vmalert/alert":
+		alert, err := rh.getAlert(r)
+		if err != nil {
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		WriteAlert(w, r, alert)
 		return true
-	case "/api/v1/groups":
+	case "/vmalert/rule":
+		rule, err := rh.getRule(r)
+		if err != nil {
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		WriteRuleDetails(w, r, rule)
+		return true
+	case "/vmalert/groups":
+		WriteListGroups(w, r, rh.groups())
+		return true
+	case "/vmalert/notifiers":
+		WriteListTargets(w, r, notifier.GetTargets())
+		return true
+
+	// special cases for Grafana requests,
+	// served without `vmalert` prefix:
+	case "/rules":
+		// Grafana makes an extra request to `/rules`
+		// handler in addition to `/api/v1/rules` calls in alerts UI,
+		WriteListGroups(w, r, rh.groups())
+		return true
+
+	case "/vmalert/api/v1/rules", "/api/v1/rules":
+		// path used by Grafana for ng alerting
 		data, err := rh.listGroups()
 		if err != nil {
 			httpserver.Errorf(w, r, "%s", err)
@@ -71,10 +118,25 @@ func (rh *requestHandler) handler(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
 		return true
-	case "/api/v1/alerts":
+	case "/vmalert/api/v1/alerts", "/api/v1/alerts":
+		// path used by Grafana for ng alerting
 		data, err := rh.listAlerts()
 		if err != nil {
 			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+		return true
+	case "/vmalert/api/v1/alert", "/api/v1/alert":
+		alert, err := rh.getAlert(r)
+		if err != nil {
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		data, err := json.Marshal(alert)
+		if err != nil {
+			httpserver.Errorf(w, r, "failed to marshal alert: %s", err)
 			return true
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -85,8 +147,15 @@ func (rh *requestHandler) handler(w http.ResponseWriter, r *http.Request) bool {
 		procutil.SelfSIGHUP()
 		w.WriteHeader(http.StatusOK)
 		return true
+
 	default:
+		// Support of deprecated links:
+		// * /api/v1/<groupID>/<alertID>/status
+		// * <groupID>/<alertID>/status
+		// TODO: to remove in next versions
+
 		if !strings.HasSuffix(r.URL.Path, "/status") {
+			httpserver.Errorf(w, r, "unsupported path requested: %q ", r.URL.Path)
 			return false
 		}
 		alert, err := rh.alertByPath(strings.TrimPrefix(r.URL.Path, "/api/v1/"))
@@ -95,29 +164,58 @@ func (rh *requestHandler) handler(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 
-		// /api/v1/<groupID>/<alertID>/status
+		redirectURL := alert.WebLink()
 		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
-			data, err := json.Marshal(alert)
-			if err != nil {
-				httpserver.Errorf(w, r, "failed to marshal alert: %s", err)
-				return true
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(data)
-			return true
+			redirectURL = alert.APILink()
 		}
-
-		// <groupID>/<alertID>/status
-		WriteAlert(w, alert)
+		httpserver.Redirect(w, "/"+redirectURL)
 		return true
 	}
 }
 
+const (
+	paramGroupID = "group_id"
+	paramAlertID = "alert_id"
+	paramRuleID  = "rule_id"
+)
+
+func (rh *requestHandler) getRule(r *http.Request) (APIRule, error) {
+	groupID, err := strconv.ParseUint(r.FormValue(paramGroupID), 10, 0)
+	if err != nil {
+		return APIRule{}, fmt.Errorf("failed to read %q param: %s", paramGroupID, err)
+	}
+	ruleID, err := strconv.ParseUint(r.FormValue(paramRuleID), 10, 0)
+	if err != nil {
+		return APIRule{}, fmt.Errorf("failed to read %q param: %s", paramRuleID, err)
+	}
+	rule, err := rh.m.RuleAPI(groupID, ruleID)
+	if err != nil {
+		return APIRule{}, errResponse(err, http.StatusNotFound)
+	}
+	return rule, nil
+}
+
+func (rh *requestHandler) getAlert(r *http.Request) (*APIAlert, error) {
+	groupID, err := strconv.ParseUint(r.FormValue(paramGroupID), 10, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %q param: %s", paramGroupID, err)
+	}
+	alertID, err := strconv.ParseUint(r.FormValue(paramAlertID), 10, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %q param: %s", paramAlertID, err)
+	}
+	a, err := rh.m.AlertAPI(groupID, alertID)
+	if err != nil {
+		return nil, errResponse(err, http.StatusNotFound)
+	}
+	return a, nil
+}
+
 type listGroupsResponse struct {
-	Data struct {
+	Status string `json:"status"`
+	Data   struct {
 		Groups []APIGroup `json:"groups"`
 	} `json:"data"`
-	Status string `json:"status"`
 }
 
 func (rh *requestHandler) groups() []APIGroup {
@@ -136,6 +234,7 @@ func (rh *requestHandler) groups() []APIGroup {
 
 	return groups
 }
+
 func (rh *requestHandler) listGroups() ([]byte, error) {
 	lr := listGroupsResponse{Status: "success"}
 	lr.Data.Groups = rh.groups()
@@ -150,10 +249,10 @@ func (rh *requestHandler) listGroups() ([]byte, error) {
 }
 
 type listAlertsResponse struct {
-	Data struct {
+	Status string `json:"status"`
+	Data   struct {
 		Alerts []*APIAlert `json:"alerts"`
 	} `json:"data"`
-	Status string `json:"status"`
 }
 
 func (rh *requestHandler) groupAlerts() []GroupAlerts {
@@ -168,7 +267,7 @@ func (rh *requestHandler) groupAlerts() []GroupAlerts {
 			if !ok {
 				continue
 			}
-			alerts = append(alerts, a.AlertsAPI()...)
+			alerts = append(alerts, a.AlertsToAPI()...)
 		}
 		if len(alerts) > 0 {
 			groupAlerts = append(groupAlerts, GroupAlerts{
@@ -177,6 +276,9 @@ func (rh *requestHandler) groupAlerts() []GroupAlerts {
 			})
 		}
 	}
+	sort.Slice(groupAlerts, func(i, j int) bool {
+		return groupAlerts[i].Group.Name < groupAlerts[j].Group.Name
+	})
 	return groupAlerts
 }
 
@@ -191,7 +293,7 @@ func (rh *requestHandler) listAlerts() ([]byte, error) {
 			if !ok {
 				continue
 			}
-			lr.Data.Alerts = append(lr.Data.Alerts, a.AlertsAPI()...)
+			lr.Data.Alerts = append(lr.Data.Alerts, a.AlertsToAPI()...)
 		}
 	}
 
@@ -211,10 +313,10 @@ func (rh *requestHandler) listAlerts() ([]byte, error) {
 }
 
 func (rh *requestHandler) alertByPath(path string) (*APIAlert, error) {
-	rh.m.groupsMu.RLock()
-	defer rh.m.groupsMu.RUnlock()
-
-	parts := strings.SplitN(strings.TrimLeft(path, "/"), "/", 3)
+	if strings.HasPrefix(path, "/vmalert") {
+		path = strings.TrimLeft(path, "/vmalert")
+	}
+	parts := strings.SplitN(strings.TrimLeft(path, "/"), "/", -1)
 	if len(parts) != 3 {
 		return nil, &httpserver.ErrorWithStatusCode{
 			Err:        fmt.Errorf(`path %q cointains /status suffix but doesn't match pattern "/groupID/alertID/status"`, path),

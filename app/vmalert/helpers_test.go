@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
 	"sync"
@@ -44,37 +45,61 @@ func (fq *fakeQuerier) BuildWithParams(_ datasource.QuerierParams) datasource.Qu
 }
 
 func (fq *fakeQuerier) QueryRange(ctx context.Context, q string, _, _ time.Time) ([]datasource.Metric, error) {
-	return fq.Query(ctx, q)
+	req, _, err := fq.Query(ctx, q, time.Now())
+	return req, err
 }
 
-func (fq *fakeQuerier) Query(_ context.Context, _ string) ([]datasource.Metric, error) {
+func (fq *fakeQuerier) Query(_ context.Context, _ string, _ time.Time) ([]datasource.Metric, *http.Request, error) {
 	fq.Lock()
 	defer fq.Unlock()
 	if fq.err != nil {
-		return nil, fq.err
+		return nil, nil, fq.err
 	}
 	cp := make([]datasource.Metric, len(fq.metrics))
 	copy(cp, fq.metrics)
-	return cp, nil
+	req, _ := http.NewRequest(http.MethodPost, "foo.com", nil)
+	return cp, req, nil
 }
 
 type fakeNotifier struct {
 	sync.Mutex
 	alerts []notifier.Alert
+	// records number of received alerts in total
+	counter int
 }
 
+func (*fakeNotifier) Close()       {}
 func (*fakeNotifier) Addr() string { return "" }
 func (fn *fakeNotifier) Send(_ context.Context, alerts []notifier.Alert) error {
 	fn.Lock()
 	defer fn.Unlock()
+	fn.counter += len(alerts)
 	fn.alerts = alerts
 	return nil
+}
+
+func (fn *fakeNotifier) getCounter() int {
+	fn.Lock()
+	defer fn.Unlock()
+	return fn.counter
 }
 
 func (fn *fakeNotifier) getAlerts() []notifier.Alert {
 	fn.Lock()
 	defer fn.Unlock()
 	return fn.alerts
+}
+
+type faultyNotifier struct {
+	fakeNotifier
+}
+
+func (fn *faultyNotifier) Send(ctx context.Context, _ []notifier.Alert) error {
+	d, ok := ctx.Deadline()
+	if ok {
+		time.Sleep(time.Until(d))
+	}
+	return fmt.Errorf("send failed")
 }
 
 func metricWithValueAndLabels(t *testing.T, value float64, labels ...string) datasource.Metric {
@@ -106,6 +131,21 @@ func metricWithLabels(t *testing.T, labels ...string) datasource.Metric {
 	return m
 }
 
+func toPromLabels(t *testing.T, labels ...string) []prompbmarshal.Label {
+	t.Helper()
+	if len(labels) == 0 || len(labels)%2 != 0 {
+		t.Fatalf("expected to get even number of labels")
+	}
+	var ls []prompbmarshal.Label
+	for i := 0; i < len(labels); i += 2 {
+		ls = append(ls, prompbmarshal.Label{
+			Name:  labels[i],
+			Value: labels[i+1],
+		})
+	}
+	return ls
+}
+
 func compareGroups(t *testing.T, a, b *Group) {
 	t.Helper()
 	if a.Name != b.Name {
@@ -127,7 +167,7 @@ func compareGroups(t *testing.T, a, b *Group) {
 			t.Fatalf("expected to have rule %q; got %q", want.ID(), got.ID())
 		}
 		if err := compareRules(t, want, got); err != nil {
-			t.Fatalf("comparsion error: %s", err)
+			t.Fatalf("comparison error: %s", err)
 		}
 	}
 }

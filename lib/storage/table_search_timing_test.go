@@ -27,11 +27,7 @@ func BenchmarkTableSearch(b *testing.B) {
 				b.Run(fmt.Sprintf("tsidsCount_%d", tsidsCount), func(b *testing.B) {
 					for _, tsidsSearch := range []int{1, 1e1, 1e2, 1e3, 1e4} {
 						b.Run(fmt.Sprintf("tsidsSearch_%d", tsidsSearch), func(b *testing.B) {
-							for _, fetchData := range []bool{true, false} {
-								b.Run(fmt.Sprintf("fetchData_%v", fetchData), func(b *testing.B) {
-									benchmarkTableSearch(b, rowsCount, tsidsCount, tsidsSearch, fetchData)
-								})
-							}
+							benchmarkTableSearch(b, rowsCount, tsidsCount, tsidsSearch)
 						})
 					}
 				})
@@ -48,7 +44,8 @@ func openBenchTable(b *testing.B, startTimestamp int64, rowsPerInsert, rowsCount
 		createBenchTable(b, path, startTimestamp, rowsPerInsert, rowsCount, tsidsCount)
 		createdBenchTables[path] = true
 	}
-	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs)
+	var isReadOnly uint32
+	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs, &isReadOnly)
 	if err != nil {
 		b.Fatalf("cnanot open table %q: %s", path, err)
 	}
@@ -71,7 +68,8 @@ var createdBenchTables = make(map[string]bool)
 func createBenchTable(b *testing.B, path string, startTimestamp int64, rowsPerInsert, rowsCount, tsidsCount int) {
 	b.Helper()
 
-	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs)
+	var isReadOnly uint32
+	tb, err := openTable(path, nilGetDeletedMetricIDs, maxRetentionMsecs, &isReadOnly)
 	if err != nil {
 		b.Fatalf("cannot open table %q: %s", path, err)
 	}
@@ -108,7 +106,7 @@ func createBenchTable(b *testing.B, path string, startTimestamp int64, rowsPerIn
 	tb.MustClose()
 }
 
-func benchmarkTableSearch(b *testing.B, rowsCount, tsidsCount, tsidsSearch int, fetchData bool) {
+func benchmarkTableSearch(b *testing.B, rowsCount, tsidsCount, tsidsSearch int) {
 	startTimestamp := timestampFromTime(time.Now()) - 365*24*3600*1000
 	rowsPerInsert := getMaxRawRowsPerShard()
 
@@ -135,7 +133,7 @@ func benchmarkTableSearch(b *testing.B, rowsCount, tsidsCount, tsidsSearch int, 
 			}
 			ts.Init(tb, tsids, tr)
 			for ts.NextBlock() {
-				ts.BlockRef.MustReadBlock(&tmpBlock, fetchData)
+				ts.BlockRef.MustReadBlock(&tmpBlock)
 			}
 			ts.MustClose()
 		}

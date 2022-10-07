@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
@@ -56,7 +57,7 @@ func addInstanceLabels(servers []server, port int) []map[string]string {
 			"__meta_openstack_instance_flavor": server.Flavor.ID,
 		}
 		for k, v := range server.Metadata {
-			m["__meta_openstack_tag_"+discoveryutils.SanitizeLabelName(k)] = v
+			m[discoveryutils.SanitizeLabelName("__meta_openstack_tag_"+k)] = v
 		}
 		// Traverse server.Addresses in alphabetical order of pool name
 		// in order to return targets in deterministic order.
@@ -110,12 +111,9 @@ func (cfg *apiConfig) getServers() ([]server, error) {
 	}
 	computeURL := *creds.computeURL
 	computeURL.Path = path.Join(computeURL.Path, "servers", "detail")
-	// by default, query fetches data from all tenants
-	if !cfg.allTenants {
-		q := computeURL.Query()
-		q.Set("all_tenants", "false")
-		computeURL.RawQuery = q.Encode()
-	}
+	q := computeURL.Query()
+	q.Set("all_tenants", strconv.FormatBool(cfg.allTenants))
+	computeURL.RawQuery = q.Encode()
 	nextLink := computeURL.String()
 	var servers []server
 	for {

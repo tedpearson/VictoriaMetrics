@@ -3,7 +3,6 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,7 +10,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
-	"github.com/VictoriaMetrics/metricsql"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // partHeader represents part header.
@@ -131,7 +130,7 @@ func (ph *partHeader) Reset() {
 
 func (ph *partHeader) readMinDedupInterval(partPath string) error {
 	filePath := partPath + "/min_dedup_interval"
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// The minimum dedup interval may not exist for old parts.
@@ -140,11 +139,11 @@ func (ph *partHeader) readMinDedupInterval(partPath string) error {
 		}
 		return fmt.Errorf("cannot read %q: %w", filePath, err)
 	}
-	dedupInterval, err := metricsql.DurationValue(string(data), 0)
+	dedupInterval, err := promutils.ParseDuration(string(data))
 	if err != nil {
 		return fmt.Errorf("cannot parse minimum dedup interval %q at %q: %w", data, filePath, err)
 	}
-	ph.MinDedupInterval = dedupInterval
+	ph.MinDedupInterval = dedupInterval.Milliseconds()
 	return nil
 }
 

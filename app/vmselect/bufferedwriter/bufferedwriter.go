@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -53,13 +54,16 @@ func (bw *Writer) reset() {
 
 // Write writes p to bw.
 func (bw *Writer) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	bw.lock.Lock()
 	defer bw.lock.Unlock()
 	if bw.err != nil {
 		return 0, bw.err
 	}
 	n, err := bw.bw.Write(p)
-	if err != nil {
+	if err != nil && !isTrivialNetworkError(err) {
 		bw.err = fmt.Errorf("cannot send %d bytes to client: %w", len(p), err)
 	}
 	return n, bw.err
@@ -72,7 +76,7 @@ func (bw *Writer) Flush() error {
 	if bw.err != nil {
 		return bw.err
 	}
-	if err := bw.bw.Flush(); err != nil {
+	if err := bw.bw.Flush(); err != nil && !isTrivialNetworkError(err) {
 		bw.err = fmt.Errorf("cannot flush data to client: %w", err)
 	}
 	return bw.err
@@ -83,4 +87,13 @@ func (bw *Writer) Error() error {
 	bw.lock.Lock()
 	defer bw.lock.Unlock()
 	return bw.err
+}
+
+func isTrivialNetworkError(err error) bool {
+	// Suppress trivial network errors, which could occur at remote side.
+	s := err.Error()
+	if strings.Contains(s, "broken pipe") || strings.Contains(s, "reset by peer") {
+		return true
+	}
+	return false
 }

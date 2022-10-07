@@ -5,20 +5,19 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/metrics"
 )
 
 // RecordingRule is a Rule that supposed
 // to evaluate configured Expression and
 // return TimeSeries as result.
 type RecordingRule struct {
-	Type    datasource.Type
+	Type    config.Type
 	RuleID  uint64
 	Name    string
 	Expr    string
@@ -27,24 +26,16 @@ type RecordingRule struct {
 
 	q datasource.Querier
 
-	// guard status fields
-	mu sync.RWMutex
-	// stores last moment of time Exec was called
-	lastExecTime time.Time
-	// stores last error that happened in Exec func
-	// resets on every successful Exec
-	// may be used as Health state
-	lastExecError error
-	// stores the number of samples returned during
-	// the last evaluation
-	lastExecSamples int
+	// state stores recent state changes
+	// during evaluations
+	state *ruleState
 
 	metrics *recordingRuleMetrics
 }
 
 type recordingRuleMetrics struct {
-	errors  *gauge
-	samples *gauge
+	errors  *utils.Gauge
+	samples *utils.Gauge
 }
 
 // String implements Stringer interface
@@ -67,36 +58,36 @@ func newRecordingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rul
 		Labels:  cfg.Labels,
 		GroupID: group.ID(),
 		metrics: &recordingRuleMetrics{},
+		state:   newRuleState(),
 		q: qb.BuildWithParams(datasource.QuerierParams{
-			DataSourceType:     &group.Type,
+			DataSourceType:     group.Type.String(),
 			EvaluationInterval: group.Interval,
 			QueryParams:        group.Params,
+			Headers:            group.Headers,
 		}),
 	}
 
 	labels := fmt.Sprintf(`recording=%q, group=%q, id="%d"`, rr.Name, group.Name, rr.ID())
-	rr.metrics.errors = getOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_error{%s}`, labels),
+	rr.metrics.errors = utils.GetOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_error{%s}`, labels),
 		func() float64 {
-			rr.mu.RLock()
-			defer rr.mu.RUnlock()
-			if rr.lastExecError == nil {
+			e := rr.state.getLast()
+			if e.err == nil {
 				return 0
 			}
 			return 1
 		})
-	rr.metrics.samples = getOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_last_evaluation_samples{%s}`, labels),
+	rr.metrics.samples = utils.GetOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_last_evaluation_samples{%s}`, labels),
 		func() float64 {
-			rr.mu.RLock()
-			defer rr.mu.RUnlock()
-			return float64(rr.lastExecSamples)
+			e := rr.state.getLast()
+			return float64(e.samples)
 		})
 	return rr
 }
 
 // Close unregisters rule metrics
 func (rr *RecordingRule) Close() {
-	metrics.UnregisterMetric(rr.metrics.errors.name)
-	metrics.UnregisterMetric(rr.metrics.samples.name)
+	rr.metrics.errors.Unregister()
+	rr.metrics.samples.Unregister()
 }
 
 // ExecRange executes recording rule on the given time range similarly to Exec.
@@ -122,16 +113,30 @@ func (rr *RecordingRule) ExecRange(ctx context.Context, start, end time.Time) ([
 }
 
 // Exec executes RecordingRule expression via the given Querier.
-func (rr *RecordingRule) Exec(ctx context.Context) ([]prompbmarshal.TimeSeries, error) {
-	qMetrics, err := rr.q.Query(ctx, rr.Expr)
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
+func (rr *RecordingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
+	start := time.Now()
+	qMetrics, req, err := rr.q.Query(ctx, rr.Expr, ts)
+	curState := ruleStateEntry{
+		time:     start,
+		at:       ts,
+		duration: time.Since(start),
+		samples:  len(qMetrics),
+		req:      req,
+	}
 
-	rr.lastExecTime = time.Now()
-	rr.lastExecError = err
-	rr.lastExecSamples = len(qMetrics)
+	defer func() {
+		rr.state.add(curState)
+	}()
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query %q: %w", rr.Expr, err)
+		curState.err = fmt.Errorf("failed to execute query %q: %w", rr.Expr, err)
+		return nil, curState.err
+	}
+
+	numSeries := len(qMetrics)
+	if limit > 0 && numSeries > limit {
+		curState.err = fmt.Errorf("exec exceeded limit of %d with %d series", limit, numSeries)
+		return nil, curState.err
 	}
 
 	duplicates := make(map[string]struct{}, len(qMetrics))
@@ -140,8 +145,8 @@ func (rr *RecordingRule) Exec(ctx context.Context) ([]prompbmarshal.TimeSeries, 
 		ts := rr.toTimeSeries(r)
 		key := stringifyLabels(ts)
 		if _, ok := duplicates[key]; ok {
-			rr.lastExecError = errDuplicate
-			return nil, fmt.Errorf("original metric %v; resulting labels %q: %w", r, key, errDuplicate)
+			curState.err = fmt.Errorf("original metric %v; resulting labels %q: %w", r, key, errDuplicate)
+			return nil, curState.err
 		}
 		duplicates[key] = struct{}{}
 		tss = append(tss, ts)
@@ -193,23 +198,29 @@ func (rr *RecordingRule) UpdateWith(r Rule) error {
 	return nil
 }
 
-// RuleAPI returns Rule representation in form
-// of APIRecordingRule
-func (rr *RecordingRule) RuleAPI() APIRecordingRule {
-	var lastErr string
-	if rr.lastExecError != nil {
-		lastErr = rr.lastExecError.Error()
-	}
-	return APIRecordingRule{
+// ToAPI returns Rule's representation in form
+// of APIRule
+func (rr *RecordingRule) ToAPI() APIRule {
+	lastState := rr.state.getLast()
+	r := APIRule{
+		Type:           "recording",
+		DatasourceType: rr.Type.String(),
+		Name:           rr.Name,
+		Query:          rr.Expr,
+		Labels:         rr.Labels,
+		LastEvaluation: lastState.time,
+		EvaluationTime: lastState.duration.Seconds(),
+		Health:         "ok",
+		LastSamples:    lastState.samples,
+		Updates:        rr.state.getAll(),
+
 		// encode as strings to avoid rounding
-		ID:          fmt.Sprintf("%d", rr.ID()),
-		GroupID:     fmt.Sprintf("%d", rr.GroupID),
-		Name:        rr.Name,
-		Type:        rr.Type.String(),
-		Expression:  rr.Expr,
-		LastError:   lastErr,
-		LastSamples: rr.lastExecSamples,
-		LastExec:    rr.lastExecTime,
-		Labels:      rr.Labels,
+		ID:      fmt.Sprintf("%d", rr.ID()),
+		GroupID: fmt.Sprintf("%d", rr.GroupID),
 	}
+	if lastState.err != nil {
+		r.LastError = lastState.err.Error()
+		r.Health = "err"
+	}
+	return r
 }

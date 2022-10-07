@@ -1,5 +1,4 @@
-import uPlot from "uplot";
-import numeral from "numeral";
+import uPlot, {Axis} from "uplot";
 import {getColorFromString} from "../color";
 
 export const defaultOptions = {
@@ -9,7 +8,7 @@ export const defaultOptions = {
   },
   cursor: {
     drag: {
-      x: false,
+      x: true,
       y: false
     },
     focus: {
@@ -20,19 +19,54 @@ export const defaultOptions = {
       width: 1.4
     },
     bind: {
-      mouseup: (): null => null,
-      mousedown: (): null => null,
       click: (): null => null,
       dblclick: (): null => null,
-      mouseenter: (): null => null
-    }
+    },
   },
 };
 
-export const formatTicks = (u: uPlot, ticks: number[]): (string | number)[] => {
-  return ticks.map(n => n > 1000 ? numeral(n).format("0.0a") : n);
+export const formatTicks = (u: uPlot, ticks: number[], unit = ""): string[] => {
+  return ticks.map(v => `${formatPrettyNumber(v)} ${unit}`);
 };
 
-export const getColorLine = (scale: number, label: string): string => getColorFromString(`${scale}${label}`);
+export const formatPrettyNumber = (n: number | null | undefined): string => {
+  if (n === undefined || n === null) {
+    return "";
+  }
+  return n.toLocaleString("en-US", { maximumSignificantDigits: 20 });
+};
+
+interface AxisExtend extends Axis {
+  _size?: number;
+}
+
+const getTextWidth = (val: string, font: string): number => {
+  const span = document.createElement("span");
+  span.innerText = val;
+  span.style.cssText = `position: absolute; z-index: -1; pointer-events: none; opacity: 0; font: ${font}`;
+  document.body.appendChild(span);
+  const width = span.offsetWidth;
+  span.remove();
+  return width;
+};
+
+export const sizeAxis = (u: uPlot, values: string[], axisIdx: number, cycleNum: number): number => {
+  const axis = u.axes[axisIdx] as AxisExtend;
+
+  if (cycleNum > 1) return axis._size || 60;
+
+  let axisSize = 6 + (axis?.ticks?.size || 0) + (axis.gap || 0);
+
+  const longestVal = (values ?? []).reduce((acc, val) => val.length > acc.length ? val : acc, "");
+  if (longestVal != "") axisSize += getTextWidth(longestVal, u.ctx.font);
+
+  return Math.ceil(axisSize);
+};
+
+export const getColorLine = (label: string): string => getColorFromString(label);
 
 export const getDashLine = (group: number): number[] => group <= 1 ? [] : [group*4, group*1.2];
+
+export const getLegendLabel = (label: string): string => {
+  return label.replace(/^\[\d+]/, "").replace(/{.+}/gmi, "");
+};

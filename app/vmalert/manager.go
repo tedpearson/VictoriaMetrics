@@ -17,7 +17,7 @@ import (
 // manager controls group states
 type manager struct {
 	querierBuilder datasource.QuerierBuilder
-	notifiers      []notifier.Notifier
+	notifiers      func() []notifier.Notifier
 
 	rw *remotewrite.Client
 	// remote read builder.
@@ -30,6 +30,23 @@ type manager struct {
 	groups   map[uint64]*Group
 }
 
+// RuleAPI generates APIRule object from alert by its ID(hash)
+func (m *manager) RuleAPI(gID, rID uint64) (APIRule, error) {
+	m.groupsMu.RLock()
+	defer m.groupsMu.RUnlock()
+
+	g, ok := m.groups[gID]
+	if !ok {
+		return APIRule{}, fmt.Errorf("can't find group with id %d", gID)
+	}
+	for _, rule := range g.Rules {
+		if rule.ID() == rID {
+			return rule.ToAPI(), nil
+		}
+	}
+	return APIRule{}, fmt.Errorf("can't find rule with id %d in group %q", rID, g.Name)
+}
+
 // AlertAPI generates APIAlert object from alert by its ID(hash)
 func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
 	m.groupsMu.RLock()
@@ -37,7 +54,7 @@ func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
 
 	g, ok := m.groups[gID]
 	if !ok {
-		return nil, fmt.Errorf("can't find group with id %q", gID)
+		return nil, fmt.Errorf("can't find group with id %d", gID)
 	}
 	for _, rule := range g.Rules {
 		ar, ok := rule.(*AlertingRule)
@@ -48,7 +65,7 @@ func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
 			return apiAlert, nil
 		}
 	}
-	return nil, fmt.Errorf("can't find alert with id %q in group %q", aID, g.Name)
+	return nil, fmt.Errorf("can't find alert with id %d in group %q", aID, g.Name)
 }
 
 func (m *manager) start(ctx context.Context, groupsCfg []config.Group) error {
@@ -70,9 +87,9 @@ func (m *manager) startGroup(ctx context.Context, group *Group, restore bool) er
 		err := group.Restore(ctx, m.rr, *remoteReadLookBack, m.labels)
 		if err != nil {
 			if !*remoteReadIgnoreRestoreErrors {
-				return fmt.Errorf("failed to restore state for group %q: %w", group.Name, err)
+				return fmt.Errorf("failed to restore ruleState for group %q: %w", group.Name, err)
 			}
-			logger.Errorf("error while restoring state for group %q: %s", group.Name, err)
+			logger.Errorf("error while restoring ruleState for group %q: %s", group.Name, err)
 		}
 	}
 
@@ -109,7 +126,7 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 		return fmt.Errorf("config contains recording rules but `-remoteWrite.url` isn't set")
 	}
 	if arPresent && m.notifiers == nil {
-		return fmt.Errorf("config contains alerting rules but `-notifier.url` isn't set")
+		return fmt.Errorf("config contains alerting rules but neither `-notifier.url` nor `-notifier.config` aren't set")
 	}
 
 	type updateItem struct {
@@ -163,21 +180,18 @@ func (g *Group) toAPI() APIGroup {
 		// encode as string to avoid rounding
 		ID: fmt.Sprintf("%d", g.ID()),
 
-		Name:        g.Name,
-		Type:        g.Type.String(),
-		File:        g.File,
-		Interval:    g.Interval.String(),
-		Concurrency: g.Concurrency,
-		Params:      urlValuesToStrings(g.Params),
-		Labels:      g.Labels,
+		Name:           g.Name,
+		Type:           g.Type.String(),
+		File:           g.File,
+		Interval:       g.Interval.Seconds(),
+		LastEvaluation: g.LastEvaluation,
+		Concurrency:    g.Concurrency,
+		Params:         urlValuesToStrings(g.Params),
+		Headers:        headersToStrings(g.Headers),
+		Labels:         g.Labels,
 	}
 	for _, r := range g.Rules {
-		switch v := r.(type) {
-		case *AlertingRule:
-			ag.AlertingRules = append(ag.AlertingRules, v.RuleAPI())
-		case *RecordingRule:
-			ag.RecordingRules = append(ag.RecordingRules, v.RuleAPI())
-		}
+		ag.Rules = append(ag.Rules, r.ToAPI())
 	}
 	return ag
 }
@@ -200,5 +214,25 @@ func urlValuesToStrings(values url.Values) []string {
 			res = append(res, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
+	return res
+}
+
+func headersToStrings(headers map[string]string) []string {
+	if len(headers) < 1 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var res []string
+	for _, k := range keys {
+		v := headers[k]
+		res = append(res, fmt.Sprintf("%s: %s", k, v))
+	}
+
 	return res
 }
