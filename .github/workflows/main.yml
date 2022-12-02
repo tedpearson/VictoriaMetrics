@@ -42,7 +42,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
-          artifacts: ${{env.executable}}
+          artifacts: bin/${{env.executable}}
           tag: ${{inputs.release_version}}
           commit: master
           token: ${{ secrets.GITHUB_TOKEN }}
