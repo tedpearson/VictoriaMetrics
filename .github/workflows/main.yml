@@ -2,14 +2,23 @@ name: main
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: tag to release
+      release_version:
+        description: version to release
         required: true
         type: string
 jobs:
   build:
     name: Build
+    strategy:
+      matrix:
+        GOOS: [ linux, darwin ]
+        GOARCH: [ arm, arm64, amd64 ]
+        exclude:
+          - GOOS: darwin
+            GOARCH: arm
     runs-on: ubuntu-latest
+    env:
+      executable: victoria-metrics-${{ matrix.GOOS }}-${{ matrix.GOARCH }}
     steps:
       - name: Setup Go
         uses: actions/setup-go@main
@@ -26,26 +35,14 @@ jobs:
       - name: Build
         run: |
           export PATH=$PATH:$(go env GOPATH)/bin # temporary fix. See https://github.com/actions/setup-go/issues/14
-          make victoria-metrics-linux-arm
-          
-      - name: Create release
+          make ${{env.executable}}
+
+      - name: Create or update release
         id: create_release
-        uses: actions/create-release@v1
-        env:
-          # This token is provided by Actions, you do not need to create your own token
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{inputs.tag}}
-          release_name: ${{inputs.tag}}
-
-      - name: Upload linux-arm
-        uses: actions/upload-release-asset@v1
-        env:
-          # This token is provided by Actions, you do not need to create your own token
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: bin/victoria-metrics-linux-arm
-          asset_name: victoria-metrics-linux-arm
-          asset_content_type: application/octet-stream
-
+          allowUpdates: true
+          artifacts: ${{env.executable}}
+          tag: ${{inputs.release_version}}
+          commit: master
+          token: ${{ secrets.GITHUB_TOKEN }}
