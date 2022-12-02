@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
@@ -158,10 +159,20 @@ func (riss *rawItemsShards) Len() int {
 	return n
 }
 
-type rawItemsShard struct {
-	mu            sync.Mutex
-	ibs           []*inmemoryBlock
+type rawItemsShardNopad struct {
+	// Put lastFlushTime to the top in order to avoid unaligned memory access on 32-bit architectures
 	lastFlushTime uint64
+
+	mu  sync.Mutex
+	ibs []*inmemoryBlock
+}
+
+type rawItemsShard struct {
+	rawItemsShardNopad
+
+	// The padding prevents false sharing on widespread platforms with
+	// 128 mod (cache line size) = 0 .
+	_ [128 - unsafe.Sizeof(rawItemsShardNopad{})%128]byte
 }
 
 func (ris *rawItemsShard) Len() int {
@@ -204,7 +215,7 @@ func (ris *rawItemsShard) addItems(tb *Table, items [][]byte) error {
 			ibs[i] = nil
 		}
 		ris.ibs = ibs[:0]
-		ris.lastFlushTime = fasttime.UnixTimestamp()
+		atomic.StoreUint64(&ris.lastFlushTime, fasttime.UnixTimestamp())
 	}
 	ris.mu.Unlock()
 
@@ -569,7 +580,7 @@ func (tb *Table) convertToV1280() {
 		logger.Infof("finished round 2 of background conversion of %q to v1.28.0 format in %.3f seconds", tb.path, time.Since(startTime).Seconds())
 	}
 
-	if err := fs.WriteFileAtomically(flagFilePath, []byte("ok")); err != nil {
+	if err := fs.WriteFileAtomically(flagFilePath, []byte("ok"), false); err != nil {
 		logger.Panicf("FATAL: cannot create %q: %s", flagFilePath, err)
 	}
 }
@@ -632,19 +643,21 @@ func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, tb *Table, i
 	if flushSeconds <= 0 {
 		flushSeconds = 1
 	}
-
-	ris.mu.Lock()
-	if isFinal || currentTime-ris.lastFlushTime > uint64(flushSeconds) {
-		ibs := ris.ibs
-		dst = append(dst, ibs...)
-		for i := range ibs {
-			ibs[i] = nil
-		}
-		ris.ibs = ibs[:0]
-		ris.lastFlushTime = currentTime
+	lastFlushTime := atomic.LoadUint64(&ris.lastFlushTime)
+	if !isFinal && currentTime <= lastFlushTime+uint64(flushSeconds) {
+		// Fast path - nothing to flush
+		return dst
 	}
+	// Slow path - move ris.ibs to dst
+	ris.mu.Lock()
+	ibs := ris.ibs
+	dst = append(dst, ibs...)
+	for i := range ibs {
+		ibs[i] = nil
+	}
+	ris.ibs = ibs[:0]
+	atomic.StoreUint64(&ris.lastFlushTime, currentTime)
 	ris.mu.Unlock()
-
 	return dst
 }
 
@@ -962,7 +975,7 @@ func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isOuterP
 	dstPartPath := ph.Path(tb.path, mergeIdx)
 	fmt.Fprintf(&bb, "%s -> %s\n", tmpPartPath, dstPartPath)
 	txnPath := fmt.Sprintf("%s/txn/%016X", tb.path, mergeIdx)
-	if err := fs.WriteFileAtomically(txnPath, bb.B); err != nil {
+	if err := fs.WriteFileAtomically(txnPath, bb.B, false); err != nil {
 		return fmt.Errorf("cannot create transaction file %q: %w", txnPath, err)
 	}
 

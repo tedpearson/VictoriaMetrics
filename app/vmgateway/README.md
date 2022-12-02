@@ -1,6 +1,6 @@
 # vmgateway
 
-***vmgateway is a part of [enterprise package](https://victoriametrics.com/products/enterprise/). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)***
+***vmgateway is a part of [enterprise package](https://docs.victoriametrics.com/enterprise.html). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)***
 
 <img alt="vmgateway" src="vmgateway-overview.jpeg">
 
@@ -13,7 +13,7 @@
   * Provides access by tenantID in the Cluster version
   * Allows for separate write/read/admin access to data
 
-`vmgateway` is included in our [enterprise packages](https://victoriametrics.com/products/enterprise/).
+`vmgateway` is included in our [enterprise packages](https://docs.victoriametrics.com/enterprise.html).
 
 ## Access Control
 
@@ -176,8 +176,8 @@ curl 'http://localhost:8431/api/v1/labels' -H 'Authorization: Bearer eyJhbGciOiJ
 The shortlist of configuration flags include the following:
 
 ```console
-  -auth.httpHeader
-    HTTP header name to look for JWT authorization token
+  -auth.httpHeader string
+     HTTP header name to look for JWT authorization token (default "Authorization")
   -clusterMode
      enable this for the cluster version
   -datasource.appendTypePrefix
@@ -201,17 +201,17 @@ The shortlist of configuration flags include the following:
   -datasource.maxIdleConnections int
      Defines the number of idle (keep-alive connections) to each configured datasource. Consider setting this value equal to the value: groups_total * group.concurrency. Too low a value may result in a high number of sockets in TIME_WAIT state. (default 100)
   -datasource.oauth2.clientID string
-     Optional OAuth2 clientID to use for -datasource.url.
+     Optional OAuth2 clientID to use for -datasource.url. 
   -datasource.oauth2.clientSecret string
      Optional OAuth2 clientSecret to use for -datasource.url.
   -datasource.oauth2.clientSecretFile string
-     Optional OAuth2 clientSecretFile to use for -datasource.url.
+     Optional OAuth2 clientSecretFile to use for -datasource.url. 
   -datasource.oauth2.scopes string
      Optional OAuth2 scopes to use for -datasource.url. Scopes must be delimited by ';'
   -datasource.oauth2.tokenUrl string
      Optional OAuth2 tokenURL to use for -datasource.url.
   -datasource.queryStep duration
-     queryStep defines how far a value can fallback to when evaluating queries. For example, if datasource.queryStep=15s then param "step" with value "15s" will be added to every query.If queryStep isn't specified, rule's evaluationInterval will be used instead.
+     How far a value can fallback to when evaluating queries. For example, if -datasource.queryStep=15s then param "step" with value "15s" will be added to every query. If set to 0, rule's evaluation interval will be used instead. (default 5m0s)
   -datasource.queryTimeAlignment
      Whether to align "time" parameter with evaluation interval.Alignment supposed to produce deterministic results despite of number of vmalert replicas or time they were started. See more details here https://github.com/VictoriaMetrics/VictoriaMetrics/pull/1257 (default true)
   -datasource.roundDigits int
@@ -229,7 +229,7 @@ The shortlist of configuration flags include the following:
   -datasource.tlsServerName string
      Optional TLS server name to use for connections to -datasource.url. By default, the server name from -datasource.url is used
   -datasource.url string
-     Datasource compatible with Prometheus HTTP API. It can be single node VictoriaMetrics or vmselect URL. Required parameter. E.g. http://127.0.0.1:8428 . See also '-datasource.disablePathAppend', '-datasource.showURL'.
+     Datasource compatible with Prometheus HTTP API. It can be single node VictoriaMetrics or vmselect URL. Required parameter. E.g. http://127.0.0.1:8428 . See also -remoteRead.disablePathAppend and -datasource.showURL
   -enable.auth
      enables auth with jwt token
   -enable.rateLimit
@@ -241,7 +241,7 @@ The shortlist of configuration flags include the following:
   -envflag.prefix string
      Prefix for environment variables if -envflag.enable is set
   -eula
-     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in enterprise version of VictoriaMetrics
+     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
   -flagsAuthKey string
      Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
   -fs.disableMmap

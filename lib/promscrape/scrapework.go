@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"math/bits"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
@@ -36,7 +36,6 @@ var (
 		"See also -promscrape.suppressScrapeErrorsDelay")
 	suppressScrapeErrorsDelay = flag.Duration("promscrape.suppressScrapeErrorsDelay", 0, "The delay for suppressing repeated scrape errors logging per each scrape targets. "+
 		"This may be used for reducing the number of log lines related to scrape errors. See also -promscrape.suppressScrapeErrors")
-	noStaleMarkers                = flag.Bool("promscrape.noStaleMarkers", false, "Whether to disable sending Prometheus stale markers for metrics when scrape target disappears. This option may reduce memory usage if stale markers aren't needed for your setup. This option also disables populating the scrape_series_added metric. See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series")
 	seriesLimitPerTarget          = flag.Int("promscrape.seriesLimitPerTarget", 0, "Optional limit on the number of unique time series a single scrape target can expose. See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter for more info")
 	minResponseSizeForStreamParse = flagutil.NewBytes("promscrape.minResponseSizeForStreamParse", 1e6, "The minimum target response size for automatic switching to stream parsing mode, which can reduce memory usage. See https://docs.victoriametrics.com/vmagent.html#stream-parsing-mode")
 )
@@ -68,30 +67,30 @@ type ScrapeWork struct {
 	// OriginalLabels contains original labels before relabeling.
 	//
 	// These labels are needed for relabeling troubleshooting at /targets page.
-	OriginalLabels []prompbmarshal.Label
+	//
+	// OriginalLabels are sorted by name.
+	OriginalLabels *promutils.Labels
 
 	// Labels to add to the scraped metrics.
 	//
-	// The list contains at least the following labels according to https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
+	// The list contains at least the following labels according to https://www.robustperception.io/life-of-a-label/
 	//
 	//     * job
-	//     * __address__
-	//     * __scheme__
-	//     * __metrics_path__
-	//     * __scrape_interval__
-	//     * __scrape_timeout__
-	//     * __param_<name>
-	//     * __meta_*
+	//     * instance
 	//     * user-defined labels set via `relabel_configs` section in `scrape_config`
 	//
 	// See also https://prometheus.io/docs/concepts/jobs_instances/
-	Labels []prompbmarshal.Label
+	//
+	// Labels are sorted by name.
+	Labels *promutils.Labels
 
 	// ExternalLabels contains labels from global->external_labels section of -promscrape.config
 	//
 	// These labels are added to scraped metrics after the relabeling.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3137
-	ExternalLabels []prompbmarshal.Label
+	//
+	// ExternalLabels are sorted by name.
+	ExternalLabels *promutils.Labels
 
 	// ProxyURL HTTP proxy url
 	ProxyURL *proxy.URL
@@ -126,6 +125,10 @@ type ScrapeWork struct {
 	// Optional limit on the number of unique series the scrape target can expose.
 	SeriesLimit int
 
+	// Whether to process stale markers for the given target.
+	// See https://docs.victoriametrics.com/vmagent.html#prometheus-staleness-markers
+	NoStaleMarkers bool
+
 	//The Tenant Info
 	AuthToken *auth.Token
 
@@ -148,45 +151,23 @@ func (sw *ScrapeWork) key() string {
 	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
 		"ExternalLabels=%s, "+
 		"ProxyURL=%s, ProxyAuthConfig=%s, AuthConfig=%s, MetricRelabelConfigs=%s, SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v, StreamParse=%v, "+
-		"ScrapeAlignInterval=%s, ScrapeOffset=%s, SeriesLimit=%d",
+		"ScrapeAlignInterval=%s, ScrapeOffset=%s, SeriesLimit=%d, NoStaleMarkers=%v",
 		sw.jobNameOriginal, sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.LabelsString(),
-		promLabelsString(sw.ExternalLabels),
+		sw.ExternalLabels.String(),
 		sw.ProxyURL.String(), sw.ProxyAuthConfig.String(),
 		sw.AuthConfig.String(), sw.MetricRelabelConfigs.String(), sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive, sw.StreamParse,
-		sw.ScrapeAlignInterval, sw.ScrapeOffset, sw.SeriesLimit)
+		sw.ScrapeAlignInterval, sw.ScrapeOffset, sw.SeriesLimit, sw.NoStaleMarkers)
 	return key
 }
 
 // Job returns job for the ScrapeWork
 func (sw *ScrapeWork) Job() string {
-	return promrelabel.GetLabelValueByName(sw.Labels, "job")
+	return sw.Labels.Get("job")
 }
 
 // LabelsString returns labels in Prometheus format for the given sw.
 func (sw *ScrapeWork) LabelsString() string {
-	labelsFinalized := promrelabel.FinalizeLabels(nil, sw.Labels)
-	return promLabelsString(labelsFinalized)
-}
-
-func promLabelsString(labels []prompbmarshal.Label) string {
-	// Calculate the required memory for storing serialized labels.
-	n := 2 // for `{...}`
-	for _, label := range labels {
-		n += len(label.Name) + len(label.Value)
-		n += 4 // for `="...",`
-	}
-	b := make([]byte, 0, n)
-	b = append(b, '{')
-	for i, label := range labels {
-		b = append(b, label.Name...)
-		b = append(b, '=')
-		b = strconv.AppendQuote(b, label.Value)
-		if i+1 < len(labels) {
-			b = append(b, ',')
-		}
-	}
-	b = append(b, '}')
-	return bytesutil.ToUnsafeString(b)
+	return sw.Labels.String()
 }
 
 type scrapeWork struct {
@@ -443,7 +424,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	wc := writeRequestCtxPool.Get(sw.prevLabelsLen)
 	lastScrape := sw.loadLastScrape()
 	bodyString := bytesutil.ToUnsafeString(body.B)
-	areIdenticalSeries := *noStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
+	areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
 	if err != nil {
 		up = 0
 		scrapesFailed.Inc()
@@ -595,7 +576,7 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 	}
 	lastScrape := sw.loadLastScrape()
 	bodyString := bytesutil.ToUnsafeString(sbr.body)
-	areIdenticalSeries := *noStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
+	areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
 
 	scrapedSamples.Update(float64(samplesScraped))
 	endTimestamp := time.Now().UnixNano() / 1e6
@@ -702,7 +683,15 @@ func (wc *writeRequestCtx) reset() {
 
 func (wc *writeRequestCtx) resetNoRows() {
 	prompbmarshal.ResetWriteRequest(&wc.writeRequest)
+
+	labels := wc.labels
+	for i := range labels {
+		label := &labels[i]
+		label.Name = ""
+		label.Value = ""
+	}
 	wc.labels = wc.labels[:0]
+
 	wc.samples = wc.samples[:0]
 }
 
@@ -738,12 +727,13 @@ func (sw *scrapeWork) applySeriesLimit(wc *writeRequestCtx) int {
 		}
 		dstSeries = append(dstSeries, ts)
 	}
+	prompbmarshal.ResetTimeSeries(wc.writeRequest.Timeseries[len(dstSeries):])
 	wc.writeRequest.Timeseries = dstSeries
 	return samplesDropped
 }
 
 func (sw *scrapeWork) sendStaleSeries(lastScrape, currScrape string, timestamp int64, addAutoSeries bool) {
-	if *noStaleMarkers {
+	if sw.Config.NoStaleMarkers {
 		return
 	}
 	bodyString := lastScrape
@@ -800,6 +790,18 @@ type autoMetrics struct {
 	seriesLimitSamplesDropped int
 }
 
+func isAutoMetric(s string) bool {
+	switch s {
+	case "up", "scrape_duration_seconds", "scrape_samples_scraped",
+		"scrape_samples_post_metric_relabeling", "scrape_series_added",
+		"scrape_timeout_seconds", "scrape_samples_limit",
+		"scrape_series_limit_samples_dropped", "scrape_series_limit",
+		"scrape_series_current":
+		return true
+	}
+	return false
+}
+
 func (sw *scrapeWork) addAutoMetrics(am *autoMetrics, wc *writeRequestCtx, timestamp int64) {
 	sw.addAutoTimeseries(wc, "up", float64(am.up), timestamp)
 	sw.addAutoTimeseries(wc, "scrape_duration_seconds", am.scrapeDurationSeconds, timestamp)
@@ -831,21 +833,29 @@ func (sw *scrapeWork) addAutoTimeseries(wc *writeRequestCtx, name string, value 
 }
 
 func (sw *scrapeWork) addRowToTimeseries(wc *writeRequestCtx, r *parser.Row, timestamp int64, needRelabel bool) {
-	labelsLen := len(wc.labels)
-	wc.labels = appendLabels(wc.labels, r.Metric, r.Tags, sw.Config.Labels, sw.Config.HonorLabels)
-	if needRelabel {
-		wc.labels = sw.Config.MetricRelabelConfigs.Apply(wc.labels, labelsLen, true)
-	} else {
-		wc.labels = promrelabel.FinalizeLabels(wc.labels[:labelsLen], wc.labels[labelsLen:])
-		promrelabel.SortLabels(wc.labels[labelsLen:])
+	metric := r.Metric
+	if needRelabel && isAutoMetric(metric) {
+		bb := bbPool.Get()
+		bb.B = append(bb.B, "exported_"...)
+		bb.B = append(bb.B, metric...)
+		metric = bytesutil.InternString(bytesutil.ToUnsafeString(bb.B))
+		bbPool.Put(bb)
 	}
+	labelsLen := len(wc.labels)
+	targetLabels := sw.Config.Labels.GetLabels()
+	wc.labels = appendLabels(wc.labels, metric, r.Tags, targetLabels, sw.Config.HonorLabels)
+	if needRelabel {
+		wc.labels = sw.Config.MetricRelabelConfigs.Apply(wc.labels, labelsLen)
+	}
+	wc.labels = promrelabel.FinalizeLabels(wc.labels[:labelsLen], wc.labels[labelsLen:])
 	if len(wc.labels) == labelsLen {
 		// Skip row without labels.
 		return
 	}
 	// Add labels from `global->external_labels` section after the relabeling like Prometheus does.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3137
-	wc.labels = appendExtraLabels(wc.labels, sw.Config.ExternalLabels, labelsLen, sw.Config.HonorLabels)
+	externalLabels := sw.Config.ExternalLabels.GetLabels()
+	wc.labels = appendExtraLabels(wc.labels, externalLabels, labelsLen, sw.Config.HonorLabels)
 	sampleTimestamp := r.Timestamp
 	if !sw.Config.HonorTimestamps || sampleTimestamp == 0 {
 		sampleTimestamp = timestamp
@@ -860,6 +870,8 @@ func (sw *scrapeWork) addRowToTimeseries(wc *writeRequestCtx, r *parser.Row, tim
 		Samples: wc.samples[len(wc.samples)-1:],
 	})
 }
+
+var bbPool bytesutil.ByteBufferPool
 
 func appendLabels(dst []prompbmarshal.Label, metric string, src []parser.Tag, extraLabels []prompbmarshal.Label, honorLabels bool) []prompbmarshal.Label {
 	dstLen := len(dst)
@@ -880,16 +892,14 @@ func appendLabels(dst []prompbmarshal.Label, metric string, src []parser.Tag, ex
 func appendExtraLabels(dst, extraLabels []prompbmarshal.Label, offset int, honorLabels bool) []prompbmarshal.Label {
 	// Add extraLabels to labels.
 	// Handle duplicates in the same way as Prometheus does.
-	if len(dst) > offset && dst[offset].Name == "__name__" {
-		offset++
-	}
-	labels := dst[offset:]
-	if len(labels) == 0 {
+	if len(dst) == offset {
 		// Fast path - add extraLabels to dst without the need to de-duplicate.
 		dst = append(dst, extraLabels...)
 		return dst
 	}
+	offsetEnd := len(dst)
 	for _, label := range extraLabels {
+		labels := dst[offset:offsetEnd]
 		prevLabel := promrelabel.GetLabelByName(labels, label.Name)
 		if prevLabel == nil {
 			// Fast path - the label doesn't exist in labels, so just add it to dst.
@@ -904,13 +914,13 @@ func appendExtraLabels(dst, extraLabels []prompbmarshal.Label, offset int, honor
 		// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
 		exportedName := "exported_" + label.Name
 		exportedLabel := promrelabel.GetLabelByName(labels, exportedName)
-		if exportedLabel == nil {
-			prevLabel.Name = exportedName
-			dst = append(dst, label)
-		} else {
-			exportedLabel.Value = prevLabel.Value
-			prevLabel.Value = label.Value
+		if exportedLabel != nil {
+			// The label with the name exported_<label.Name> already exists.
+			// Add yet another 'exported_' prefix to it.
+			exportedLabel.Name = "exported_" + exportedName
 		}
+		prevLabel.Name = exportedName
+		dst = append(dst, label)
 	}
 	return dst
 }

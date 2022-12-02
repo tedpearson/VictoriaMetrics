@@ -2,7 +2,7 @@ version: '3.5'
 services:
   vmagent:
     container_name: vmagent
-    image: victoriametrics/vmagent:v1.81.2
+    image: victoriametrics/vmagent:v1.84.0
     depends_on:
       - "vminsert"
     ports:
@@ -17,7 +17,7 @@ services:
 
   grafana:
     container_name: grafana
-    image: grafana/grafana:9.1.0
+    image: grafana/grafana:9.2.6
     depends_on:
       - "vmselect"
     ports:
@@ -32,7 +32,7 @@ services:
 
   vmstorage-1:
     container_name: vmstorage-1
-    image: victoriametrics/vmstorage:v1.81.2-cluster
+    image: victoriametrics/vmstorage:v1.84.0-cluster
     ports:
       - 8482
       - 8400
@@ -44,7 +44,7 @@ services:
     restart: always
   vmstorage-2:
     container_name: vmstorage-2
-    image: victoriametrics/vmstorage:v1.81.2-cluster
+    image: victoriametrics/vmstorage:v1.84.0-cluster
     ports:
       - 8482
       - 8400
@@ -56,7 +56,7 @@ services:
     restart: always
   vminsert:
     container_name: vminsert
-    image: victoriametrics/vminsert:v1.81.2-cluster
+    image: victoriametrics/vminsert:v1.84.0-cluster
     depends_on:
       - "vmstorage-1"
       - "vmstorage-2"
@@ -68,7 +68,7 @@ services:
     restart: always
   vmselect:
     container_name: vmselect
-    image: victoriametrics/vmselect:v1.81.2-cluster
+    image: victoriametrics/vmselect:v1.84.0-cluster
     depends_on:
       - "vmstorage-1"
       - "vmstorage-2"
@@ -82,7 +82,7 @@ services:
 
   vmalert:
     container_name: vmalert
-    image: victoriametrics/vmalert:v1.81.2
+    image: victoriametrics/vmalert:v1.84.0
     depends_on:
       - "vmselect"
     ports:
@@ -91,6 +91,7 @@ services:
       - ./alerts-cluster.yml:/etc/alerts/alerts.yml
       - ./alerts-health.yml:/etc/alerts/alerts-health.yml
       - ./alerts-vmagent.yml:/etc/alerts/alerts-vmagent.yml
+      - ./alerts-vmalert.yml:/etc/alerts/alerts-vmalert.yml
     command:
       - '--datasource.url=http://vmselect:8481/select/0/prometheus'
       - '--remoteRead.url=http://vmselect:8481/select/0/prometheus'
@@ -100,7 +101,7 @@ services:
       # display source of alerts in grafana
       - '-external.url=http://127.0.0.1:3000' #grafana outside container
       # when copypaste the line below be aware of '$$' for escaping in '$expr'
-      - '--external.alert.source=explore?orgId=1&left=["now-1h","now","VictoriaMetrics",{"expr":"{{$$expr|quotesEscape|crlfEscape|queryEscape}}"},{"mode":"Metrics"},{"ui":[true,true,true,"none"]}]'
+      - '--external.alert.source=explore?orgId=1&left=["now-1h","now","VictoriaMetrics",{"expr":{{$$expr|jsonEscape|queryEscape}} },{"mode":"Metrics"},{"ui":[true,true,true,"none"]}]'
     restart: always
 
   alertmanager:

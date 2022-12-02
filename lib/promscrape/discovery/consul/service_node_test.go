@@ -1,11 +1,10 @@
 package consul
 
 import (
-	"reflect"
 	"testing"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestParseServiceNodesFailure(t *testing.T) {
@@ -64,7 +63,8 @@ func TestParseServiceNodesSuccess(t *testing.T) {
         "Passing": 10,
         "Warning": 1
       },
-      "Namespace": "ns-dev"
+      "Namespace": "ns-dev",
+      "Partition": "part-foobar"
     },
     "Checks": [
       {
@@ -107,12 +107,8 @@ func TestParseServiceNodesSuccess(t *testing.T) {
 	// Check sn.appendTargetLabels()
 	tagSeparator := ","
 	labelss := sn.appendTargetLabels(nil, "redis", tagSeparator)
-	var sortedLabelss [][]prompbmarshal.Label
-	for _, labels := range labelss {
-		sortedLabelss = append(sortedLabelss, discoveryutils.GetSortedLabels(labels))
-	}
-	expectedLabelss := [][]prompbmarshal.Label{
-		discoveryutils.GetSortedLabels(map[string]string{
+	expectedLabelss := []*promutils.Labels{
+		promutils.NewLabelsFromMap(map[string]string{
 			"__address__":                                  "10.1.10.12:8000",
 			"__meta_consul_address":                        "10.1.10.12",
 			"__meta_consul_dc":                             "dc1",
@@ -120,6 +116,7 @@ func TestParseServiceNodesSuccess(t *testing.T) {
 			"__meta_consul_metadata_instance_type":         "t2.medium",
 			"__meta_consul_namespace":                      "ns-dev",
 			"__meta_consul_node":                           "foobar",
+			"__meta_consul_partition":                      "part-foobar",
 			"__meta_consul_service":                        "redis",
 			"__meta_consul_service_address":                "10.1.10.12",
 			"__meta_consul_service_id":                     "redis",
@@ -130,7 +127,5 @@ func TestParseServiceNodesSuccess(t *testing.T) {
 			"__meta_consul_tags":                           ",primary,",
 		}),
 	}
-	if !reflect.DeepEqual(sortedLabelss, expectedLabelss) {
-		t.Fatalf("unexpected labels:\ngot\n%v\nwant\n%v", sortedLabelss, expectedLabelss)
-	}
+	discoveryutils.TestEqualLabelss(t, labelss, expectedLabelss)
 }

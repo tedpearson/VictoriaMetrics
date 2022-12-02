@@ -50,9 +50,6 @@ type Storage struct {
 	addRowsConcurrencyLimitTimeout uint64
 	addRowsConcurrencyDroppedRows  uint64
 
-	searchTSIDsConcurrencyLimitReached uint64
-	searchTSIDsConcurrencyLimitTimeout uint64
-
 	slowRowInserts         uint64
 	slowPerDayIndexInserts uint64
 	slowMetricNameLoads    uint64
@@ -261,7 +258,7 @@ func OpenStorage(path string, retentionMsecs int64, maxHourlySeries, maxDailySer
 
 	// Load data
 	tablePath := path + "/data"
-	tb, err := openTable(tablePath, s.getDeletedMetricIDs, retentionMsecs, &s.isReadOnly)
+	tb, err := openTable(tablePath, s)
 	if err != nil {
 		s.idb().MustClose()
 		return nil, fmt.Errorf("cannot open table at %q: %w", tablePath, err)
@@ -459,11 +456,6 @@ type Metrics struct {
 	AddRowsConcurrencyCapacity     uint64
 	AddRowsConcurrencyCurrent      uint64
 
-	SearchTSIDsConcurrencyLimitReached uint64
-	SearchTSIDsConcurrencyLimitTimeout uint64
-	SearchTSIDsConcurrencyCapacity     uint64
-	SearchTSIDsConcurrencyCurrent      uint64
-
 	SearchDelays uint64
 
 	SlowRowInserts         uint64
@@ -540,11 +532,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.AddRowsConcurrencyDroppedRows += atomic.LoadUint64(&s.addRowsConcurrencyDroppedRows)
 	m.AddRowsConcurrencyCapacity = uint64(cap(addRowsConcurrencyCh))
 	m.AddRowsConcurrencyCurrent = uint64(len(addRowsConcurrencyCh))
-
-	m.SearchTSIDsConcurrencyLimitReached += atomic.LoadUint64(&s.searchTSIDsConcurrencyLimitReached)
-	m.SearchTSIDsConcurrencyLimitTimeout += atomic.LoadUint64(&s.searchTSIDsConcurrencyLimitTimeout)
-	m.SearchTSIDsConcurrencyCapacity = uint64(cap(searchTSIDsConcurrencyCh))
-	m.SearchTSIDsConcurrencyCurrent = uint64(len(searchTSIDsConcurrencyCh))
 
 	m.SearchDelays = storagepacelimiter.Search.DelaysTotal()
 
@@ -713,10 +700,12 @@ func (s *Storage) currHourMetricIDsUpdater() {
 	for {
 		select {
 		case <-s.stop:
-			s.updateCurrHourMetricIDs()
+			hour := fasttime.UnixHour()
+			s.updateCurrHourMetricIDs(hour)
 			return
 		case <-ticker.C:
-			s.updateCurrHourMetricIDs()
+			hour := fasttime.UnixHour()
+			s.updateCurrHourMetricIDs(hour)
 		}
 	}
 }
@@ -729,10 +718,12 @@ func (s *Storage) nextDayMetricIDsUpdater() {
 	for {
 		select {
 		case <-s.stop:
-			s.updateNextDayMetricIDs()
+			date := fasttime.UnixDate()
+			s.updateNextDayMetricIDs(date)
 			return
 		case <-ticker.C:
-			s.updateNextDayMetricIDs()
+			date := fasttime.UnixDate()
+			s.updateNextDayMetricIDs(date)
 		}
 	}
 }
@@ -908,14 +899,12 @@ func (s *Storage) mustLoadHourMetricIDs(hour uint64, name string) *hourMetricIDs
 		logger.Panicf("FATAL: cannot read %s: %s", path, err)
 	}
 	srcOrigLen := len(src)
-	if len(src) < 24 {
-		logger.Errorf("discarding %s, since it has broken header; got %d bytes; want %d bytes", path, len(src), 24)
+	if len(src) < 16 {
+		logger.Errorf("discarding %s, since it has broken header; got %d bytes; want %d bytes", path, len(src), 16)
 		return hm
 	}
 
 	// Unmarshal header
-	isFull := encoding.UnmarshalUint64(src)
-	src = src[8:]
 	hourLoaded := encoding.UnmarshalUint64(src)
 	src = src[8:]
 	if hourLoaded != hour {
@@ -934,7 +923,6 @@ func (s *Storage) mustLoadHourMetricIDs(hour uint64, name string) *hourMetricIDs
 		return hm
 	}
 	hm.m = m
-	hm.isFull = isFull != 0
 	logger.Infof("loaded %s from %q in %.3f seconds; entriesCount: %d; sizeBytes: %d", name, path, time.Since(startTime).Seconds(), m.Len(), srcOrigLen)
 	return hm
 }
@@ -963,13 +951,8 @@ func (s *Storage) mustSaveHourMetricIDs(hm *hourMetricIDs, name string) {
 	logger.Infof("saving %s to %q...", name, path)
 	startTime := time.Now()
 	dst := make([]byte, 0, hm.m.Len()*8+24)
-	isFull := uint64(0)
-	if hm.isFull {
-		isFull = 1
-	}
 
 	// Marshal header
-	dst = encoding.MarshalUint64(dst, isFull)
 	dst = encoding.MarshalUint64(dst, hm.hour)
 
 	// Marshal hm.m
@@ -1026,10 +1009,7 @@ func mustGetMinTimestampForCompositeIndex(metadataDir string, isEmptyDB bool) in
 	}
 	minTimestamp = date * msecPerDay
 	dateBuf := encoding.MarshalInt64(nil, minTimestamp)
-	if err := os.RemoveAll(path); err != nil {
-		logger.Fatalf("cannot remove a file with minTimestampForCompositeIndex: %s", err)
-	}
-	if err := fs.WriteFileAtomically(path, dateBuf); err != nil {
+	if err := fs.WriteFileAtomically(path, dateBuf, true); err != nil {
 		logger.Fatalf("cannot store minTimestampForCompositeIndex: %s", err)
 	}
 	return minTimestamp
@@ -1106,27 +1086,26 @@ func nextRetentionDuration(retentionMsecs int64) time.Duration {
 func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]string, error) {
 	qt = qt.NewChild("search for matching metric names: filters=%s, timeRange=%s", tfss, &tr)
 	defer qt.Done()
-	tsids, err := s.searchTSIDs(qt, tfss, tr, maxMetrics, deadline)
+	metricIDs, err := s.idb().searchMetricIDs(qt, tfss, tr, maxMetrics, deadline)
 	if err != nil {
 		return nil, err
 	}
-	if len(tsids) == 0 {
+	if len(metricIDs) == 0 {
 		return nil, nil
 	}
-	if err = s.prefetchMetricNames(qt, tsids, deadline); err != nil {
+	if err = s.prefetchMetricNames(qt, metricIDs, deadline); err != nil {
 		return nil, err
 	}
 	idb := s.idb()
-	metricNames := make([]string, 0, len(tsids))
-	metricNamesSeen := make(map[string]struct{}, len(tsids))
+	metricNames := make([]string, 0, len(metricIDs))
+	metricNamesSeen := make(map[string]struct{}, len(metricIDs))
 	var metricName []byte
-	for i := range tsids {
+	for i, metricID := range metricIDs {
 		if i&paceLimiterSlowIterationsMask == 0 {
 			if err := checkSearchDeadlineAndPace(deadline); err != nil {
 				return nil, err
 			}
 		}
-		metricID := tsids[i].MetricID
 		var err error
 		metricName, err = idb.searchMetricNameWithCache(metricName[:0], metricID)
 		if err != nil {
@@ -1148,75 +1127,25 @@ func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, 
 	return metricNames, nil
 }
 
-// searchTSIDs returns sorted TSIDs for the given tfss and the given tr.
-func (s *Storage) searchTSIDs(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]TSID, error) {
-	qt = qt.NewChild("search for matching tsids: filters=%s, timeRange=%s", tfss, &tr)
-	defer qt.Done()
-	// Do not cache tfss -> tsids here, since the caching is performed
-	// on idb level.
-
-	// Limit the number of concurrent goroutines that may search TSIDS in the storage.
-	// This should prevent from out of memory errors and CPU thrashing when too many
-	// goroutines call searchTSIDs.
-	select {
-	case searchTSIDsConcurrencyCh <- struct{}{}:
-	default:
-		// Sleep for a while until giving up
-		atomic.AddUint64(&s.searchTSIDsConcurrencyLimitReached, 1)
-		currentTime := fasttime.UnixTimestamp()
-		timeoutSecs := uint64(0)
-		if currentTime < deadline {
-			timeoutSecs = deadline - currentTime
-		}
-		timeout := time.Second * time.Duration(timeoutSecs)
-		t := timerpool.Get(timeout)
-		select {
-		case searchTSIDsConcurrencyCh <- struct{}{}:
-			qt.Printf("wait in the queue because %d concurrent search requests are already performed", cap(searchTSIDsConcurrencyCh))
-			timerpool.Put(t)
-		case <-t.C:
-			timerpool.Put(t)
-			atomic.AddUint64(&s.searchTSIDsConcurrencyLimitTimeout, 1)
-			return nil, fmt.Errorf("cannot search for tsids, since more than %d concurrent searches are performed during %.3f secs; add more CPUs or reduce query load",
-				cap(searchTSIDsConcurrencyCh), timeout.Seconds())
-		}
-	}
-	tsids, err := s.idb().searchTSIDs(qt, tfss, tr, maxMetrics, deadline)
-	<-searchTSIDsConcurrencyCh
-	if err != nil {
-		return nil, fmt.Errorf("error when searching tsids: %w", err)
-	}
-	return tsids, nil
-}
-
-var (
-	// Limit the concurrency for TSID searches to GOMAXPROCS*2, since this operation
-	// is CPU bound and sometimes disk IO bound, so there is no sense in running more
-	// than GOMAXPROCS*2 concurrent goroutines for TSID searches.
-	searchTSIDsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs()*2)
-)
-
-// prefetchMetricNames pre-fetches metric names for the given tsids into metricID->metricName cache.
+// prefetchMetricNames pre-fetches metric names for the given metricIDs into metricID->metricName cache.
 //
-// This should speed-up further searchMetricNameWithCache calls for metricIDs from tsids.
-func (s *Storage) prefetchMetricNames(qt *querytracer.Tracer, tsids []TSID, deadline uint64) error {
-	qt = qt.NewChild("prefetch metric names for %d tsids", len(tsids))
+// This should speed-up further searchMetricNameWithCache calls for srcMetricIDs from tsids.
+func (s *Storage) prefetchMetricNames(qt *querytracer.Tracer, srcMetricIDs []uint64, deadline uint64) error {
+	qt = qt.NewChild("prefetch metric names for %d metricIDs", len(srcMetricIDs))
 	defer qt.Done()
-	if len(tsids) == 0 {
+	if len(srcMetricIDs) == 0 {
 		qt.Printf("nothing to prefetch")
 		return nil
 	}
 	var metricIDs uint64Sorter
 	prefetchedMetricIDs := s.prefetchedMetricIDs.Load().(*uint64set.Set)
-	for i := range tsids {
-		tsid := &tsids[i]
-		metricID := tsid.MetricID
+	for _, metricID := range srcMetricIDs {
 		if prefetchedMetricIDs.Has(metricID) {
 			continue
 		}
 		metricIDs = append(metricIDs, metricID)
 	}
-	qt.Printf("%d out of %d metric names must be pre-fetched", len(metricIDs), len(tsids))
+	qt.Printf("%d out of %d metric names must be pre-fetched", len(metricIDs), len(srcMetricIDs))
 	if len(metricIDs) < 500 {
 		// It is cheaper to skip pre-fetching and obtain metricNames inline.
 		qt.Printf("skip pre-fetching metric names for low number of metrid ids=%d", len(metricIDs))
@@ -2365,8 +2294,7 @@ type byDateMetricIDEntry struct {
 	v    uint64set.Set
 }
 
-func (s *Storage) updateNextDayMetricIDs() {
-	date := fasttime.UnixDate()
+func (s *Storage) updateNextDayMetricIDs(date uint64) {
 	e := s.nextDayMetricIDs.Load().(*byDateMetricIDEntry)
 	s.pendingNextDayMetricIDsLock.Lock()
 	pendingMetricIDs := s.pendingNextDayMetricIDs
@@ -2380,6 +2308,11 @@ func (s *Storage) updateNextDayMetricIDs() {
 	// Slow path: union pendingMetricIDs with e.v
 	if e.date == date {
 		pendingMetricIDs.Union(&e.v)
+	} else {
+		// Do not add pendingMetricIDs from the previous day to the cyrrent day,
+		// since this may result in missing registration of the metricIDs in the per-day inverted index.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3309
+		pendingMetricIDs = &uint64set.Set{}
 	}
 	eNew := &byDateMetricIDEntry{
 		date: date,
@@ -2388,14 +2321,13 @@ func (s *Storage) updateNextDayMetricIDs() {
 	s.nextDayMetricIDs.Store(eNew)
 }
 
-func (s *Storage) updateCurrHourMetricIDs() {
+func (s *Storage) updateCurrHourMetricIDs(hour uint64) {
 	hm := s.currHourMetricIDs.Load().(*hourMetricIDs)
 	s.pendingHourEntriesLock.Lock()
 	newMetricIDs := s.pendingHourEntries
 	s.pendingHourEntries = &uint64set.Set{}
 	s.pendingHourEntriesLock.Unlock()
 
-	hour := fasttime.UnixHour()
 	if newMetricIDs.Len() == 0 && hm.hour == hour {
 		// Fast path: nothing to update.
 		return
@@ -2403,18 +2335,20 @@ func (s *Storage) updateCurrHourMetricIDs() {
 
 	// Slow path: hm.m must be updated with non-empty s.pendingHourEntries.
 	var m *uint64set.Set
-	isFull := hm.isFull
 	if hm.hour == hour {
 		m = hm.m.Clone()
 	} else {
 		m = &uint64set.Set{}
-		isFull = true
 	}
-	m.Union(newMetricIDs)
+	if hour%24 != 0 {
+		// Do not add pending metricIDs from the previous hour to the current hour on the next day,
+		// since this may result in missing registration of the metricIDs in the per-day inverted index.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3309
+		m.Union(newMetricIDs)
+	}
 	hmNew := &hourMetricIDs{
-		m:      m,
-		hour:   hour,
-		isFull: isFull,
+		m:    m,
+		hour: hour,
 	}
 	s.currHourMetricIDs.Store(hmNew)
 	if hm.hour != hour {
@@ -2423,9 +2357,8 @@ func (s *Storage) updateCurrHourMetricIDs() {
 }
 
 type hourMetricIDs struct {
-	m      *uint64set.Set
-	hour   uint64
-	isFull bool
+	m    *uint64set.Set
+	hour uint64
 }
 
 type generationTSID struct {

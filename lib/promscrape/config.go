@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
@@ -19,7 +18,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
@@ -42,8 +40,9 @@ import (
 )
 
 var (
-	strictParse = flag.Bool("promscrape.config.strictParse", true, "Whether to deny unsupported fields in -promscrape.config . Set to false in order to silently skip unsupported fields")
-	dryRun      = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
+	noStaleMarkers = flag.Bool("promscrape.noStaleMarkers", false, "Whether to disable sending Prometheus stale markers for metrics when scrape target disappears. This option may reduce memory usage if stale markers aren't needed for your setup. This option also disables populating the scrape_series_added metric. See https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series")
+	strictParse    = flag.Bool("promscrape.config.strictParse", true, "Whether to deny unsupported fields in -promscrape.config . Set to false in order to silently skip unsupported fields")
+	dryRun         = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
 		"Returns non-zero exit code on parsing errors and emits these errors to stderr. "+
 		"See also -promscrape.config.strictParse command-line flag. "+
 		"Pass -loggerLevel=ERROR if you don't need to see info messages in the output.")
@@ -91,8 +90,11 @@ type Config struct {
 }
 
 func (cfg *Config) unmarshal(data []byte, isStrict bool) error {
-	data = envtemplate.Replace(data)
 	var err error
+	data, err = envtemplate.ReplaceBytes(data)
+	if err != nil {
+		return fmt.Errorf("cannot expand environment variables: %w", err)
+	}
 	if isStrict {
 		if err = yaml.UnmarshalStrict(data, cfg); err != nil {
 			err = fmt.Errorf("%w; pass -promscrape.config.strictParse=false command-line flag for ignoring unknown fields in yaml config", err)
@@ -226,23 +228,7 @@ func (cfg *Config) getJobNames() []string {
 type GlobalConfig struct {
 	ScrapeInterval *promutils.Duration `yaml:"scrape_interval,omitempty"`
 	ScrapeTimeout  *promutils.Duration `yaml:"scrape_timeout,omitempty"`
-	ExternalLabels map[string]string   `yaml:"external_labels,omitempty"`
-}
-
-func (gc *GlobalConfig) getExternalLabels() []prompbmarshal.Label {
-	externalLabels := gc.ExternalLabels
-	if len(externalLabels) == 0 {
-		return nil
-	}
-	labels := make([]prompbmarshal.Label, 0, len(externalLabels))
-	for name, value := range externalLabels {
-		labels = append(labels, prompbmarshal.Label{
-			Name:  name,
-			Value: value,
-		})
-	}
-	promrelabel.SortLabels(labels)
-	return labels
+	ExternalLabels *promutils.Labels   `yaml:"external_labels,omitempty"`
 }
 
 // ScrapeConfig represents essential parts for `scrape_config` section of Prometheus config.
@@ -289,6 +275,7 @@ type ScrapeConfig struct {
 	ScrapeAlignInterval *promutils.Duration        `yaml:"scrape_align_interval,omitempty"`
 	ScrapeOffset        *promutils.Duration        `yaml:"scrape_offset,omitempty"`
 	SeriesLimit         int                        `yaml:"series_limit,omitempty"`
+	NoStaleMarkers      *bool                      `yaml:"no_stale_markers,omitempty"`
 	ProxyClientConfig   promauth.ProxyClientConfig `yaml:",inline"`
 
 	// This is set in loadConfig
@@ -296,8 +283,8 @@ type ScrapeConfig struct {
 }
 
 func (sc *ScrapeConfig) mustStart(baseDir string) {
-	swosFunc := func(metaLabels map[string]string) interface{} {
-		target := metaLabels["__address__"]
+	swosFunc := func(metaLabels *promutils.Labels) interface{} {
+		target := metaLabels.Get("__address__")
 		sw, err := sc.swc.getScrapeWork(target, nil, metaLabels)
 		if err != nil {
 			logger.Errorf("cannot create kubernetes_sd_config target %q for job_name %q: %s", target, sc.swc.jobName, err)
@@ -362,7 +349,7 @@ type FileSDConfig struct {
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#static_config
 type StaticConfig struct {
 	Targets []string          `yaml:"targets"`
-	Labels  map[string]string `yaml:"labels,omitempty"`
+	Labels  *promutils.Labels `yaml:"labels,omitempty"`
 }
 
 func loadStaticConfigs(path string) ([]StaticConfig, error) {
@@ -370,7 +357,10 @@ func loadStaticConfigs(path string) ([]StaticConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read `static_configs` from %q: %w", path, err)
 	}
-	data = envtemplate.Replace(data)
+	data, err = envtemplate.ReplaceBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("cannot expand environment vars in %q: %w", path, err)
+	}
 	var stcs []StaticConfig
 	if err := yaml.UnmarshalStrict(data, &stcs); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal `static_configs` from %q: %w", path, err)
@@ -411,7 +401,10 @@ func loadScrapeConfigFiles(baseDir string, scrapeConfigFiles []string) ([]*Scrap
 			if err != nil {
 				return nil, nil, fmt.Errorf("cannot load %q: %w", path, err)
 			}
-			data = envtemplate.Replace(data)
+			data, err = envtemplate.ReplaceBytes(data)
+			if err != nil {
+				return nil, nil, fmt.Errorf("cannot expand environment vars in %q: %w", path, err)
+			}
 			var scs []*ScrapeConfig
 			if err = yaml.UnmarshalStrict(data, &scs); err != nil {
 				return nil, nil, fmt.Errorf("cannot parse %q: %w", path, err)
@@ -712,7 +705,7 @@ func (cfg *Config) getFileSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	// Create a map for the previous scrape work.
 	swsMapPrev := make(map[string][]*ScrapeWork)
 	for _, sw := range prev {
-		filepath := promrelabel.GetLabelValueByName(sw.Labels, "__vm_filepath")
+		filepath := sw.Labels.Get("__vm_filepath")
 		if len(filepath) == 0 {
 			logger.Panicf("BUG: missing `__vm_filepath` label")
 		} else {
@@ -949,7 +942,11 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 	if (*streamParse || sc.StreamParse) && sc.SeriesLimit > 0 {
 		return nil, fmt.Errorf("cannot use stream parsing mode when `series_limit` is set for `job_name` %q", jobName)
 	}
-	externalLabels := globalCfg.getExternalLabels()
+	externalLabels := globalCfg.ExternalLabels
+	noStaleTracking := *noStaleMarkers
+	if sc.NoStaleMarkers != nil {
+		noStaleTracking = *sc.NoStaleMarkers
+	}
 	swc := &scrapeWorkConfig{
 		scrapeInterval:       scrapeInterval,
 		scrapeIntervalString: scrapeInterval.String(),
@@ -975,6 +972,7 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 		scrapeAlignInterval:  sc.ScrapeAlignInterval.Duration(),
 		scrapeOffset:         sc.ScrapeOffset.Duration(),
 		seriesLimit:          sc.SeriesLimit,
+		noStaleMarkers:       noStaleTracking,
 	}
 	return swc, nil
 }
@@ -994,7 +992,7 @@ type scrapeWorkConfig struct {
 	honorLabels          bool
 	honorTimestamps      bool
 	denyRedirects        bool
-	externalLabels       []prompbmarshal.Label
+	externalLabels       *promutils.Labels
 	relabelConfigs       *promrelabel.ParsedConfigs
 	metricRelabelConfigs *promrelabel.ParsedConfigs
 	sampleLimit          int
@@ -1004,10 +1002,11 @@ type scrapeWorkConfig struct {
 	scrapeAlignInterval  time.Duration
 	scrapeOffset         time.Duration
 	seriesLimit          int
+	noStaleMarkers       bool
 }
 
 type targetLabelsGetter interface {
-	GetLabels(baseDir string) ([]map[string]string, error)
+	GetLabels(baseDir string) ([]*promutils.Labels, error)
 }
 
 func appendSDScrapeWork(dst []*ScrapeWork, sdc targetLabelsGetter, baseDir string, swc *scrapeWorkConfig, discoveryType string) ([]*ScrapeWork, bool) {
@@ -1019,7 +1018,7 @@ func appendSDScrapeWork(dst []*ScrapeWork, sdc targetLabelsGetter, baseDir strin
 	return appendScrapeWorkForTargetLabels(dst, swc, targetLabels, discoveryType), true
 }
 
-func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, targetLabels []map[string]string, discoveryType string) []*ScrapeWork {
+func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, targetLabels []*promutils.Labels, discoveryType string) []*ScrapeWork {
 	startTime := time.Now()
 	// Process targetLabels in parallel in order to reduce processing time for big number of targetLabels.
 	type result struct {
@@ -1028,11 +1027,11 @@ func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, t
 	}
 	goroutines := cgroup.AvailableCPUs()
 	resultCh := make(chan result, len(targetLabels))
-	workCh := make(chan map[string]string, goroutines)
+	workCh := make(chan *promutils.Labels, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			for metaLabels := range workCh {
-				target := metaLabels["__address__"]
+				target := metaLabels.Get("__address__")
 				sw, err := swc.getScrapeWork(target, nil, metaLabels)
 				if err != nil {
 					err = fmt.Errorf("skipping %s target %q for job_name %q because of error: %w", discoveryType, target, swc.jobName, err)
@@ -1063,6 +1062,8 @@ func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, t
 }
 
 func (sdc *FileSDConfig) appendScrapeWork(dst []*ScrapeWork, swsMapPrev map[string][]*ScrapeWork, baseDir string, swc *scrapeWorkConfig) []*ScrapeWork {
+	metaLabels := promutils.GetLabels()
+	defer promutils.PutLabels(metaLabels)
 	for _, file := range sdc.Files {
 		pathPattern := fs.GetFilepath(baseDir, file)
 		paths := []string{pathPattern}
@@ -1095,10 +1096,9 @@ func (sdc *FileSDConfig) appendScrapeWork(dst []*ScrapeWork, swsMapPrev map[stri
 					pathShort = pathShort[1:]
 				}
 			}
-			metaLabels := map[string]string{
-				"__meta_filepath": pathShort,
-				"__vm_filepath":   path, // This label is needed for internal promscrape logic
-			}
+			metaLabels.Reset()
+			metaLabels.Add("__meta_filepath", pathShort)
+			metaLabels.Add("__vm_filepath", path) // This label is needed for internal promscrape logic
 			for i := range stcs {
 				dst = stcs[i].appendScrapeWork(dst, swc, metaLabels)
 			}
@@ -1107,7 +1107,7 @@ func (sdc *FileSDConfig) appendScrapeWork(dst []*ScrapeWork, swsMapPrev map[stri
 	return dst
 }
 
-func (stc *StaticConfig) appendScrapeWork(dst []*ScrapeWork, swc *scrapeWorkConfig, metaLabels map[string]string) []*ScrapeWork {
+func (stc *StaticConfig) appendScrapeWork(dst []*ScrapeWork, swc *scrapeWorkConfig, metaLabels *promutils.Labels) []*ScrapeWork {
 	for _, target := range stc.Targets {
 		if target == "" {
 			// Do not return this error, since other targets may be valid
@@ -1127,8 +1127,8 @@ func (stc *StaticConfig) appendScrapeWork(dst []*ScrapeWork, swc *scrapeWorkConf
 	return dst
 }
 
-func appendScrapeWorkKey(dst []byte, labels []prompbmarshal.Label) []byte {
-	for _, label := range labels {
+func appendScrapeWorkKey(dst []byte, labels *promutils.Labels) []byte {
+	for _, label := range labels.GetLabels() {
 		// Do not use strconv.AppendQuote, since it is slow according to CPU profile.
 		dst = append(dst, label.Name...)
 		dst = append(dst, '=')
@@ -1159,46 +1159,20 @@ func needSkipScrapeWork(key string, membersCount, replicasCount, memberNum int) 
 	return true
 }
 
-type labelsContext struct {
-	labels []prompbmarshal.Label
-}
-
-func getLabelsContext() *labelsContext {
-	v := labelsContextPool.Get()
-	if v == nil {
-		return &labelsContext{}
-	}
-	return v.(*labelsContext)
-}
-
-func putLabelsContext(lctx *labelsContext) {
-	labels := lctx.labels
-	for i := range labels {
-		labels[i].Name = ""
-		labels[i].Value = ""
-	}
-	lctx.labels = lctx.labels[:0]
-	labelsContextPool.Put(lctx)
-}
-
-var labelsContextPool sync.Pool
-
 var scrapeWorkKeyBufPool bytesutil.ByteBufferPool
 
-func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabels map[string]string) (*ScrapeWork, error) {
-	lctx := getLabelsContext()
-	lctx.labels = mergeLabels(lctx.labels[:0], swc, target, extraLabels, metaLabels)
-	var originalLabels []prompbmarshal.Label
+func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabels *promutils.Labels) (*ScrapeWork, error) {
+	labels := promutils.GetLabels()
+	defer promutils.PutLabels(labels)
+
+	mergeLabels(labels, swc, target, extraLabels, metaLabels)
+	var originalLabels *promutils.Labels
 	if !*dropOriginalLabels {
-		originalLabels = append([]prompbmarshal.Label{}, lctx.labels...)
+		originalLabels = labels.Clone()
 	}
-	lctx.labels = swc.relabelConfigs.Apply(lctx.labels, 0, false)
-	lctx.labels = promrelabel.RemoveMetaLabels(lctx.labels[:0], lctx.labels)
-	// Remove references to already deleted labels, so GC could clean strings for label name and label value past len(labels).
-	// This should reduce memory usage when relabeling creates big number of temporary labels with long names and/or values.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825 for details.
-	labels := append([]prompbmarshal.Label{}, lctx.labels...)
-	putLabelsContext(lctx)
+	labels.Labels = swc.relabelConfigs.Apply(labels.Labels, 0)
+	// Remove labels starting from "__meta_" prefix according to https://www.robustperception.io/life-of-a-label/
+	labels.RemoveMetaLabels()
 
 	// Verify whether the scrape work must be skipped because of `-promscrape.cluster.*` configs.
 	// Perform the verification on labels after the relabeling in order to guarantee that targets with the same set of labels
@@ -1214,72 +1188,76 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		}
 	}
 	if !*dropOriginalLabels {
-		promrelabel.SortLabels(originalLabels)
+		originalLabels.Sort()
 		// Reduce memory usage by interning all the strings in originalLabels.
-		internLabelStrings(originalLabels)
+		originalLabels.InternStrings()
 	}
-	if len(labels) == 0 {
+	if labels.Len() == 0 {
 		// Drop target without labels.
 		droppedTargetsMap.Register(originalLabels)
 		return nil, nil
 	}
 	// See https://www.robustperception.io/life-of-a-label
-	schemeRelabeled := promrelabel.GetLabelValueByName(labels, "__scheme__")
-	if len(schemeRelabeled) == 0 {
-		schemeRelabeled = "http"
+	scheme := labels.Get("__scheme__")
+	if len(scheme) == 0 {
+		scheme = "http"
 	}
-	addressRelabeled := promrelabel.GetLabelValueByName(labels, "__address__")
-	if len(addressRelabeled) == 0 {
+	metricsPath := labels.Get("__metrics_path__")
+	if len(metricsPath) == 0 {
+		metricsPath = "/metrics"
+	}
+	address := labels.Get("__address__")
+	if len(address) == 0 {
 		// Drop target without scrape address.
 		droppedTargetsMap.Register(originalLabels)
 		return nil, nil
 	}
-	if strings.Contains(addressRelabeled, "/") {
-		// Drop target with '/'
-		droppedTargetsMap.Register(originalLabels)
-		return nil, nil
+	// Usability extension to Prometheus behavior: extract optional scheme and metricsPath from __address__.
+	// Prometheus silently drops targets with __address__ containing scheme or metricsPath
+	// according to https://www.robustperception.io/life-of-a-label/ .
+	if strings.HasPrefix(address, "http://") {
+		scheme = "http"
+		address = address[len("http://"):]
+	} else if strings.HasPrefix(address, "https://") {
+		scheme = "https"
+		address = address[len("https://"):]
 	}
-	addressRelabeled = addMissingPort(addressRelabeled, schemeRelabeled == "https")
-	metricsPathRelabeled := promrelabel.GetLabelValueByName(labels, "__metrics_path__")
-	if metricsPathRelabeled == "" {
-		metricsPathRelabeled = "/metrics"
+	if n := strings.IndexByte(address, '/'); n >= 0 {
+		metricsPath = address[n:]
+		address = address[:n]
 	}
+	address = addMissingPort(address, scheme == "https")
 
 	var at *auth.Token
-	tenantID := promrelabel.GetLabelValueByName(labels, "__tenant_id__")
-	if tenantID != "" {
+	tenantID := labels.Get("__tenant_id__")
+	if len(tenantID) > 0 {
 		newToken, err := auth.NewToken(tenantID)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse __tenant_id__=%q for job=%s, err: %w", tenantID, swc.jobName, err)
+			return nil, fmt.Errorf("cannot parse __tenant_id__=%q for job=%q: %w", tenantID, swc.jobName, err)
 		}
 		at = newToken
 	}
 
-	if !strings.HasPrefix(metricsPathRelabeled, "/") {
-		metricsPathRelabeled = "/" + metricsPathRelabeled
+	if !strings.HasPrefix(metricsPath, "/") {
+		metricsPath = "/" + metricsPath
 	}
-	paramsRelabeled := getParamsFromLabels(labels, swc.params)
-	optionalQuestion := "?"
-	if len(paramsRelabeled) == 0 || strings.Contains(metricsPathRelabeled, "?") {
-		optionalQuestion = ""
+	params := getParamsFromLabels(labels, swc.params)
+	optionalQuestion := ""
+	if len(params) > 0 {
+		optionalQuestion = "?"
+		if strings.Contains(metricsPath, "?") {
+			optionalQuestion = "&"
+		}
 	}
-	paramsStr := url.Values(paramsRelabeled).Encode()
-	scrapeURL := fmt.Sprintf("%s://%s%s%s%s", schemeRelabeled, addressRelabeled, metricsPathRelabeled, optionalQuestion, paramsStr)
+	paramsStr := url.Values(params).Encode()
+	scrapeURL := getScrapeURL(scheme, address, metricsPath, optionalQuestion, paramsStr)
 	if _, err := url.Parse(scrapeURL); err != nil {
-		return nil, fmt.Errorf("invalid url %q for scheme=%q (%q), target=%q (%q), metrics_path=%q (%q) for `job_name` %q: %w",
-			scrapeURL, swc.scheme, schemeRelabeled, target, addressRelabeled, swc.metricsPath, metricsPathRelabeled, swc.jobName, err)
-	}
-	// Set missing "instance" label according to https://www.robustperception.io/life-of-a-label
-	if promrelabel.GetLabelByName(labels, "instance") == nil {
-		labels = append(labels, prompbmarshal.Label{
-			Name:  "instance",
-			Value: addressRelabeled,
-		})
-		promrelabel.SortLabels(labels)
+		return nil, fmt.Errorf("invalid url %q for scheme=%q, target=%q, address=%q, metrics_path=%q for job=%q: %w",
+			scrapeURL, scheme, target, address, metricsPath, swc.jobName, err)
 	}
 	// Read __scrape_interval__ and __scrape_timeout__ from labels.
 	scrapeInterval := swc.scrapeInterval
-	if s := promrelabel.GetLabelValueByName(labels, "__scrape_interval__"); len(s) > 0 {
+	if s := labels.Get("__scrape_interval__"); len(s) > 0 {
 		d, err := promutils.ParseDuration(s)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse __scrape_interval__=%q: %w", s, err)
@@ -1287,7 +1265,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		scrapeInterval = d
 	}
 	scrapeTimeout := swc.scrapeTimeout
-	if s := promrelabel.GetLabelValueByName(labels, "__scrape_timeout__"); len(s) > 0 {
+	if s := labels.Get("__scrape_timeout__"); len(s) > 0 {
 		d, err := promutils.ParseDuration(s)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse __scrape_timeout__=%q: %w", s, err)
@@ -1297,7 +1275,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 	// Read series_limit option from __series_limit__ label.
 	// See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter
 	seriesLimit := swc.seriesLimit
-	if s := promrelabel.GetLabelValueByName(labels, "__series_limit__"); len(s) > 0 {
+	if s := labels.Get("__series_limit__"); len(s) > 0 {
 		n, err := strconv.Atoi(s)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse __series_limit__=%q: %w", s, err)
@@ -1307,15 +1285,28 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 	// Read stream_parse option from __stream_parse__ label.
 	// See https://docs.victoriametrics.com/vmagent.html#stream-parsing-mode
 	streamParse := swc.streamParse
-	if s := promrelabel.GetLabelValueByName(labels, "__stream_parse__"); len(s) > 0 {
+	if s := labels.Get("__stream_parse__"); len(s) > 0 {
 		b, err := strconv.ParseBool(s)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse __stream_parse__=%q: %w", s, err)
 		}
 		streamParse = b
 	}
+	// Remove labels with "__" prefix according to https://www.robustperception.io/life-of-a-label/
+	labels.RemoveLabelsWithDoubleUnderscorePrefix()
+	// Add missing "instance" label according to https://www.robustperception.io/life-of-a-label
+	if labels.Get("instance") == "" {
+		labels.Add("instance", address)
+	}
+	// Remove references to deleted labels, so GC could clean strings for label name and label value past len(labels.Labels).
+	// This should reduce memory usage when relabeling creates big number of temporary labels with long names and/or values.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825 for details.
+	labelsCopy := labels.Clone()
+	// Sort labels in alphabetical order of their names.
+	labelsCopy.Sort()
 	// Reduce memory usage by interning all the strings in labels.
-	internLabelStrings(labels)
+	labelsCopy.InternStrings()
+
 	sw := &ScrapeWork{
 		ScrapeURL:            scrapeURL,
 		ScrapeInterval:       scrapeInterval,
@@ -1324,7 +1315,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		HonorTimestamps:      swc.honorTimestamps,
 		DenyRedirects:        swc.denyRedirects,
 		OriginalLabels:       originalLabels,
-		Labels:               labels,
+		Labels:               labelsCopy,
 		ExternalLabels:       swc.externalLabels,
 		ProxyURL:             swc.proxyURL,
 		ProxyAuthConfig:      swc.proxyAuthConfig,
@@ -1337,6 +1328,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		ScrapeAlignInterval:  swc.scrapeAlignInterval,
 		ScrapeOffset:         swc.scrapeOffset,
 		SeriesLimit:          seriesLimit,
+		NoStaleMarkers:       swc.noStaleMarkers,
 		AuthToken:            at,
 
 		jobNameOriginal: swc.jobName,
@@ -1344,19 +1336,26 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 	return sw, nil
 }
 
-func internLabelStrings(labels []prompbmarshal.Label) {
-	for i := range labels {
-		label := &labels[i]
-		label.Name = bytesutil.InternString(label.Name)
-		label.Value = bytesutil.InternString(label.Value)
-	}
+func getScrapeURL(scheme, address, metricsPath, optionalQuestion, paramsStr string) string {
+	bb := bbPool.Get()
+	b := bb.B[:0]
+	b = append(b, scheme...)
+	b = append(b, "://"...)
+	b = append(b, address...)
+	b = append(b, metricsPath...)
+	b = append(b, optionalQuestion...)
+	b = append(b, paramsStr...)
+	s := bytesutil.ToUnsafeString(b)
+	s = bytesutil.InternString(s)
+	bb.B = b
+	bbPool.Put(bb)
+	return s
 }
 
-func getParamsFromLabels(labels []prompbmarshal.Label, paramsOrig map[string][]string) map[string][]string {
+func getParamsFromLabels(labels *promutils.Labels, paramsOrig map[string][]string) map[string][]string {
 	// See https://www.robustperception.io/life-of-a-label
-	m := make(map[string][]string)
-	for i := range labels {
-		label := &labels[i]
+	var m map[string][]string
+	for _, label := range labels.GetLabels() {
 		if !strings.HasPrefix(label.Name, "__param_") {
 			continue
 		}
@@ -1365,79 +1364,36 @@ func getParamsFromLabels(labels []prompbmarshal.Label, paramsOrig map[string][]s
 		if p := paramsOrig[name]; len(p) > 1 {
 			values = append(values, p[1:]...)
 		}
+		if m == nil {
+			m = make(map[string][]string)
+		}
 		m[name] = values
 	}
 	return m
 }
 
-func mergeLabels(dst []prompbmarshal.Label, swc *scrapeWorkConfig, target string, extraLabels, metaLabels map[string]string) []prompbmarshal.Label {
-	if len(dst) > 0 {
-		logger.Panicf("BUG: len(dst) must be 0; got %d", len(dst))
+func mergeLabels(dst *promutils.Labels, swc *scrapeWorkConfig, target string, extraLabels, metaLabels *promutils.Labels) {
+	if n := dst.Len(); n > 0 {
+		logger.Panicf("BUG: len(dst.Labels) must be 0; got %d", n)
 	}
 	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
-	dst = appendLabel(dst, "job", swc.jobName)
-	dst = appendLabel(dst, "__address__", target)
-	dst = appendLabel(dst, "__scheme__", swc.scheme)
-	dst = appendLabel(dst, "__metrics_path__", swc.metricsPath)
-	dst = appendLabel(dst, "__scrape_interval__", swc.scrapeIntervalString)
-	dst = appendLabel(dst, "__scrape_timeout__", swc.scrapeTimeoutString)
+	dst.Add("job", swc.jobName)
+	dst.Add("__address__", target)
+	dst.Add("__scheme__", swc.scheme)
+	dst.Add("__metrics_path__", swc.metricsPath)
+	dst.Add("__scrape_interval__", swc.scrapeIntervalString)
+	dst.Add("__scrape_timeout__", swc.scrapeTimeoutString)
 	for k, args := range swc.params {
 		if len(args) == 0 {
 			continue
 		}
 		k = "__param_" + k
 		v := args[0]
-		dst = appendLabel(dst, k, v)
+		dst.Add(k, v)
 	}
-	for k, v := range extraLabels {
-		dst = appendLabel(dst, k, v)
-	}
-	for k, v := range metaLabels {
-		dst = appendLabel(dst, k, v)
-	}
-	if len(dst) < 2 {
-		return dst
-	}
-	// Remove duplicate labels if any.
-	// Stable sorting is needed in order to preserve the order for labels with identical names.
-	// This is needed in order to remove labels with duplicate names other than the last one.
-	promrelabel.SortLabelsStable(dst)
-	prevName := dst[0].Name
-	hasDuplicateLabels := false
-	for _, label := range dst[1:] {
-		if label.Name == prevName {
-			hasDuplicateLabels = true
-			break
-		}
-		prevName = label.Name
-	}
-	if !hasDuplicateLabels {
-		return dst
-	}
-	prevName = dst[0].Name
-	tmp := dst[:1]
-	for _, label := range dst[1:] {
-		if label.Name == prevName {
-			tmp[len(tmp)-1] = label
-		} else {
-			tmp = append(tmp, label)
-			prevName = label.Name
-		}
-	}
-	tail := dst[len(tmp):]
-	for i := range tail {
-		label := &tail[i]
-		label.Name = ""
-		label.Value = ""
-	}
-	return tmp
-}
-
-func appendLabel(dst []prompbmarshal.Label, name, value string) []prompbmarshal.Label {
-	return append(dst, prompbmarshal.Label{
-		Name:  name,
-		Value: value,
-	})
+	dst.AddFrom(extraLabels)
+	dst.AddFrom(metaLabels)
+	dst.RemoveDuplicates()
 }
 
 const (

@@ -1,6 +1,7 @@
 package workingsetcache
 
 import (
+	"flag"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,14 +11,19 @@ import (
 	"github.com/VictoriaMetrics/fastcache"
 )
 
+var (
+	prevCacheRemovalPercent = flag.Float64("prevCacheRemovalPercent", 0.1, "Items in the previous caches are removed when the percent of requests it serves "+
+		"becomes lower than this value. Higher values reduce memory usage at the cost of higher CPU usage. See also -cacheExpireDuration")
+	cacheExpireDuration = flag.Duration("cacheExpireDuration", 30*time.Minute, "Items are removed from in-memory caches after they aren't accessed for this duration. "+
+		"Lower values may reduce memory usage at the cost of higher CPU usage. See also -prevCacheRemovalPercent")
+)
+
 // Cache modes.
 const (
 	split     = 0
 	switching = 1
 	whole     = 2
 )
-
-const defaultExpireDuration = 10 * time.Minute
 
 // Cache is a cache for working set entries.
 //
@@ -27,8 +33,8 @@ type Cache struct {
 	curr atomic.Value
 	prev atomic.Value
 
-	// cs holds cache stats
-	cs fastcache.Stats
+	// csHistory holds cache stats history
+	csHistory fastcache.Stats
 
 	// mode indicates whether to use only curr and skip prev.
 	//
@@ -42,7 +48,7 @@ type Cache struct {
 	maxBytes int
 
 	// mu serializes access to curr, prev and mode
-	// in expirationWatcher and cacheSizeWatcher.
+	// in expirationWatcher, prevCacheWatcher and cacheSizeWatcher.
 	mu sync.Mutex
 
 	wg     sync.WaitGroup
@@ -54,14 +60,10 @@ type Cache struct {
 //
 // Stop must be called on the returned cache when it is no longer needed.
 func Load(filePath string, maxBytes int) *Cache {
-	return LoadWithExpire(filePath, maxBytes, defaultExpireDuration)
+	return loadWithExpire(filePath, maxBytes, *cacheExpireDuration)
 }
 
-// LoadWithExpire loads the cache from filePath and limits its size to maxBytes
-// and evicts inactive entires after expireDuration.
-//
-// Stop must be called on the returned cache when it is no longer needed.
-func LoadWithExpire(filePath string, maxBytes int, expireDuration time.Duration) *Cache {
+func loadWithExpire(filePath string, maxBytes int, expireDuration time.Duration) *Cache {
 	curr := fastcache.LoadFromFileOrNew(filePath, maxBytes)
 	var cs fastcache.Stats
 	curr.UpdateStats(&cs)
@@ -90,14 +92,10 @@ func LoadWithExpire(filePath string, maxBytes int, expireDuration time.Duration)
 //
 // Stop must be called on the returned cache when it is no longer needed.
 func New(maxBytes int) *Cache {
-	return NewWithExpire(maxBytes, defaultExpireDuration)
+	return newWithExpire(maxBytes, *cacheExpireDuration)
 }
 
-// NewWithExpire creates new cache with the given maxBytes capacity and the given expireDuration
-// for inactive entries.
-//
-// Stop must be called on the returned cache when it is no longer needed.
-func NewWithExpire(maxBytes int, expireDuration time.Duration) *Cache {
+func newWithExpire(maxBytes int, expireDuration time.Duration) *Cache {
 	curr := fastcache.New(maxBytes / 2)
 	prev := fastcache.New(1024)
 	c := newCacheInternal(curr, prev, split, maxBytes)
@@ -124,20 +122,25 @@ func (c *Cache) runWatchers(expireDuration time.Duration) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		c.prevCacheWatcher()
+	}()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
 		c.cacheSizeWatcher()
 	}()
 }
 
 func (c *Cache) expirationWatcher(expireDuration time.Duration) {
-	t := time.NewTicker(expireDuration / 2)
+	expireDuration += timeJitter(expireDuration / 10)
+	t := time.NewTicker(expireDuration)
+	defer t.Stop()
 	for {
 		select {
 		case <-c.stopCh:
-			t.Stop()
 			return
 		case <-t.C:
 		}
-
 		c.mu.Lock()
 		if atomic.LoadUint32(&c.mode) != split {
 			// Stop the expirationWatcher on non-split mode.
@@ -148,14 +151,74 @@ func (c *Cache) expirationWatcher(expireDuration time.Duration) {
 		prev := c.prev.Load().(*fastcache.Cache)
 		curr := c.curr.Load().(*fastcache.Cache)
 		c.prev.Store(curr)
+		var cs fastcache.Stats
+		prev.UpdateStats(&cs)
+		updateCacheStatsHistory(&c.csHistory, &cs)
 		prev.Reset()
 		c.curr.Store(prev)
 		c.mu.Unlock()
 	}
 }
 
+func (c *Cache) prevCacheWatcher() {
+	p := *prevCacheRemovalPercent / 100
+	if p <= 0 {
+		// There is no need in removing the previous cache.
+		return
+	}
+	minCurrRequests := uint64(1 / p)
+
+	// Watch for the usage of the prev cache and drop it whenever it receives
+	// less than prevCacheRemovalPercent requests comparing to the curr cache during the last 60 seconds.
+	checkInterval := 60 * time.Second
+	checkInterval += timeJitter(checkInterval / 10)
+	t := time.NewTicker(checkInterval)
+	defer t.Stop()
+	prevGetCalls := uint64(0)
+	currGetCalls := uint64(0)
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-t.C:
+		}
+		c.mu.Lock()
+		if atomic.LoadUint32(&c.mode) != split {
+			// Do nothing in non-split mode.
+			c.mu.Unlock()
+			return
+		}
+		prev := c.prev.Load().(*fastcache.Cache)
+		curr := c.curr.Load().(*fastcache.Cache)
+		var csCurr, csPrev fastcache.Stats
+		curr.UpdateStats(&csCurr)
+		prev.UpdateStats(&csPrev)
+		currRequests := csCurr.GetCalls
+		if currRequests >= currGetCalls {
+			currRequests -= currGetCalls
+		}
+		prevRequests := csPrev.GetCalls
+		if prevRequests >= prevGetCalls {
+			prevRequests -= prevGetCalls
+		}
+		currGetCalls = csCurr.GetCalls
+		prevGetCalls = csPrev.GetCalls
+		if currRequests >= minCurrRequests && float64(prevRequests)/float64(currRequests) < p {
+			// The majority of requests are served from the curr cache,
+			// so the prev cache can be deleted in order to free up memory.
+			if csPrev.EntriesCount > 0 {
+				updateCacheStatsHistory(&c.csHistory, &csPrev)
+				prev.Reset()
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
 func (c *Cache) cacheSizeWatcher() {
-	t := time.NewTicker(1500 * time.Millisecond)
+	checkInterval := 1500 * time.Millisecond
+	checkInterval += timeJitter(checkInterval / 10)
+	t := time.NewTicker(checkInterval)
 	defer t.Stop()
 
 	var maxBytesSize uint64
@@ -194,6 +257,9 @@ func (c *Cache) cacheSizeWatcher() {
 	prev := c.prev.Load().(*fastcache.Cache)
 	curr := c.curr.Load().(*fastcache.Cache)
 	c.prev.Store(curr)
+	var cs fastcache.Stats
+	prev.UpdateStats(&cs)
+	updateCacheStatsHistory(&c.csHistory, &cs)
 	prev.Reset()
 	// use c.maxBytes instead of maxBytesSize*2 for creating new cache, since otherwise the created cache
 	// couldn't be loaded from file with c.maxBytes limit after saving with maxBytesSize*2 limit.
@@ -218,6 +284,9 @@ func (c *Cache) cacheSizeWatcher() {
 	c.setMode(whole)
 	prev = c.prev.Load().(*fastcache.Cache)
 	c.prev.Store(fastcache.New(1024))
+	cs.Reset()
+	prev.UpdateStats(&cs)
+	updateCacheStatsHistory(&c.csHistory, &cs)
 	prev.Reset()
 	c.mu.Unlock()
 }
@@ -241,9 +310,13 @@ func (c *Cache) Stop() {
 
 // Reset resets the cache.
 func (c *Cache) Reset() {
+	var cs fastcache.Stats
 	prev := c.prev.Load().(*fastcache.Cache)
+	prev.UpdateStats(&cs)
 	prev.Reset()
 	curr := c.curr.Load().(*fastcache.Cache)
+	curr.UpdateStats(&cs)
+	updateCacheStatsHistory(&c.csHistory, &cs)
 	curr.Reset()
 	// Reset the mode to `split` in the hope the working set size becomes smaller after the reset.
 	c.setMode(split)
@@ -259,30 +332,43 @@ func (c *Cache) loadMode() int {
 
 // UpdateStats updates fcs with cache stats.
 func (c *Cache) UpdateStats(fcs *fastcache.Stats) {
+	updateCacheStatsHistory(fcs, &c.csHistory)
+
 	var cs fastcache.Stats
 	curr := c.curr.Load().(*fastcache.Cache)
 	curr.UpdateStats(&cs)
-	fcs.Collisions += cs.Collisions
-	fcs.Corruptions += cs.Corruptions
-	fcs.EntriesCount += cs.EntriesCount
-	fcs.BytesSize += cs.BytesSize
-	fcs.MaxBytesSize += cs.MaxBytesSize
-
-	fcs.GetCalls += atomic.LoadUint64(&c.cs.GetCalls)
-	fcs.SetCalls += atomic.LoadUint64(&c.cs.SetCalls)
-	fcs.Misses += atomic.LoadUint64(&c.cs.Misses)
+	updateCacheStats(fcs, &cs)
 
 	prev := c.prev.Load().(*fastcache.Cache)
 	cs.Reset()
 	prev.UpdateStats(&cs)
-	fcs.EntriesCount += cs.EntriesCount
-	fcs.BytesSize += cs.BytesSize
-	fcs.MaxBytesSize += cs.MaxBytesSize
+	updateCacheStats(fcs, &cs)
+}
+
+func updateCacheStats(dst, src *fastcache.Stats) {
+	dst.GetCalls += src.GetCalls
+	dst.SetCalls += src.SetCalls
+	dst.Misses += src.Misses
+	dst.Collisions += src.Collisions
+	dst.Corruptions += src.Corruptions
+	dst.EntriesCount += src.EntriesCount
+	dst.BytesSize += src.BytesSize
+	dst.MaxBytesSize += src.MaxBytesSize
+}
+
+func updateCacheStatsHistory(dst, src *fastcache.Stats) {
+	atomic.AddUint64(&dst.GetCalls, atomic.LoadUint64(&src.GetCalls))
+	atomic.AddUint64(&dst.SetCalls, atomic.LoadUint64(&src.SetCalls))
+	atomic.AddUint64(&dst.Misses, atomic.LoadUint64(&src.Misses))
+	atomic.AddUint64(&dst.Collisions, atomic.LoadUint64(&src.Collisions))
+	atomic.AddUint64(&dst.Corruptions, atomic.LoadUint64(&src.Corruptions))
+
+	// Do not add EntriesCount, BytesSize and MaxBytesSize, since these metrics
+	// are calculated from c.curr and c.prev caches.
 }
 
 // Get appends the found value for the given key to dst and returns the result.
 func (c *Cache) Get(dst, key []byte) []byte {
-	atomic.AddUint64(&c.cs.GetCalls, 1)
 	curr := c.curr.Load().(*fastcache.Cache)
 	result := curr.Get(dst, key)
 	if len(result) > len(dst) {
@@ -291,7 +377,6 @@ func (c *Cache) Get(dst, key []byte) []byte {
 	}
 	if c.loadMode() == whole {
 		// Nothing found.
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return result
 	}
 
@@ -300,7 +385,6 @@ func (c *Cache) Get(dst, key []byte) []byte {
 	result = prev.Get(dst, key)
 	if len(result) <= len(dst) {
 		// Nothing found.
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return result
 	}
 	// Cache the found entry in the current cache.
@@ -310,18 +394,15 @@ func (c *Cache) Get(dst, key []byte) []byte {
 
 // Has verifies whether the cache contains the given key.
 func (c *Cache) Has(key []byte) bool {
-	atomic.AddUint64(&c.cs.GetCalls, 1)
 	curr := c.curr.Load().(*fastcache.Cache)
 	if curr.Has(key) {
 		return true
 	}
 	if c.loadMode() == whole {
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return false
 	}
 	prev := c.prev.Load().(*fastcache.Cache)
 	if !prev.Has(key) {
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return false
 	}
 	// Cache the found entry in the current cache.
@@ -336,14 +417,12 @@ var tmpBufPool bytesutil.ByteBufferPool
 
 // Set sets the given value for the given key.
 func (c *Cache) Set(key, value []byte) {
-	atomic.AddUint64(&c.cs.SetCalls, 1)
 	curr := c.curr.Load().(*fastcache.Cache)
 	curr.Set(key, value)
 }
 
 // GetBig appends the found value for the given key to dst and returns the result.
 func (c *Cache) GetBig(dst, key []byte) []byte {
-	atomic.AddUint64(&c.cs.GetCalls, 1)
 	curr := c.curr.Load().(*fastcache.Cache)
 	result := curr.GetBig(dst, key)
 	if len(result) > len(dst) {
@@ -352,7 +431,6 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 	}
 	if c.loadMode() == whole {
 		// Nothing found.
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return result
 	}
 
@@ -361,7 +439,6 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 	result = prev.GetBig(dst, key)
 	if len(result) <= len(dst) {
 		// Nothing found.
-		atomic.AddUint64(&c.cs.Misses, 1)
 		return result
 	}
 	// Cache the found entry in the current cache.
@@ -371,7 +448,11 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 
 // SetBig sets the given value for the given key.
 func (c *Cache) SetBig(key, value []byte) {
-	atomic.AddUint64(&c.cs.SetCalls, 1)
 	curr := c.curr.Load().(*fastcache.Cache)
 	curr.SetBig(key, value)
+}
+
+func timeJitter(d time.Duration) time.Duration {
+	n := float64(time.Now().UnixNano()%1e9) / 1e9
+	return time.Duration(float64(d) * n)
 }

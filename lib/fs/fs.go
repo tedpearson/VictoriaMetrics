@@ -29,11 +29,14 @@ func MustSyncPath(path string) {
 //
 // WriteFileAtomically returns only after the file is fully written and synced
 // to the underlying storage.
-func WriteFileAtomically(path string, data []byte) error {
+//
+// If the file at path already exists, then the file is overwritten atomically if canOverwrite is true.
+// Otherwise error is returned.
+func WriteFileAtomically(path string, data []byte, canOverwrite bool) error {
 	// Check for the existing file. It is expected that
 	// the WriteFileAtomically function cannot be called concurrently
 	// with the same `path`.
-	if IsPathExist(path) {
+	if IsPathExist(path) && !canOverwrite {
 		return fmt.Errorf("cannot create file %q, since it already exists", path)
 	}
 
@@ -316,7 +319,7 @@ func CopyDirectory(srcPath, dstPath string) error {
 		}
 		src := filepath.Join(srcPath, de.Name())
 		dst := filepath.Join(dstPath, de.Name())
-		if err := copyFile(src, dst); err != nil {
+		if err := CopyFile(src, dst); err != nil {
 			return err
 		}
 	}
@@ -324,7 +327,8 @@ func CopyDirectory(srcPath, dstPath string) error {
 	return nil
 }
 
-func copyFile(srcPath, dstPath string) error {
+// CopyFile copies the file from srcPath to dstPath.
+func CopyFile(srcPath, dstPath string) error {
 	src, err := os.Open(srcPath)
 	if err != nil {
 		return err

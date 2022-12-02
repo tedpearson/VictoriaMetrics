@@ -4,18 +4,24 @@ sort: 10
 
 ## vmbackupmanager
 
-***vmbackupmanager is a part of [enterprise package](https://victoriametrics.com/products/enterprise/). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)***
+***vmbackupmanager is a part of [enterprise package](https://docs.victoriametrics.com/enterprise.html). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)***
 
-The VictoriaMetrics backup manager automates regular backup procedures. It supports the following backup intervals: **hourly**, **daily**, **weekly** and **monthly**. Multiple backup intervals may be configured simultaneously. I.e. the backup manager creates hourly backups every hour, while it creates daily backups every day, etc. Backup manager must have read access to the storage data, so best practice is to install it on the same machine (or as a sidecar) where the storage node is installed.
-The backup service makes a backup every hour and puts it to the latest folder and then copies data to the folders which represent the backup intervals (hourly, daily, weekly and monthly)
+The VictoriaMetrics backup manager automates regular backup procedures. It supports the following backup intervals: **hourly**, **daily**, **weekly** and **monthly**.
+Multiple backup intervals may be configured simultaneously. I.e. the backup manager creates hourly backups every hour, while it creates daily backups every day, etc.
+Backup manager must have read access to the storage data, so best practice is to install it on the same machine (or as a sidecar) where the storage node is installed.
+The backup service makes a backup every hour and puts it to the latest folder and then copies data to the folders
+which represent the backup intervals (hourly, daily, weekly and monthly)
 
 The required flags for running the service are as follows:
 
-* -eula - should be true and means that you have the legal right to run a backup manager. That can either be a signed contract or an email with confirmation to run the service in a trial period
-* -storageDataPath - path to VictoriaMetrics or vmstorage data path to make backup from
+* -eula - should be true and means that you have the legal right to run a backup manager. That can either be a signed contract or an email
+  with confirmation to run the service in a trial period.
+* -storageDataPath - path to VictoriaMetrics or vmstorage data path to make backup from.
 * -snapshot.createURL - VictoriaMetrics creates snapshot URL which will automatically be created during backup. Example: <http://victoriametrics:8428/snapshot/create>
-* -dst - backup destination at s3, gcs or local filesystem
-* -credsFilePath - path to file with GCS or S3 credentials. Credentials are loaded from default locations if not set. See [https://cloud.google.com/iam/docs/creating-managing-service-account-keys](https://cloud.google.com/iam/docs/creating-managing-service-account-keys) and [https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html](https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html)
+* -dst - backup destination at [the supported storage types](https://docs.victoriametrics.com/vmbackup.html#supported-storage-types).
+* -credsFilePath - path to file with GCS or S3 credentials. Credentials are loaded from default locations if not set.
+  See [https://cloud.google.com/iam/docs/creating-managing-service-account-keys](https://cloud.google.com/iam/docs/creating-managing-service-account-keys)
+  and [https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html](https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html).
 
 Backup schedule is controlled by the following flags:
 
@@ -40,7 +46,11 @@ To get the full list of supported flags please run the following command:
 ./vmbackupmanager --help
 ```
 
-The service creates a **full** backup each run. This means that the system can be restored fully from any particular backup using vmrestore. Backup manager uploads only the data that has been changed or created since the most recent backup (incremental backup).
+The service creates a **full** backup each run. This means that the system can be restored fully
+from any particular backup using [vmrestore](https://docs.victoriametrics.com/vmrestore.html).
+Backup manager uploads only the data that has been changed or created since the most recent backup (incremental backup).
+This reduces the consumed network traffic and the time needed for performing the backup.
+See [this article](https://medium.com/@valyala/speeding-up-backups-for-big-time-series-databases-533c1a927883) for details.
 
 *Please take into account that the first backup upload could take a significant amount of time as it needs to upload all of the data.*
 
@@ -51,7 +61,7 @@ There are two flags which could help with performance tuning:
 
 ## Example of Usage
 
-GCS and cluster version. You need to have a credentials file in json format with following structure
+GCS and cluster version. You need to have a credentials file in json format with following structure:
 
 credentials.json
 
@@ -145,6 +155,142 @@ The result on the GCS bucket. We see only 3 daily backups:
 ![daily](vmbackupmanager_rp_daily_2.png)
 
 
+## API methods
+
+`vmbackupmanager` exposes the following API methods:
+
+* GET `/api/v1/backups` - returns list of backups in remote storage.
+  Example output:
+  ```json
+  ["daily/2022-10-06","daily/2022-10-10","hourly/2022-10-04:13","hourly/2022-10-06:12","hourly/2022-10-06:13","hourly/2022-10-10:14","hourly/2022-10-10:16","monthly/2022-10","weekly/2022-40","weekly/2022-41"]
+  ```
+
+* POST `/api/v1/restore` - saves backup name to restore when [performing restore](#restore-commands).
+  Example request body:
+  ```json
+  {"backup":"daily/2022-10-06"}
+  ```
+
+* GET `/api/v1/restore` - returns backup name from restore mark if it exists.
+  Example response:
+  ```json
+  {"backup":"daily/2022-10-06"}
+  ```
+
+* DELETE `/api/v1/restore` - delete restore mark.
+
+## CLI
+
+`vmbackupmanager` exposes CLI commands to work with [API methods](#api-methods) without external dependencies.
+
+Supported commands:
+```console
+vmbackupmanager backup 
+
+  vmbackupmanager backup list 
+    List backups in remote storage
+
+vmbackupmanager restore 
+  Restore backup specified by restore mark if it exists
+
+  vmbackupmanager restore get 
+    Get restore mark if it exists
+
+  vmbackupmanager restore delete 
+    Delete restore mark if it exists
+
+  vmbackupmanager restore create [backup_name]
+    Create restore mark
+```
+
+By default, CLI commands are using `http://127.0.0.1:8300` endpoint to reach `vmbackupmanager` API.
+It can be changed by using flag:
+```
+-apiURL string
+      vmbackupmanager address to perform API requests (default "http://127.0.0.1:8300")
+```
+
+### Backup commands
+
+`vmbackupmanager backup list` lists backups in remote storage:
+```console
+$ ./vmbackupmanager backup list
+["daily/2022-10-06","daily/2022-10-10","hourly/2022-10-04:13","hourly/2022-10-06:12","hourly/2022-10-06:13","hourly/2022-10-10:14","hourly/2022-10-10:16","monthly/2022-10","weekly/2022-40","weekly/2022-41"]
+```
+
+### Restore commands
+
+Restore commands are used to create, get and delete restore mark.
+Restore mark is used by `vmbackupmanager` to store backup name to restore when running restore.
+
+
+Create restore mark:
+```console
+$ ./vmbackupmanager restore create daily/2022-10-06
+```
+
+Get restore mark if it exists:
+```console
+$ ./vmbackupmanager restore get
+{"backup":"daily/2022-10-06"}
+```
+
+Delete restore mark if it exists:
+```console
+$ ./vmbackupmanager restore delete
+```
+
+Perform restore:
+```console
+$ /vmbackupmanager-prod restore -dst=gs://vmstorage-data/$NODE_IP -credsFilePath=credentials.json -storageDataPath=/vmstorage-data
+```
+Note that `vmsingle` or `vmstorage` should be stopped before performing restore.
+
+If restore mark doesn't exist at `storageDataPath`(restore wasn't requested) `vmbackupmanager restore` will exit with successful status code.
+
+### How to restore backup via CLI
+
+1. Run `vmbackupmanager backup list` to get list of available backups:
+  ```console
+  $ /vmbackupmanager-prod backup list
+  ["daily/2022-10-06","daily/2022-10-10","hourly/2022-10-04:13","hourly/2022-10-06:12","hourly/2022-10-06:13","hourly/2022-10-10:14","hourly/2022-10-10:16","monthly/2022-10","weekly/2022-40","weekly/2022-41"]
+  ```
+2. Run `vmbackupmanager restore create` to create restore mark:
+   - Use relative path to backup to restore from currently used remote storage:
+     ```console
+     $ /vmbackupmanager-prod restore create daily/2022-10-06
+     ```
+   - Use full path to backup to restore from any remote storage:
+     ```console
+     $ /vmbackupmanager-prod restore create azblob://test1/vmbackupmanager/daily/2022-10-06
+     ```
+3. Stop `vmstorage` or `vmsingle` node
+4. Run `vmbackupmanager restore` to restore backup:
+  ```console
+  $ /vmbackupmanager-prod restore -credsFilePath=credentials.json -storageDataPath=/vmstorage-data
+  ```
+5. Start `vmstorage` or `vmsingle` node
+
+
+### How to restore in Kubernetes
+
+1. Enter container running `vmbackupmanager`
+2. Use `vmbackupmanager backup list` to get list of available backups:
+  ```console
+  $ /vmbackupmanager-prod backup list
+  ["daily/2022-10-06","daily/2022-10-10","hourly/2022-10-04:13","hourly/2022-10-06:12","hourly/2022-10-06:13","hourly/2022-10-10:14","hourly/2022-10-10:16","monthly/2022-10","weekly/2022-40","weekly/2022-41"]
+  ```
+3. Use `vmbackupmanager restore create` to create restore mark:
+  - Use relative path to backup to restore from currently used remote storage:
+    ```console
+    $ /vmbackupmanager-prod restore create daily/2022-10-06
+    ```
+  - Use full path to backup to restore from any remote storage:
+    ```console
+    $ /vmbackupmanager-prod restore create azblob://test1/vmbackupmanager/daily/2022-10-06
+    ```
+4. Restart pod
+
 ## Configuration
 
 ### Flags
@@ -157,6 +303,13 @@ The shortlist of configuration flags is the following:
 ```
 vmbackupmanager performs regular backups according to the provided configs.
 
+subcommands:
+ backup: provides auxiliary backup-related commands
+ restore: restores backup specified by restore mark if it exists
+
+command-line flags:
+  -apiURL string
+     vmbackupmanager address to perform API requests (default "http://127.0.0.1:8300")
   -concurrency int
      The number of concurrent workers. Higher concurrency may reduce backup duration (default 10)
   -configFilePath string
@@ -186,7 +339,7 @@ vmbackupmanager performs regular backups according to the provided configs.
   -envflag.prefix string
      Prefix for environment variables if -envflag.enable is set
   -eula
-     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in enterprise version of VictoriaMetrics
+     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
   -flagsAuthKey string
      Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
   -fs.disableMmap

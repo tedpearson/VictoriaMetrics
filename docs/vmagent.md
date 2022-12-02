@@ -321,7 +321,8 @@ Extra labels can be added to metrics collected by `vmagent` via the following me
 
 ## Automatically generated metrics
 
-`vmagent` automatically generates the following metrics per each scrape of every [Prometheus-compatible target](#how-to-collect-metrics-in-prometheus-format):
+`vmagent` automatically generates the following metrics per each scrape of every [Prometheus-compatible target](#how-to-collect-metrics-in-prometheus-format)
+and attaches target-specific `instance` and `job` labels to these metrics:
 
 * `up` - this metric exposes `1` value on successful scrape and `0` value on unsuccessful scrape. This allows monitoring
   failing scrapes with the following [MetricsQL query](https://docs.victoriametrics.com/MetricsQL.html):
@@ -386,7 +387,7 @@ Extra labels can be added to metrics collected by `vmagent` via the following me
   ```
 
   `vmagent` sets `scrape_series_added` to zero when it runs with `-promscrape.noStaleMarkers` command-line option
-  (e.g. when [staleness markers](#prometheus-staleness-markers) are disabled).
+  or when it scrapes target with `no_stale_markers: true` option, e.g. when [staleness markers](#prometheus-staleness-markers) are disabled.
 
 * `scrape_series_limit` - the limit on the number of unique time series the given target can expose according to [these docs](#cardinality-limiter).
   This metric is exposed only if the series limit is set.
@@ -408,6 +409,9 @@ Extra labels can be added to metrics collected by `vmagent` via the following me
   ```metricsql
   sum_over_time(scrape_series_limit_samples_dropped[1h]) > 0
   ```
+
+If the target exports metrics with names clashing with the automatically generated metric names, then `vmagent` automatically
+adds `exported_` prefix to these metric names, so they don't clash with automatically generated metric names.
 
 
 ## Relabeling
@@ -549,7 +553,7 @@ The following articles contain useful information about Prometheus relabeling:
 
   * `keep_metrics`: keeps all the metrics with names matching the given `regex`,
     while dropping all the other metrics. For example, the following relabeling config keeps metrics
-    with `fo` and `bar` names, while dropping all the other metrics:
+    with `foo` and `bar` names, while dropping all the other metrics:
 
     ```yaml
     - action: keep_metrics
@@ -608,9 +612,13 @@ Additionally, the `action: graphite` relabeling rules usually work much faster t
 * If the scrape target is removed from the list of targets, then stale markers are sent for all the metrics scraped from this target.
 
 Prometheus staleness markers' tracking needs additional memory, since it must store the previous response body per each scrape target
-in order to compare it to the current response body. The memory usage may be reduced by passing `-promscrape.noStaleMarkers`
-command-line flag to `vmagent`. This disables staleness tracking. This also disables tracking the number of new time series
-per each scrape with the auto-generated `scrape_series_added` metric. See [these docs](#automatically-generated-metrics) for details.
+in order to compare it to the current response body. The memory usage may be reduced by disabling staleness tracking in the following ways:
+
+* By passing `-promscrape.noStaleMarkers` command-line flag to `vmagent`. This disables staleness tracking across all the targets.
+* By specifying `no_stale_markers: true` option in the [scrape_config](https://docs.victoriametrics.com/sd_configs.html#scrape_configs) for the corresponding target.
+
+When staleness tracking is disabled, then `vmagent` doesn't track the number of new time series per each scrape,
+e.g. it sets `scrape_series_added` metric to zero. See [these docs](#automatically-generated-metrics) for details.
 
 ## Stream parsing mode
 
@@ -908,7 +916,7 @@ See also [troubleshooting docs](https://docs.victoriametrics.com/Troubleshooting
 
 ## Kafka integration
 
-[Enterprise version](https://victoriametrics.com/products/enterprise/) of `vmagent` can read and write metrics from / to Kafka:
+[Enterprise version](https://docs.victoriametrics.com/enterprise.html) of `vmagent` can read and write metrics from / to Kafka:
 
 * [Reading metrics from Kafka](#reading-metrics-from-kafka)
 * [Writing metrics to Kafka](#writing-metrics-to-kafka)
@@ -918,7 +926,7 @@ in `vmutils-...-enteprise.tar.gz` archives and in [docker images](https://hub.do
 
 ### Reading metrics from Kafka
 
-[Enterprise version](https://victoriametrics.com/products/enterprise/) of `vmagent` can read metrics in various formats from Kafka messages.
+[Enterprise version](https://docs.victoriametrics.com/enterprise.html) of `vmagent` can read metrics in various formats from Kafka messages.
 These formats can be configured with `-kafka.consumer.topic.defaultFormat` or `-kafka.consumer.topic.format` command-line options. The following formats are supported:
 
 * `promremotewrite` - [Prometheus remote_write](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write).
@@ -960,7 +968,7 @@ data_format = "influx"
 
 #### Command-line flags for Kafka consumer
 
-These command-line flags are available only in [enterprise](https://victoriametrics.com/products/enterprise/) version of `vmagent`,
+These command-line flags are available only in [enterprise](https://docs.victoriametrics.com/enterprise.html) version of `vmagent`,
 which can be downloaded for evaluation from [releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases) page
 (see `vmutils-...-enteprise.tar.gz` archives) and from [docker images](https://hub.docker.com/r/victoriametrics/vmagent/tags) with tags containing `enterprise` suffix.
 
@@ -995,7 +1003,7 @@ which can be downloaded for evaluation from [releases](https://github.com/Victor
 
 ### Writing metrics to Kafka
 
-[Enterprise version](https://victoriametrics.com/products/enterprise/) of `vmagent` writes data to Kafka with `at-least-once`
+[Enterprise version](https://docs.victoriametrics.com/enterprise.html) of `vmagent` writes data to Kafka with `at-least-once`
 semantics if `-remoteWrite.url` contains e.g. Kafka url. For example, if `vmagent` is started with `-remoteWrite.url=kafka://localhost:9092/?topic=prom-rw`,
 then it would send Prometheus remote_write messages to Kafka bootstrap server at `localhost:9092` with the topic `prom-rw`.
 These messages can be read later from Kafka by another `vmagent` - see [these docs](#reading-metrics-from-kafka) for details.
@@ -1027,7 +1035,7 @@ It may be needed to build `vmagent` from source code when developing or testing 
 
 ### Development build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.19.1.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.19.3.
 2. Run `make vmagent` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics).
    It builds the `vmagent` binary and puts it into the `bin` folder.
 
@@ -1056,7 +1064,7 @@ ARM build may run on Raspberry Pi or on [energy-efficient ARM servers](https://b
 
 ### Development ARM build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.19.1.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.19.3.
 2. Run `make vmagent-linux-arm` or `make vmagent-linux-arm64` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics)
    It builds `vmagent-linux-arm` or `vmagent-linux-arm64` binary respectively and puts it into the `bin` folder.
 
@@ -1107,6 +1115,8 @@ vmagent collects metrics data via popular data ingestion protocols and routes th
 
 See the docs at https://docs.victoriametrics.com/vmagent.html .
 
+  -cacheExpireDuration duration
+     Items are removed from in-memory caches after they aren't accessed for this duration. Lower values may reduce memory usage at the cost of higher CPU usage. See also -prevCacheRemovalPercent (default 30m0s)
   -configAuthKey string
      Authorization key for accessing /config page. It must be passed via authKey query arg
   -csvTrimTimestamp duration
@@ -1127,7 +1137,7 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -envflag.prefix string
      Prefix for environment variables if -envflag.enable is set
   -eula
-     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in enterprise version of VictoriaMetrics
+     By specifying this flag, you confirm that you have an enterprise license and accept the EULA https://victoriametrics.com/assets/VM_EULA.pdf . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
   -flagsAuthKey string
      Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
   -fs.disableMmap
@@ -1178,30 +1188,30 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -insert.maxQueueDuration duration
      The maximum duration for waiting in the queue for insert requests due to -maxConcurrentInserts (default 1m0s)
   -kafka.consumer.topic array
-     Kafka topic names for data consumption. This flag is available only in enterprise version of VictoriaMetrics
+     Kafka topic names for data consumption. This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.basicAuth.password array
-     Optional basic auth password for -kafka.consumer.topic. Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . This flag is available only in enterprise version of VictoriaMetrics
+     Optional basic auth password for -kafka.consumer.topic. Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.basicAuth.username array
-     Optional basic auth username for -kafka.consumer.topic. Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . This flag is available only in enterprise version of VictoriaMetrics
+     Optional basic auth username for -kafka.consumer.topic. Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.brokers array
-     List of brokers to connect for given topic, e.g. -kafka.consumer.topic.broker=host-1:9092;host-2:9092 . This flag is available only in enterprise version of VictoriaMetrics
+     List of brokers to connect for given topic, e.g. -kafka.consumer.topic.broker=host-1:9092;host-2:9092 . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.defaultFormat string
-     Expected data format in the topic if -kafka.consumer.topic.format is skipped. This flag is available only in enterprise version of VictoriaMetrics (default "promremotewrite")
+     Expected data format in the topic if -kafka.consumer.topic.format is skipped. This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html (default "promremotewrite")
   -kafka.consumer.topic.format array
-     data format for corresponding kafka topic. Valid formats: influx, prometheus, promremotewrite, graphite, jsonline . This flag is available only in enterprise version of VictoriaMetrics
+     data format for corresponding kafka topic. Valid formats: influx, prometheus, promremotewrite, graphite, jsonline . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.groupID array
-     Defines group.id for topic. This flag is available only in enterprise version of VictoriaMetrics
+     Defines group.id for topic. This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.isGzipped array
-     Enables gzip setting for topic messages payload. Only prometheus, jsonline and influx formats accept gzipped messages.This flag is available only in enterprise version of VictoriaMetrics
+     Enables gzip setting for topic messages payload. Only prometheus, jsonline and influx formats accept gzipped messages.This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports array of values separated by comma or specified via multiple flags.
   -kafka.consumer.topic.options array
-     Optional key=value;key1=value2 settings for topic consumer. See full configuration options at https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md . This flag is available only in enterprise version of VictoriaMetrics
+     Optional key=value;key1=value2 settings for topic consumer. See full configuration options at https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md . This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
   -loggerDisableTimestamps
      Whether to disable writing timestamps in logs
@@ -1242,6 +1252,8 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Trim timestamps for OpenTSDB HTTP data to this duration. Minimum practical duration is 1ms. Higher duration (i.e. 1s) may be used for reducing disk space usage for timestamp data (default 1ms)
   -pprofAuthKey string
      Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings
+  -prevCacheRemovalPercent float
+     Items in the previous caches are removed when the percent of requests it serves becomes lower than this value. Higher values reduce memory usage at the cost of higher CPU usage. See also -cacheExpireDuration (default 0.1)
   -promscrape.azureSDCheckInterval duration
      Interval for checking for changes in Azure. This works only if azure_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#azure_sd_configs for details (default 1m0s)
   -promscrape.cluster.memberNum string

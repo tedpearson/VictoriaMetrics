@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestSanitizeName(t *testing.T) {
@@ -77,8 +78,12 @@ func TestApplyRelabelConfigs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cannot parse %q: %s", config, err)
 		}
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := pcs.Apply(labels, 0, isFinalize)
+		labels := promutils.NewLabelsFromString(metric)
+		resultLabels := pcs.Apply(labels.GetLabels(), 0)
+		if isFinalize {
+			resultLabels = FinalizeLabels(resultLabels[:0], resultLabels)
+		}
+		SortLabels(resultLabels)
 		result := labelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
@@ -112,6 +117,12 @@ func TestApplyRelabelConfigs(t *testing.T) {
   target_label: "bar"
   regex: ".+"
 `, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
+		f(`
+- action: replace
+  source_labels: ["foo"]
+  target_label: "xxx"
+  regex: ".+"
+`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
 	})
 	t.Run("replace-if-miss", func(t *testing.T) {
 		f(`
@@ -129,6 +140,16 @@ func TestApplyRelabelConfigs(t *testing.T) {
   target_label: "bar"
   replacement: "a-$1-b"
 `, `{xxx="yyy"}`, false, `{bar="a-yyy;-b",xxx="yyy"}`)
+		f(`
+- action: replace
+  source_labels: ["xxx", "foo"]
+  target_label: "xxx"
+`, `{xxx="yyy"}`, false, `{xxx="yyy;"}`)
+		f(`
+- action: replace
+  source_labels: ["foo"]
+  target_label: "xxx"
+`, `{xxx="yyy"}`, false, `{}`)
 	})
 	t.Run("replace-if-hit", func(t *testing.T) {
 		f(`
@@ -688,13 +709,25 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: [xyz]
 `, `metric{xyz="foo$",a="b"}`, true, `metric{a="b",xyz="bar"}`)
 	})
+	t.Run("issue-3251", func(t *testing.T) {
+		f(`
+- source_labels: [instance, container_label_com_docker_swarm_task_name]
+  separator: ';'
+  #  regex: '(.*?)\..*;(.*?)\..*'
+  regex: '([^.]+).[^;]+;([^.]+).+'
+  replacement: '$2:$1'
+  target_label: container_label_com_docker_swarm_task_name
+  action: replace
+`, `{instance="subdomain.domain.com",container_label_com_docker_swarm_task_name="myservice.h408nlaxmv8oqkn1pjjtd71to.nv987lz99rb27lkjjnfiay0g4"}`, true,
+			`{container_label_com_docker_swarm_task_name="myservice:subdomain",instance="subdomain.domain.com"}`)
+	})
 }
 
 func TestFinalizeLabels(t *testing.T) {
 	f := func(metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := FinalizeLabels(nil, labels)
+		labels := promutils.NewLabelsFromString(metric)
+		resultLabels := FinalizeLabels(nil, labels.GetLabels())
 		result := labelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
@@ -706,27 +739,11 @@ func TestFinalizeLabels(t *testing.T) {
 	f(`{foo="bar",abc="def",__address__="foo.com"}`, `{abc="def",foo="bar"}`)
 }
 
-func TestRemoveMetaLabels(t *testing.T) {
-	f := func(metric, resultExpected string) {
-		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := RemoveMetaLabels(nil, labels)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result of RemoveMetaLabels;\ngot\n%s\nwant\n%s", result, resultExpected)
-		}
-	}
-	f(`{}`, `{}`)
-	f(`{foo="bar"}`, `{foo="bar"}`)
-	f(`{__meta_foo="bar"}`, `{}`)
-	f(`{__meta_foo="bdffr",foo="bar",__meta_xxx="basd"}`, `{foo="bar"}`)
-}
-
 func TestFillLabelReferences(t *testing.T) {
 	f := func(replacement, metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		result := fillLabelReferences(nil, replacement, labels)
+		labels := promutils.NewLabelsFromString(metric)
+		result := fillLabelReferences(nil, replacement, labels.GetLabels())
 		if string(result) != resultExpected {
 			t.Fatalf("unexpected result; got\n%q\nwant\n%q", result, resultExpected)
 		}
