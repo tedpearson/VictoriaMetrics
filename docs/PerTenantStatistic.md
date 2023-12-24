@@ -1,12 +1,20 @@
 ---
-sort: 19
+sort: 31
+weight: 31
+title: VictoriaMetrics Cluster Per Tenant Statistic
+menu:
+  docs:
+    parent: 'victoriametrics'
+    weight: 31
+aliases:
+- /PerTenantStatistic.html
 ---
 
 # VictoriaMetrics Cluster Per Tenant Statistic
 
-***The per-tenant statistic is a part of [enterprise package](https://docs.victoriametrics.com/enterprise.html). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)***
+***The per-tenant statistic is a part of [enterprise package](https://docs.victoriametrics.com/enterprise.html). It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest). You need to request a [free trial license](https://victoriametrics.com/products/enterprise/trial/) for evaluation.***
 
-<img alt="cluster-per-tenant-stat" src="PerTenantStatistic-stats.jpg">
+<img alt="cluster-per-tenant-stat" src="PerTenantStatistic-stats.webp">
 
 VictoriaMetrics cluster for enterprise provides various metrics and statistics usage per tenant:
 
@@ -31,7 +39,7 @@ VictoriaMetrics cluster for enterprise provides various metrics and statistics u
 
 Collect the metrics by any scrape agent you like (`vmagent`, `victoriametrics`, Prometheus, etc) and put into TSDB.
 It is ok to use existing cluster for storing such metrics, but make sure to use a different tenant for it to avoid collisions.
-Or just run a separate TSDB (VM single, Promethes, etc.) to keep the data isolated from the main cluster.
+Or just run a separate TSDB (VM single, Prometheus, etc.) to keep the data isolated from the main cluster.
 
 Example of the scraping configuration for statistic is the following:
 

@@ -3,8 +3,11 @@
 .vm-trace-page {
   display: flex;
   flex-direction: column;
-  padding: $padding-global;
   min-height: 100%;
+
+  @media (max-width: 768px) {
+    padding: $padding-medium 0;
+  }
 
   &-controls {
     display: grid;
@@ -21,12 +24,21 @@
     gap: $padding-global;
     margin-bottom: $padding-medium;
 
+    @media (max-width: 768px) {
+      grid-template-columns: 1fr;
+      padding: 0 $padding-medium;
+    }
+
     &-errors {
       display: grid;
       align-items: flex-start;
       justify-content: stretch;
       grid-template-columns: 1fr;
       gap: $padding-medium;
+
+      @media (max-width: 768px) {
+        grid-row: 2;
+      }
 
       &-item {
         position: relative;
@@ -56,11 +68,26 @@
     justify-content: center;
 
     &__text {
-      margin-bottom: $padding-small;
-      font-size: $font-size-medium;
+      margin-bottom: $padding-global;
+      font-size: $font-size;
       white-space: pre-line;
       text-align: center;
       line-height: 1.8;
     }
+  }
+
+  &__dropzone {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: inset $color-primary 0 0 10px;
+    opacity: 0.5;
+    z-index: 100;
+    pointer-events: none;
   }
 }

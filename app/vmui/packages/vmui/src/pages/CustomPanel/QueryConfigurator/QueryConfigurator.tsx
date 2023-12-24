@@ -1,66 +1,114 @@
-import React, { FC, useState, useEffect } from "preact/compat";
+import React, { FC, useEffect, useState } from "preact/compat";
+import { StateUpdater } from "preact/hooks";
 import QueryEditor from "../../../components/Configurators/QueryEditor/QueryEditor";
 import AdditionalSettings from "../../../components/Configurators/AdditionalSettings/AdditionalSettings";
-import { ErrorTypes } from "../../../types";
 import usePrevious from "../../../hooks/usePrevious";
-import { MAX_QUERY_FIELDS } from "../../../constants/graph";
+import { MAX_QUERIES_HISTORY, MAX_QUERY_FIELDS } from "../../../constants/graph";
 import { useQueryDispatch, useQueryState } from "../../../state/query/QueryStateContext";
 import { useTimeDispatch } from "../../../state/time/TimeStateContext";
-import { DeleteIcon, PlayIcon, PlusIcon, VisibilityIcon, VisibilityOffIcon } from "../../../components/Main/Icons";
+import {
+  DeleteIcon,
+  PlayIcon,
+  PlusIcon,
+  Prettify,
+  VisibilityIcon,
+  VisibilityOffIcon
+} from "../../../components/Main/Icons";
 import Button from "../../../components/Main/Button/Button";
 import "./style.scss";
 import Tooltip from "../../../components/Main/Tooltip/Tooltip";
 import classNames from "classnames";
+import { MouseEvent as ReactMouseEvent } from "react";
+import { arrayEquals } from "../../../utils/array";
+import useDeviceDetect from "../../../hooks/useDeviceDetect";
+import { QueryStats } from "../../../api/types";
+import { usePrettifyQuery } from "./hooks/usePrettifyQuery";
+import QueryHistory from "../QueryHistory/QueryHistory";
 
 export interface QueryConfiguratorProps {
-  error?: ErrorTypes | string;
-  queryOptions: string[]
+  queryErrors: string[];
+  setQueryErrors: StateUpdater<string[]>;
+  setHideError: StateUpdater<boolean>;
+  stats: QueryStats[];
   onHideQuery: (queries: number[]) => void
+  onRunQuery: () => void
 }
 
-const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, onHideQuery }) => {
+const QueryConfigurator: FC<QueryConfiguratorProps> = ({
+  queryErrors,
+  setQueryErrors,
+  setHideError,
+  stats,
+  onHideQuery,
+  onRunQuery
+}) => {
 
-  const { query, queryHistory, autocomplete } = useQueryState();
+  const { isMobile } = useDeviceDetect();
+
+  const { query, queryHistory, autocomplete, autocompleteQuick } = useQueryState();
   const queryDispatch = useQueryDispatch();
   const timeDispatch = useTimeDispatch();
 
   const [stateQuery, setStateQuery] = useState(query || []);
   const [hideQuery, setHideQuery] = useState<number[]>([]);
+  const [awaitStateQuery, setAwaitStateQuery] = useState(false);
   const prevStateQuery = usePrevious(stateQuery) as (undefined | string[]);
+
+  const getPrettifiedQuery = usePrettifyQuery();
 
   const updateHistory = () => {
     queryDispatch({
-      type: "SET_QUERY_HISTORY", payload: stateQuery.map((q, i) => {
+      type: "SET_QUERY_HISTORY",
+      payload: stateQuery.map((q, i) => {
         const h = queryHistory[i] || { values: [] };
         const queryEqual = q === h.values[h.values.length - 1];
+        const newValues = !queryEqual && q ? [...h.values, q] : h.values;
+
+        // limit the history
+        if (newValues.length > MAX_QUERIES_HISTORY)  newValues.shift();
+
         return {
           index: h.values.length - Number(queryEqual),
-          values: !queryEqual && q ? [...h.values, q] : h.values
+          values: newValues
         };
       })
     });
   };
 
-  const onRunQuery = () => {
+  const handleRunQuery = () => {
     updateHistory();
     queryDispatch({ type: "SET_QUERY", payload: stateQuery });
     timeDispatch({ type: "RUN_QUERY" });
+    onRunQuery();
   };
 
-  const onAddQuery = () => {
+  const handleAddQuery = () => {
     setStateQuery(prev => [...prev, ""]);
   };
 
-  const onRemoveQuery = (index: number) => {
+  const handleRemoveQuery = (index: number) => {
     setStateQuery(prev => prev.filter((q, i) => i !== index));
   };
 
-  const onToggleHideQuery = (index: number) => {
-    setHideQuery(prev => prev.includes(index) ? prev.filter(n => n !== index) : [...prev, index]);
+  const handleToggleHideQuery = (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>, index: number) => {
+    const { ctrlKey, metaKey } = e;
+    const ctrlMetaKey = ctrlKey || metaKey;
+
+    if (ctrlMetaKey) {
+      const hideIndexes = stateQuery.map((q, i) => i).filter(n => n !== index);
+      setHideQuery(prev => arrayEquals(hideIndexes, prev) ? [] : hideIndexes);
+    } else {
+      setHideQuery(prev => prev.includes(index) ? prev.filter(n => n !== index) : [...prev, index]);
+    }
   };
 
   const handleChangeQuery = (value: string, index: number) => {
     setStateQuery(prev => prev.map((q, i) => i === index ? value : q));
+  };
+
+  const handleSelectHistory = (value: string, index: number) => {
+    handleChangeQuery(value, index);
+    setAwaitStateQuery(true);
   };
 
   const handleHistoryChange = (step: number, indexQuery: number) => {
@@ -83,17 +131,29 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
   };
 
   const createHandlerRemoveQuery = (i: number) => () => {
-    onRemoveQuery(i);
-    setHideQuery(prev => prev.map(n => n > i ? n - 1: n));
+    handleRemoveQuery(i);
+    setHideQuery(prev => prev.includes(i) ? prev.filter(n => n !== i) : prev.map(n => n > i ? n - 1 : n));
   };
 
-  const createHandlerHideQuery = (i: number) => () => {
-    onToggleHideQuery(i);
+  const createHandlerHideQuery = (i: number) => (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>) => {
+    handleToggleHideQuery(e, i);
+  };
+
+  const handlePrettifyQuery = async (i:number) => {
+    const prettyQuery = await getPrettifiedQuery(stateQuery[i]);
+    setHideError(false);
+
+    handleChangeQuery(prettyQuery.query, i);
+
+    setQueryErrors((qe) => {
+      qe[i] = prettyQuery.error;
+      return [...qe];
+    });
   };
 
   useEffect(() => {
     if (prevStateQuery && (stateQuery.length < prevStateQuery.length)) {
-      onRunQuery();
+      handleRunQuery();
     }
   }, [stateQuery]);
 
@@ -101,24 +161,38 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
     onHideQuery(hideQuery);
   }, [hideQuery]);
 
-  return <div className="vm-query-configurator vm-block">
+  useEffect(() => {
+    if (awaitStateQuery) {
+      handleRunQuery();
+      setAwaitStateQuery(false);
+    }
+  }, [stateQuery, awaitStateQuery]);
+
+  return <div
+    className={classNames({
+      "vm-query-configurator": true,
+      "vm-block": true,
+      "vm-block_mobile": isMobile
+    })}
+  >
     <div className="vm-query-configurator-list">
       {stateQuery.map((q, i) => (
         <div
           className={classNames({
             "vm-query-configurator-list-row": true,
-            "vm-query-configurator-list-row_disabled": hideQuery.includes(i)
+            "vm-query-configurator-list-row_disabled": hideQuery.includes(i),
+            "vm-query-configurator-list-row_mobile": isMobile
           })}
           key={i}
         >
           <QueryEditor
             value={stateQuery[i]}
-            autocomplete={autocomplete}
-            options={queryOptions}
-            error={error}
+            autocomplete={autocomplete || autocompleteQuick}
+            error={queryErrors[i]}
+            stats={stats[i]}
             onArrowUp={createHandlerArrow(-1, i)}
             onArrowDown={createHandlerArrow(1, i)}
-            onEnter={onRunQuery}
+            onEnter={handleRunQuery}
             onChange={createHandlerChangeQuery(i)}
             label={`Query ${i + 1}`}
             disabled={hideQuery.includes(i)}
@@ -130,9 +204,24 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
                 color={"gray"}
                 startIcon={hideQuery.includes(i) ? <VisibilityOffIcon/> : <VisibilityIcon/>}
                 onClick={createHandlerHideQuery(i)}
+                ariaLabel="visibility query"
               />
             </div>
           </Tooltip>
+
+          <Tooltip title={"Prettify query"}>
+            <div className="vm-query-configurator-list-row__button">
+              <Button
+                variant={"text"}
+                color={"gray"}
+                startIcon={<Prettify/>}
+                onClick={async () => await handlePrettifyQuery(i)}
+                className="prettify"
+                ariaLabel="prettify the query"
+              />
+            </div>
+          </Tooltip>
+
           {stateQuery.length > 1 && (
             <Tooltip title="Remove Query">
               <div className="vm-query-configurator-list-row__button">
@@ -141,6 +230,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
                   color={"error"}
                   startIcon={<DeleteIcon/>}
                   onClick={createHandlerRemoveQuery(i)}
+                  ariaLabel="remove query"
                 />
               </div>
             </Tooltip>
@@ -151,10 +241,11 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
     <div className="vm-query-configurator-settings">
       <AdditionalSettings/>
       <div className="vm-query-configurator-settings__buttons">
+        <QueryHistory handleSelectQuery={handleSelectHistory}/>
         {stateQuery.length < MAX_QUERY_FIELDS && (
           <Button
             variant="outlined"
-            onClick={onAddQuery}
+            onClick={handleAddQuery}
             startIcon={<PlusIcon/>}
           >
             Add Query
@@ -162,10 +253,10 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({ error, queryOptions, on
         )}
         <Button
           variant="contained"
-          onClick={onRunQuery}
+          onClick={handleRunQuery}
           startIcon={<PlayIcon/>}
         >
-          Execute Query
+          {isMobile ? "Execute" : "Execute Query"}
         </Button>
       </div>
     </div>

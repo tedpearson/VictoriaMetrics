@@ -1,5 +1,7 @@
 /* eslint-disable */
 import uPlot from "uplot";
+import {getCssVariable} from "../theme";
+import {sizeAxis} from "./helpers";
 
 export const seriesBarsPlugin = (opts) => {
   let pxRatio;
@@ -88,7 +90,7 @@ export const seriesBarsPlugin = (opts) => {
     u.ctx.save();
 
     u.ctx.font         = font;
-    u.ctx.fillStyle    = "black";
+    u.ctx.fillStyle    = getCssVariable("color-text");
 
     uPlot.orient(u, sidx, (
       series,
@@ -261,7 +263,9 @@ export const seriesBarsPlugin = (opts) => {
         },
         values:     u => u.data[0],
         gap:        15,
-        size:       ori === 0 ? 40 : 150,
+        size:       sizeAxis,
+        stroke: getCssVariable("color-text"),
+        font: "10px Arial",
         labelSize:  20,
         grid:       {show: false},
         ticks:      {show: false},

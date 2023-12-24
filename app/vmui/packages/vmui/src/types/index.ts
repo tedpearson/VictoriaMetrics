@@ -1,4 +1,5 @@
 import { MetricBase } from "../api/types";
+export * from "./uplot";
 
 declare global {
   interface Window {
@@ -11,7 +12,7 @@ export type DisplayType = "table" | "chart" | "code";
 export interface TimeParams {
   start: number; // timestamp in seconds
   end: number; // timestamp in seconds
-  step?: number; // seconds
+  step?: string; // seconds
   date: string; // end input date
 }
 
@@ -35,6 +36,7 @@ export interface DataSeries extends MetricBase{
 export interface InstantDataSeries {
   metadata: string[]; // just ordered columns
   value: string;
+  values: string[]
   copyValue: string;
 }
 
@@ -44,7 +46,8 @@ export enum ErrorTypes {
   validQuery = "Please enter a valid Query and execute it",
   traceNotFound = "Not found the tracing information",
   emptyTitle = "Please enter title",
-  positiveNumber = "Please enter positive number"
+  positiveNumber = "Please enter positive number",
+  validStep = "Please enter a valid step"
 }
 
 export interface PanelSettings {
@@ -84,7 +87,8 @@ export interface TopQuery {
   query: string
   timeRangeSeconds: number
   sumDurationSeconds: number
-  timeRangeHours: number
+  timeRange: string
+  url?: string
 }
 
 export interface TopQueryStats {
@@ -92,16 +96,67 @@ export interface TopQueryStats {
   "search.queryStats.minQueryDuration": string
 }
 
-export interface TopQueriesData extends TopQueryStats{
+export interface TopQueriesData extends TopQueryStats {
   maxLifetime: string
   topN: string
   topByAvgDuration: TopQuery[]
   topByCount: TopQuery[]
   topBySumDuration: TopQuery[]
+  error?: string
 }
 
 export interface SeriesLimits {
   table: number,
   chart: number,
   code: number,
+}
+
+export interface Timezone {
+  region: string,
+  utc: string,
+  search?: string
+}
+
+export interface GraphSize {
+  id: string,
+  isDefault?: boolean,
+  height: () => number
+}
+
+export enum Theme {
+  system = "system",
+  light = "light",
+  dark = "dark",
+}
+
+export interface RelabelStep {
+  rule: string;
+  inLabels: string;
+  outLabels: string;
+}
+
+export interface RelabelData {
+  status: string;
+  originalLabels?: string;
+  resultingLabels?: string;
+  steps: RelabelStep[];
+}
+
+export interface ActiveQueriesType {
+  duration: string;
+  end: number;
+  start: number;
+  id: string;
+  query: string;
+  remote_addr: string;
+  step: number;
+  args?: string;
+  data?: string;
+}
+
+export enum QueryContextType {
+  empty = "empty",
+  metricsql = "metricsql",
+  label = "label",
+  labelValue = "labelValue",
 }

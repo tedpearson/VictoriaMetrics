@@ -23,11 +23,12 @@ import (
 )
 
 var (
-	retentionPeriod   = flagutil.NewDuration("retentionPeriod", "1", "Data with timestamps outside the retentionPeriod is automatically deleted. See also -retentionFilter")
-	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
-	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
-	forceFlushAuthKey = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
-	snapshotsMaxAge   = flagutil.NewDuration("snapshotsMaxAge", "0", "Automatically delete snapshots older than -snapshotsMaxAge if it is set to non-zero duration. Make sure that backup process has enough time to finish the backup before the corresponding snapshot is automatically deleted")
+	retentionPeriod       = flagutil.NewDuration("retentionPeriod", "1", "Data with timestamps outside the retentionPeriod is automatically deleted. The minimum retentionPeriod is 24h or 1d. See also -retentionFilter")
+	snapshotAuthKey       = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
+	forceMergeAuthKey     = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
+	forceFlushAuthKey     = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
+	snapshotsMaxAge       = flagutil.NewDuration("snapshotsMaxAge", "0", "Automatically delete snapshots older than -snapshotsMaxAge if it is set to non-zero duration. Make sure that backup process has enough time to finish the backup before the corresponding snapshot is automatically deleted")
+	snapshotCreateTimeout = flag.Duration("snapshotCreateTimeout", 0, "The timeout for creating new snapshot. If set, make sure that timeout is lower than backup period")
 
 	precisionBits = flag.Int("precisionBits", 64, "The number of precision bits to store per each value. Lower precision bits improves data compression at the cost of precision loss")
 
@@ -37,15 +38,17 @@ var (
 	finalMergeDelay = flag.Duration("finalMergeDelay", 0, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
 		"Final merge may require additional disk IO and CPU resources. Final merge may increase query speed and reduce disk space usage in some cases. "+
 		"Zero value disables final merge")
-	bigMergeConcurrency     = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
-	smallMergeConcurrency   = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
+	_ = flag.Int("bigMergeConcurrency", 0, "Deprecated: this flag does nothing. Please use -smallMergeConcurrency "+
+		"for controlling the concurrency of background merges. See https://docs.victoriametrics.com/#storage")
+	smallMergeConcurrency = flag.Int("smallMergeConcurrency", 0, "The maximum number of workers for background merges. See https://docs.victoriametrics.com/#storage . "+
+		"It isn't recommended tuning this flag in general case, since this may lead to uncontrolled increase in the number of parts and increased CPU usage during queries")
 	retentionTimezoneOffset = flag.Duration("retentionTimezoneOffset", 0, "The offset for performing indexdb rotation. "+
 		"If set to 0, then the indexdb rotation is performed at 4am UTC time per each -retentionPeriod. "+
 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 
 	logNewSeries = flag.Bool("logNewSeries", false, "Whether to log new series. This option is for debug purposes only. It can lead to performance issues "+
 		"when big number of new series are ingested into VictoriaMetrics")
-	denyQueriesOutsideRetention = flag.Bool("denyQueriesOutsideRetention", false, "Whether to deny queries outside of the configured -retentionPeriod. "+
+	denyQueriesOutsideRetention = flag.Bool("denyQueriesOutsideRetention", false, "Whether to deny queries outside the configured -retentionPeriod. "+
 		"When set, then /api/v1/query_range would return '503 Service Unavailable' error for queries with 'from' value outside -retentionPeriod. "+
 		"This may be useful when multiple data sources with distinct retentions are hidden behind query-tee")
 	maxHourlySeries = flag.Int("storage.maxHourlySeries", 0, "The maximum number of unique series can be added to the storage during the last hour. "+
@@ -72,7 +75,7 @@ func CheckTimeRange(tr storage.TimeRange) error {
 	if !*denyQueriesOutsideRetention {
 		return nil
 	}
-	minAllowedTimestamp := int64(fasttime.UnixTimestamp()*1000) - retentionPeriod.Msecs
+	minAllowedTimestamp := int64(fasttime.UnixTimestamp()*1000) - retentionPeriod.Milliseconds()
 	if tr.MinTimestamp > minAllowedTimestamp {
 		return nil
 	}
@@ -84,14 +87,6 @@ func CheckTimeRange(tr storage.TimeRange) error {
 
 // Init initializes vmstorage.
 func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
-	InitWithoutMetrics(resetCacheIfNeeded)
-	registerStorageMetrics(Storage)
-}
-
-// InitWithoutMetrics must be called instead of Init inside tests.
-//
-// This allows multiple Init / Stop cycles.
-func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	if err := encoding.CheckPrecisionBits(uint8(*precisionBits)); err != nil {
 		logger.Fatalf("invalid `-precisionBits`: %s", err)
 	}
@@ -99,25 +94,21 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	resetResponseCacheIfNeeded = resetCacheIfNeeded
 	storage.SetLogNewSeries(*logNewSeries)
 	storage.SetFinalMergeDelay(*finalMergeDelay)
-	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
-	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
+	storage.SetMergeWorkersCount(*smallMergeConcurrency)
 	storage.SetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
-	storage.SetTSIDCacheSize(cacheSizeStorageTSID.N)
-	storage.SetTagFiltersCacheSize(cacheSizeIndexDBTagFilters.N)
-	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.N)
-	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.N)
+	storage.SetTSIDCacheSize(cacheSizeStorageTSID.IntN())
+	storage.SetTagFiltersCacheSize(cacheSizeIndexDBTagFilters.IntN())
+	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.IntN())
+	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.IntN())
 
-	if retentionPeriod.Msecs < 24*3600*1000 {
+	if retentionPeriod.Duration() < 24*time.Hour {
 		logger.Fatalf("-retentionPeriod cannot be smaller than a day; got %s", retentionPeriod)
 	}
 	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
-	strg, err := storage.OpenStorage(*DataPath, retentionPeriod.Msecs, *maxHourlySeries, *maxDailySeries)
-	if err != nil {
-		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *DataPath, retentionPeriod, err)
-	}
+	strg := storage.MustOpenStorage(*DataPath, retentionPeriod.Duration(), *maxHourlySeries, *maxDailySeries)
 	Storage = strg
 	initStaleSnapshotsRemover(strg)
 
@@ -130,6 +121,7 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	sizeBytes := tm.SmallSizeBytes + tm.BigSizeBytes
 	logger.Infof("successfully opened storage %q in %.3f seconds; partsCount: %d; blocksCount: %d; rowsCount: %d; sizeBytes: %d",
 		*DataPath, time.Since(startTime).Seconds(), partsCount, blocksCount, rowsCount, sizeBytes)
+	registerStorageMetrics(Storage)
 }
 
 // Storage is a storage.
@@ -147,6 +139,8 @@ var WG syncwg.WaitGroup
 var resetResponseCacheIfNeeded func(mrs []storage.MetricRow)
 
 // AddRows adds mrs to the storage.
+//
+// The caller should limit the number of concurrent calls to AddRows() in order to limit memory usage.
 func AddRows(mrs []storage.MetricRow) error {
 	if Storage.IsReadOnly() {
 		return errReadOnly
@@ -161,11 +155,10 @@ func AddRows(mrs []storage.MetricRow) error {
 var errReadOnly = errors.New("the storage is in read-only mode; check -storage.minFreeDiskSpaceBytes command-line flag value")
 
 // RegisterMetricNames registers all the metrics from mrs in the storage.
-func RegisterMetricNames(qt *querytracer.Tracer, mrs []storage.MetricRow) error {
+func RegisterMetricNames(qt *querytracer.Tracer, mrs []storage.MetricRow) {
 	WG.Add(1)
-	err := Storage.RegisterMetricNames(qt, mrs)
+	Storage.RegisterMetricNames(qt, mrs)
 	WG.Done()
-	return err
 }
 
 // DeleteSeries deletes series matching tfss.
@@ -253,9 +246,7 @@ func Stop() {
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
 	if path == "/internal/force_merge" {
-		authKey := r.FormValue("authKey")
-		if authKey != *forceMergeAuthKey {
-			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceMergeAuthKey command line flag", authKey)
+		if !httpserver.CheckAuthFlag(w, r, *forceMergeAuthKey, "forceMergeAuthKey") {
 			return true
 		}
 		// Run force merge in background
@@ -273,9 +264,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if path == "/internal/force_flush" {
-		authKey := r.FormValue("authKey")
-		if authKey != *forceFlushAuthKey {
-			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceFlushAuthKey command line flag", authKey)
+		if !httpserver.CheckAuthFlag(w, r, *forceFlushAuthKey, "forceFlushAuthKey") {
 			return true
 		}
 		logger.Infof("flushing storage to make pending data available for reading")
@@ -291,20 +280,24 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	if !strings.HasPrefix(path, "/snapshot") {
 		return false
 	}
-	authKey := r.FormValue("authKey")
-	if authKey != *snapshotAuthKey {
-		httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -snapshotAuthKey command line flag", authKey)
+	if !httpserver.CheckAuthFlag(w, r, *snapshotAuthKey, "snapshotAuthKey") {
 		return true
 	}
 	path = path[len("/snapshot"):]
 
 	switch path {
 	case "/create":
+		snapshotsCreateTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
-		snapshotPath, err := Storage.CreateSnapshot()
+		deadline := uint64(0)
+		if *snapshotCreateTimeout > 0 {
+			deadline = fasttime.UnixTimestamp() + uint64(snapshotCreateTimeout.Seconds())
+		}
+		snapshotPath, err := Storage.CreateSnapshot(deadline)
 		if err != nil {
 			err = fmt.Errorf("cannot create snapshot: %w", err)
 			jsonResponseError(w, err)
+			snapshotsCreateErrorsTotal.Inc()
 			return true
 		}
 		if prometheusCompatibleResponse {
@@ -314,11 +307,13 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/list":
+		snapshotsListTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsListErrorsTotal.Inc()
 			return true
 		}
 		fmt.Fprintf(w, `{"status":"ok","snapshots":[`)
@@ -331,6 +326,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `]}`)
 		return true
 	case "/delete":
+		snapshotsDeleteTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshotName := r.FormValue("snapshot")
 
@@ -338,6 +334,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsDeleteErrorsTotal.Inc()
 			return true
 		}
 		for _, snName := range snapshots {
@@ -345,6 +342,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 				if err := Storage.DeleteSnapshot(snName); err != nil {
 					err = fmt.Errorf("cannot delete snapshot %q: %w", snName, err)
 					jsonResponseError(w, err)
+					snapshotsDeleteErrorsTotal.Inc()
 					return true
 				}
 				fmt.Fprintf(w, `{"status":"ok"}`)
@@ -352,21 +350,24 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 			}
 		}
 
-		err = fmt.Errorf("cannot find snapshot %q: %w", snapshotName, err)
+		err = fmt.Errorf("cannot find snapshot %q", snapshotName)
 		jsonResponseError(w, err)
 		return true
 	case "/delete_all":
+		snapshotsDeleteAllTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsDeleteAllErrorsTotal.Inc()
 			return true
 		}
 		for _, snapshotName := range snapshots {
 			if err := Storage.DeleteSnapshot(snapshotName); err != nil {
 				err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
 				jsonResponseError(w, err)
+				snapshotsDeleteAllErrorsTotal.Inc()
 				return true
 			}
 		}
@@ -379,10 +380,10 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 
 func initStaleSnapshotsRemover(strg *storage.Storage) {
 	staleSnapshotsRemoverCh = make(chan struct{})
-	if snapshotsMaxAge.Msecs <= 0 {
+	if snapshotsMaxAge.Duration() <= 0 {
 		return
 	}
-	snapshotsMaxAgeDur := time.Duration(snapshotsMaxAge.Msecs) * time.Millisecond
+	snapshotsMaxAgeDur := snapshotsMaxAge.Duration()
 	staleSnapshotsRemoverWG.Add(1)
 	go func() {
 		defer staleSnapshotsRemoverWG.Done()
@@ -412,7 +413,21 @@ var (
 	staleSnapshotsRemoverWG sync.WaitGroup
 )
 
-var activeForceMerges = metrics.NewCounter("vm_active_force_merges")
+var (
+	activeForceMerges = metrics.NewCounter("vm_active_force_merges")
+
+	snapshotsCreateTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/create"}`)
+	snapshotsCreateErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/create"}`)
+
+	snapshotsListTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/list"}`)
+	snapshotsListErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/list"}`)
+
+	snapshotsDeleteTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/delete"}`)
+	snapshotsDeleteErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/delete"}`)
+
+	snapshotsDeleteAllTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/delete_all"}`)
+	snapshotsDeleteAllErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/delete_all"}`)
+)
 
 func registerStorageMetrics(strg *storage.Storage) {
 	mCache := &storage.Metrics{}
@@ -453,65 +468,83 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return 0
 	})
 
-	metrics.NewGauge(`vm_active_merges{type="storage/big"}`, func() float64 {
-		return float64(tm().ActiveBigMerges)
+	metrics.NewGauge(`vm_active_merges{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().ActiveInmemoryMerges)
 	})
 	metrics.NewGauge(`vm_active_merges{type="storage/small"}`, func() float64 {
 		return float64(tm().ActiveSmallMerges)
 	})
-	metrics.NewGauge(`vm_active_merges{type="indexdb"}`, func() float64 {
-		return float64(idbm().ActiveMerges)
+	metrics.NewGauge(`vm_active_merges{type="storage/big"}`, func() float64 {
+		return float64(tm().ActiveBigMerges)
+	})
+	metrics.NewGauge(`vm_active_merges{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().ActiveInmemoryMerges)
+	})
+	metrics.NewGauge(`vm_active_merges{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().ActiveFileMerges)
 	})
 
-	metrics.NewGauge(`vm_merges_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigMergesCount)
+	metrics.NewGauge(`vm_merges_total{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryMergesCount)
 	})
 	metrics.NewGauge(`vm_merges_total{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallMergesCount)
 	})
-	metrics.NewGauge(`vm_merges_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().MergesCount)
+	metrics.NewGauge(`vm_merges_total{type="storage/big"}`, func() float64 {
+		return float64(tm().BigMergesCount)
+	})
+	metrics.NewGauge(`vm_merges_total{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryMergesCount)
+	})
+	metrics.NewGauge(`vm_merges_total{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileMergesCount)
 	})
 
-	metrics.NewGauge(`vm_rows_merged_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsMerged)
+	metrics.NewGauge(`vm_rows_merged_total{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryRowsMerged)
 	})
 	metrics.NewGauge(`vm_rows_merged_total{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallRowsMerged)
 	})
-	metrics.NewGauge(`vm_rows_merged_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().ItemsMerged)
+	metrics.NewGauge(`vm_rows_merged_total{type="storage/big"}`, func() float64 {
+		return float64(tm().BigRowsMerged)
+	})
+	metrics.NewGauge(`vm_rows_merged_total{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryItemsMerged)
+	})
+	metrics.NewGauge(`vm_rows_merged_total{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileItemsMerged)
 	})
 
-	metrics.NewGauge(`vm_rows_deleted_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsDeleted)
+	metrics.NewGauge(`vm_rows_deleted_total{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryRowsDeleted)
 	})
 	metrics.NewGauge(`vm_rows_deleted_total{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallRowsDeleted)
 	})
-
-	metrics.NewGauge(`vm_references{type="storage/big", name="parts"}`, func() float64 {
-		return float64(tm().BigPartsRefCount)
+	metrics.NewGauge(`vm_rows_deleted_total{type="storage/big"}`, func() float64 {
+		return float64(tm().BigRowsDeleted)
 	})
-	metrics.NewGauge(`vm_references{type="storage/small", name="parts"}`, func() float64 {
+
+	metrics.NewGauge(`vm_part_references{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryPartsRefCount)
+	})
+	metrics.NewGauge(`vm_part_references{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallPartsRefCount)
 	})
-	metrics.NewGauge(`vm_references{type="storage", name="partitions"}`, func() float64 {
+	metrics.NewGauge(`vm_part_references{type="storage/big"}`, func() float64 {
+		return float64(tm().BigPartsRefCount)
+	})
+	metrics.NewGauge(`vm_partition_references{type="storage"}`, func() float64 {
 		return float64(tm().PartitionsRefCount)
 	})
-	metrics.NewGauge(`vm_references{type="indexdb", name="objects"}`, func() float64 {
+	metrics.NewGauge(`vm_object_references{type="indexdb"}`, func() float64 {
 		return float64(idbm().IndexDBRefCount)
 	})
-	metrics.NewGauge(`vm_references{type="indexdb", name="parts"}`, func() float64 {
+	metrics.NewGauge(`vm_part_references{type="indexdb"}`, func() float64 {
 		return float64(idbm().PartsRefCount)
 	})
 
-	metrics.NewGauge(`vm_new_timeseries_created_total`, func() float64 {
-		return float64(idbm().NewTimeseriesCreated)
-	})
-	metrics.NewGauge(`vm_timeseries_repopulated_total`, func() float64 {
-		return float64(idbm().TimeseriesRepopulated)
-	})
 	metrics.NewGauge(`vm_missing_tsids_for_metric_id_total`, func() float64 {
 		return float64(idbm().MissingTSIDsForMetricID)
 	})
@@ -531,11 +564,18 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(idbm().CompositeFilterMissingConversions)
 	})
 
+	metrics.NewGauge(`vm_assisted_merges_total{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryAssistedMerges)
+	})
 	metrics.NewGauge(`vm_assisted_merges_total{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallAssistedMerges)
 	})
-	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().AssistedMerges)
+
+	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryAssistedMerges)
+	})
+	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileAssistedMerges)
 	})
 
 	metrics.NewGauge(`vm_indexdb_items_added_total`, func() float64 {
@@ -545,14 +585,6 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(idbm().ItemsAddedSizeBytes)
 	})
 
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/686
-	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallMergeNeedFreeDiskSpace)
-	})
-	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/big"}`, func() float64 {
-		return float64(tm().BigMergeNeedFreeDiskSpace)
-	})
-
 	metrics.NewGauge(`vm_pending_rows{type="storage"}`, func() float64 {
 		return float64(tm().PendingRows)
 	})
@@ -560,34 +592,52 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(idbm().PendingItems)
 	})
 
-	metrics.NewGauge(`vm_parts{type="storage/big"}`, func() float64 {
-		return float64(tm().BigPartsCount)
+	metrics.NewGauge(`vm_parts{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryPartsCount)
 	})
 	metrics.NewGauge(`vm_parts{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallPartsCount)
 	})
-	metrics.NewGauge(`vm_parts{type="indexdb"}`, func() float64 {
-		return float64(idbm().PartsCount)
+	metrics.NewGauge(`vm_parts{type="storage/big"}`, func() float64 {
+		return float64(tm().BigPartsCount)
+	})
+	metrics.NewGauge(`vm_parts{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryPartsCount)
+	})
+	metrics.NewGauge(`vm_parts{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FilePartsCount)
 	})
 
-	metrics.NewGauge(`vm_blocks{type="storage/big"}`, func() float64 {
-		return float64(tm().BigBlocksCount)
+	metrics.NewGauge(`vm_blocks{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryBlocksCount)
 	})
 	metrics.NewGauge(`vm_blocks{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallBlocksCount)
 	})
-	metrics.NewGauge(`vm_blocks{type="indexdb"}`, func() float64 {
-		return float64(idbm().BlocksCount)
+	metrics.NewGauge(`vm_blocks{type="storage/big"}`, func() float64 {
+		return float64(tm().BigBlocksCount)
+	})
+	metrics.NewGauge(`vm_blocks{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryBlocksCount)
+	})
+	metrics.NewGauge(`vm_blocks{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileBlocksCount)
 	})
 
-	metrics.NewGauge(`vm_data_size_bytes{type="storage/big"}`, func() float64 {
-		return float64(tm().BigSizeBytes)
+	metrics.NewGauge(`vm_data_size_bytes{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemorySizeBytes)
 	})
 	metrics.NewGauge(`vm_data_size_bytes{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallSizeBytes)
 	})
-	metrics.NewGauge(`vm_data_size_bytes{type="indexdb"}`, func() float64 {
-		return float64(idbm().SizeBytes)
+	metrics.NewGauge(`vm_data_size_bytes{type="storage/big"}`, func() float64 {
+		return float64(tm().BigSizeBytes)
+	})
+	metrics.NewGauge(`vm_data_size_bytes{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemorySizeBytes)
+	})
+	metrics.NewGauge(`vm_data_size_bytes{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileSizeBytes)
 	})
 
 	metrics.NewGauge(`vm_rows_added_to_storage_total`, func() float64 {
@@ -604,26 +654,15 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(m().TooSmallTimestampRows)
 	})
 
-	metrics.NewGauge(`vm_concurrent_addrows_limit_reached_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyLimitReached)
+	metrics.NewGauge(`vm_timeseries_repopulated_total`, func() float64 {
+		return float64(m().TimeseriesRepopulated)
 	})
-	metrics.NewGauge(`vm_concurrent_addrows_limit_timeout_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyLimitTimeout)
+	metrics.NewGauge(`vm_timeseries_precreated_total`, func() float64 {
+		return float64(m().TimeseriesPreCreated)
 	})
-	metrics.NewGauge(`vm_concurrent_addrows_dropped_rows_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyDroppedRows)
+	metrics.NewGauge(`vm_new_timeseries_created_total`, func() float64 {
+		return float64(m().NewTimeseriesCreated)
 	})
-	metrics.NewGauge(`vm_concurrent_addrows_capacity`, func() float64 {
-		return float64(m().AddRowsConcurrencyCapacity)
-	})
-	metrics.NewGauge(`vm_concurrent_addrows_current`, func() float64 {
-		return float64(m().AddRowsConcurrencyCurrent)
-	})
-
-	metrics.NewGauge(`vm_search_delays_total`, func() float64 {
-		return float64(m().SearchDelays)
-	})
-
 	metrics.NewGauge(`vm_slow_row_inserts_total`, func() float64 {
 		return float64(m().SlowRowInserts)
 	})
@@ -665,14 +704,20 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(m().TimestampsBytesSaved)
 	})
 
-	metrics.NewGauge(`vm_rows{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsCount)
+	metrics.NewGauge(`vm_rows{type="storage/inmemory"}`, func() float64 {
+		return float64(tm().InmemoryRowsCount)
 	})
 	metrics.NewGauge(`vm_rows{type="storage/small"}`, func() float64 {
 		return float64(tm().SmallRowsCount)
 	})
-	metrics.NewGauge(`vm_rows{type="indexdb"}`, func() float64 {
-		return float64(idbm().ItemsCount)
+	metrics.NewGauge(`vm_rows{type="storage/big"}`, func() float64 {
+		return float64(tm().BigRowsCount)
+	})
+	metrics.NewGauge(`vm_rows{type="indexdb/inmemory"}`, func() float64 {
+		return float64(idbm().InmemoryItemsCount)
+	})
+	metrics.NewGauge(`vm_rows{type="indexdb/file"}`, func() float64 {
+		return float64(idbm().FileItemsCount)
 	})
 
 	metrics.NewGauge(`vm_date_range_search_calls_total`, func() float64 {

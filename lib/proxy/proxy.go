@@ -18,6 +18,17 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+var validURLSchemes = []string{"http", "https", "socks5", "tls+socks5"}
+
+func isURLSchemeValid(scheme string) bool {
+	for _, vs := range validURLSchemes {
+		if scheme == vs {
+			return true
+		}
+	}
+	return false
+}
+
 // URL implements YAML.Marshaler and yaml.Unmarshaler interfaces for url.URL.
 type URL struct {
 	URL *url.URL
@@ -62,38 +73,48 @@ func (u *URL) String() string {
 }
 
 // SetHeaders sets headers to req according to u and ac configs.
-func (u *URL) SetHeaders(ac *promauth.Config, req *http.Request) {
-	ah := u.getAuthHeader(ac)
+func (u *URL) SetHeaders(ac *promauth.Config, req *http.Request) error {
+	ah, err := u.getAuthHeader(ac)
+	if err != nil {
+		return fmt.Errorf("cannot obtain Proxy-Authorization headers: %w", err)
+	}
 	if ah != "" {
 		req.Header.Set("Proxy-Authorization", ah)
 	}
-	ac.SetHeaders(req, false)
+	return ac.SetHeaders(req, false)
 }
 
 // SetFasthttpHeaders sets headers to req according to u and ac configs.
-func (u *URL) SetFasthttpHeaders(ac *promauth.Config, req *fasthttp.Request) {
-	ah := u.getAuthHeader(ac)
+func (u *URL) SetFasthttpHeaders(ac *promauth.Config, req *fasthttp.Request) error {
+	ah, err := u.getAuthHeader(ac)
+	if err != nil {
+		return fmt.Errorf("cannot obtain Proxy-Authorization headers: %w", err)
+	}
 	if ah != "" {
 		req.Header.Set("Proxy-Authorization", ah)
 	}
-	ac.SetFasthttpHeaders(req, false)
+	return ac.SetFasthttpHeaders(req, false)
 }
 
 // getAuthHeader returns Proxy-Authorization auth header for the given u and ac.
-func (u *URL) getAuthHeader(ac *promauth.Config) string {
+func (u *URL) getAuthHeader(ac *promauth.Config) (string, error) {
 	authHeader := ""
 	if ac != nil {
-		authHeader = ac.GetAuthHeader()
+		var err error
+		authHeader, err = ac.GetAuthHeader()
+		if err != nil {
+			return "", err
+		}
 	}
 	if u == nil || u.URL == nil {
-		return authHeader
+		return authHeader, nil
 	}
 	pu := u.URL
 	if pu.User != nil && len(pu.User.Username()) > 0 {
 		userPasswordEncoded := base64.StdEncoding.EncodeToString([]byte(pu.User.String()))
 		authHeader = "Basic " + userPasswordEncoded
 	}
-	return authHeader
+	return authHeader, nil
 }
 
 // MarshalYAML implements yaml.Marshaler interface.
@@ -114,6 +135,9 @@ func (u *URL) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return fmt.Errorf("cannot parse proxy_url=%q as *url.URL: %w", s, err)
 	}
+	if !isURLSchemeValid(parsedURL.Scheme) {
+		return fmt.Errorf("cannot parse proxy_url=%q unsupported scheme format=%q, valid schemes: %s", s, parsedURL.Scheme, validURLSchemes)
+	}
 	u.URL = parsedURL
 	return nil
 }
@@ -124,16 +148,18 @@ func (u *URL) NewDialFunc(ac *promauth.Config) (fasthttp.DialFunc, error) {
 		return defaultDialFunc, nil
 	}
 	pu := u.URL
-	switch pu.Scheme {
-	case "http", "https", "socks5", "tls+socks5":
-	default:
-		return nil, fmt.Errorf("unknown scheme=%q for proxy_url=%q, must be http, https, socks5 or tls+socks5", pu.Scheme, pu.Redacted())
+	if !isURLSchemeValid(pu.Scheme) {
+		return nil, fmt.Errorf("unknown scheme=%q for proxy_url=%q, must be in %s", pu.Scheme, pu.Redacted(), validURLSchemes)
 	}
 	isTLS := (pu.Scheme == "https" || pu.Scheme == "tls+socks5")
 	proxyAddr := addMissingPort(pu.Host, isTLS)
 	var tlsCfg *tls.Config
 	if isTLS {
-		tlsCfg = ac.NewTLSConfig()
+		var err error
+		tlsCfg, err = ac.NewTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("cannot initialize tls config: %w", err)
+		}
 		if !tlsCfg.InsecureSkipVerify && tlsCfg.ServerName == "" {
 			tlsCfg.ServerName = tlsServerName(proxyAddr)
 		}
@@ -149,7 +175,10 @@ func (u *URL) NewDialFunc(ac *promauth.Config) (fasthttp.DialFunc, error) {
 		if isTLS {
 			proxyConn = tls.Client(proxyConn, tlsCfg)
 		}
-		authHeader := u.getAuthHeader(ac)
+		authHeader, err := u.getAuthHeader(ac)
+		if err != nil {
+			return nil, fmt.Errorf("cannot obtain Proxy-Authorization header: %w", err)
+		}
 		if authHeader != "" {
 			authHeader = "Proxy-Authorization: " + authHeader + "\r\n"
 			authHeader += ac.HeadersNoAuthString()

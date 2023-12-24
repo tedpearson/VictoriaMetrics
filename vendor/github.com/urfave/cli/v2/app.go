@@ -107,6 +107,8 @@ type App struct {
 	CustomAppHelpTemplate string
 	// SliceFlagSeparator is used to customize the separator for SliceFlag, the default is ","
 	SliceFlagSeparator string
+	// DisableSliceFlagSeparator is used to disable SliceFlagSeparator, the default is false
+	DisableSliceFlagSeparator bool
 	// Boolean to enable short-option handling so user can combine several
 	// single-character bool arguments into one
 	// i.e. foobar -o -v -> foobar -ov
@@ -119,7 +121,8 @@ type App struct {
 	// Treat all flags as normal arguments if true
 	SkipFlagParsing bool
 
-	didSetup bool
+	didSetup  bool
+	separator separatorSpec
 
 	rootCommand *Command
 }
@@ -214,6 +217,16 @@ func (a *App) Setup() {
 		})
 	}
 
+	if len(a.SliceFlagSeparator) != 0 {
+		a.separator.customized = true
+		a.separator.sep = a.SliceFlagSeparator
+	}
+
+	if a.DisableSliceFlagSeparator {
+		a.separator.customized = true
+		a.separator.disabled = true
+	}
+
 	var newCommands []*Command
 
 	for _, c := range a.Commands {
@@ -221,8 +234,8 @@ func (a *App) Setup() {
 		if c.HelpName != "" {
 			cname = c.HelpName
 		}
+		c.separator = a.separator
 		c.HelpName = fmt.Sprintf("%s %s", a.HelpName, cname)
-
 		c.flagCategories = newFlagCategoriesFromFlags(c.Flags)
 		newCommands = append(newCommands, c)
 	}
@@ -248,21 +261,10 @@ func (a *App) Setup() {
 	}
 	sort.Sort(a.categories.(*commandCategories))
 
-	a.flagCategories = newFlagCategories()
-	for _, fl := range a.Flags {
-		if cf, ok := fl.(CategorizableFlag); ok {
-			if cf.GetCategory() != "" {
-				a.flagCategories.AddFlag(cf.GetCategory(), cf)
-			}
-		}
-	}
+	a.flagCategories = newFlagCategoriesFromFlags(a.Flags)
 
 	if a.Metadata == nil {
 		a.Metadata = make(map[string]interface{})
-	}
-
-	if len(a.SliceFlagSeparator) != 0 {
-		defaultSliceFlagSeparator = a.SliceFlagSeparator
 	}
 }
 
@@ -289,11 +291,12 @@ func (a *App) newRootCommand() *Command {
 		categories:             a.categories,
 		SkipFlagParsing:        a.SkipFlagParsing,
 		isRoot:                 true,
+		separator:              a.separator,
 	}
 }
 
 func (a *App) newFlagSet() (*flag.FlagSet, error) {
-	return flagSet(a.Name, a.Flags)
+	return flagSet(a.Name, a.Flags, a.separator)
 }
 
 func (a *App) useShortOptionHandling() bool {
@@ -326,14 +329,24 @@ func (a *App) RunContext(ctx context.Context, arguments []string) (err error) {
 	a.rootCommand = a.newRootCommand()
 	cCtx.Command = a.rootCommand
 
+	if err := checkDuplicatedCmds(a.rootCommand); err != nil {
+		return err
+	}
 	return a.rootCommand.Run(cCtx, arguments...)
 }
 
-// This is a stub function to keep public API unchanged from old code
-//
-// Deprecated: use App.Run or App.RunContext
+// RunAsSubcommand is for legacy/compatibility purposes only. New code should only
+// use App.RunContext. This function is slated to be removed in v3.
 func (a *App) RunAsSubcommand(ctx *Context) (err error) {
-	return a.RunContext(ctx.Context, ctx.Args().Slice())
+	a.Setup()
+
+	cCtx := NewContext(a, nil, ctx)
+	cCtx.shellComplete = ctx.shellComplete
+
+	a.rootCommand = a.newRootCommand()
+	cCtx.Command = a.rootCommand
+
+	return a.rootCommand.Run(cCtx, ctx.Args().Slice()...)
 }
 
 func (a *App) suggestFlagFromError(err error, command string) (string, error) {
@@ -443,30 +456,6 @@ func (a *App) handleExitCoder(cCtx *Context, err error) {
 	} else {
 		HandleExitCoder(err)
 	}
-}
-
-func (a *App) commandNames() []string {
-	var cmdNames []string
-
-	for _, cmd := range a.Commands {
-		cmdNames = append(cmdNames, cmd.Names()...)
-	}
-
-	return cmdNames
-}
-
-func (a *App) validCommandName(checkCmdName string) bool {
-	valid := false
-	allCommandNames := a.commandNames()
-
-	for _, cmdName := range allCommandNames {
-		if checkCmdName == cmdName {
-			valid = true
-			break
-		}
-	}
-
-	return valid
 }
 
 func (a *App) argsWithDefaultCommand(oldArgs Args) Args {

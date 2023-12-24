@@ -156,6 +156,10 @@ func adjustBinaryOpTags(be *metricsql.BinaryOpExpr, left, right []*timeseries) (
 		groupOp = "ignoring"
 	}
 	groupTags := be.GroupModifier.Args
+	if be.KeepMetricNames && groupOp == "on" {
+		// Add __name__ to groupTags if metric name must be preserved.
+		groupTags = append(groupTags[:len(groupTags):len(groupTags)], "__name__")
+	}
 	for k, tssLeft := range mLeft {
 		tssRight := mRight[k]
 		if len(tssRight) == 0 {
@@ -220,6 +224,14 @@ func ensureSingleTimeseries(side string, be *metricsql.BinaryOpExpr, tss []*time
 
 func groupJoin(singleTimeseriesSide string, be *metricsql.BinaryOpExpr, rvsLeft, rvsRight, tssLeft, tssRight []*timeseries) ([]*timeseries, []*timeseries, error) {
 	joinTags := be.JoinModifier.Args
+	var skipTags []string
+	if strings.ToLower(be.GroupModifier.Op) == "on" {
+		skipTags = be.GroupModifier.Args
+	}
+	joinPrefix := ""
+	if be.JoinModifierPrefix != nil {
+		joinPrefix = be.JoinModifierPrefix.S
+	}
 	type tsPair struct {
 		left  *timeseries
 		right *timeseries
@@ -229,7 +241,7 @@ func groupJoin(singleTimeseriesSide string, be *metricsql.BinaryOpExpr, rvsLeft,
 		resetMetricGroupIfRequired(be, tsLeft)
 		if len(tssRight) == 1 {
 			// Easy case - right part contains only a single matching time series.
-			tsLeft.MetricName.SetTags(joinTags, &tssRight[0].MetricName)
+			tsLeft.MetricName.SetTags(joinTags, joinPrefix, skipTags, &tssRight[0].MetricName)
 			rvsLeft = append(rvsLeft, tsLeft)
 			rvsRight = append(rvsRight, tssRight[0])
 			continue
@@ -244,7 +256,7 @@ func groupJoin(singleTimeseriesSide string, be *metricsql.BinaryOpExpr, rvsLeft,
 		for _, tsRight := range tssRight {
 			var tsCopy timeseries
 			tsCopy.CopyFromShallowTimestamps(tsLeft)
-			tsCopy.MetricName.SetTags(joinTags, &tsRight.MetricName)
+			tsCopy.MetricName.SetTags(joinTags, joinPrefix, skipTags, &tsRight.MetricName)
 			bb.B = marshalMetricTagsSorted(bb.B[:0], &tsCopy.MetricName)
 			pair, ok := m[string(bb.B)]
 			if !ok {
@@ -313,6 +325,12 @@ func resetMetricGroupIfRequired(be *metricsql.BinaryOpExpr, ts *timeseries) {
 		// Do not reset MetricGroup for non-boolean `compare` binary ops like Prometheus does.
 		return
 	}
+	if be.KeepMetricNames {
+		// Do not reset MetricGroup if it is explicitly requested via `a op b keep_metric_names`
+		// See https://docs.victoriametrics.com/MetricsQL.html#keep_metric_names
+		return
+	}
+
 	ts.MetricName.ResetMetricGroup()
 }
 
@@ -504,7 +522,8 @@ func createTimeseriesMapByTagSet(be *metricsql.BinaryOpExpr, left, right []*time
 				logger.Panicf("BUG: unexpected binary op modifier %q", groupOp)
 			}
 			bb.B = marshalMetricTagsSorted(bb.B[:0], mn)
-			m[string(bb.B)] = append(m[string(bb.B)], ts)
+			k := string(bb.B)
+			m[k] = append(m[k], ts)
 		}
 		storage.PutMetricName(mn)
 		bbPool.Put(bb)

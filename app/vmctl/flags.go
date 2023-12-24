@@ -44,6 +44,8 @@ const (
 	// also used in vm-native
 	vmExtraLabel = "vm-extra-label"
 	vmRateLimit  = "vm-rate-limit"
+
+	vmInterCluster = "vm-intercluster"
 )
 
 var (
@@ -111,7 +113,7 @@ var (
 		&cli.Int64Flag{
 			Name: vmRateLimit,
 			Usage: "Optional data transfer rate limit in bytes per second.\n" +
-				"By default the rate limit is disabled. It can be useful for limiting load on configured via '--vmAddr' destination.",
+				"By default, the rate limit is disabled. It can be useful for limiting load on configured via '--vmAddr' destination.",
 		},
 		&cli.BoolFlag{
 			Name:  vmDisableProgressBar,
@@ -318,18 +320,27 @@ var (
 )
 
 const (
-	vmNativeFilterMatch     = "vm-native-filter-match"
-	vmNativeFilterTimeStart = "vm-native-filter-time-start"
-	vmNativeFilterTimeEnd   = "vm-native-filter-time-end"
-	vmNativeStepInterval    = "vm-native-step-interval"
+	vmNativeFilterMatch       = "vm-native-filter-match"
+	vmNativeFilterTimeStart   = "vm-native-filter-time-start"
+	vmNativeFilterTimeEnd     = "vm-native-filter-time-end"
+	vmNativeFilterTimeReverse = "vm-native-filter-time-reverse"
+	vmNativeStepInterval      = "vm-native-step-interval"
 
-	vmNativeSrcAddr     = "vm-native-src-addr"
-	vmNativeSrcUser     = "vm-native-src-user"
-	vmNativeSrcPassword = "vm-native-src-password"
+	vmNativeDisableBinaryProtocol = "vm-native-disable-binary-protocol"
+	vmNativeDisableHTTPKeepAlive  = "vm-native-disable-http-keep-alive"
+	vmNativeDisableRetries        = "vm-native-disable-retries"
 
-	vmNativeDstAddr     = "vm-native-dst-addr"
-	vmNativeDstUser     = "vm-native-dst-user"
-	vmNativeDstPassword = "vm-native-dst-password"
+	vmNativeSrcAddr        = "vm-native-src-addr"
+	vmNativeSrcUser        = "vm-native-src-user"
+	vmNativeSrcPassword    = "vm-native-src-password"
+	vmNativeSrcHeaders     = "vm-native-src-headers"
+	vmNativeSrcBearerToken = "vm-native-src-bearer-token"
+
+	vmNativeDstAddr        = "vm-native-dst-addr"
+	vmNativeDstUser        = "vm-native-dst-user"
+	vmNativeDstPassword    = "vm-native-dst-password"
+	vmNativeDstHeaders     = "vm-native-dst-headers"
+	vmNativeDstBearerToken = "vm-native-dst-bearer-token"
 )
 
 var (
@@ -342,16 +353,29 @@ var (
 			Value: `{__name__!=""}`,
 		},
 		&cli.StringFlag{
-			Name:  vmNativeFilterTimeStart,
-			Usage: "The time filter may contain either unix timestamp in seconds or RFC3339 values. E.g. '2020-01-01T20:07:00Z'",
+			Name:     vmNativeFilterTimeStart,
+			Usage:    "The time filter may contain different timestamp formats. See more details here https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#timestamp-formats",
+			Required: true,
 		},
 		&cli.StringFlag{
 			Name:  vmNativeFilterTimeEnd,
-			Usage: "The time filter may contain either unix timestamp in seconds or RFC3339 values. E.g. '2020-01-01T20:07:00Z'",
+			Usage: "The time filter may contain different timestamp formats. See more details here https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#timestamp-formats",
 		},
 		&cli.StringFlag{
-			Name:  vmNativeStepInterval,
-			Usage: fmt.Sprintf("Split export data into chunks. Requires setting --%s. Valid values are '%s','%s','%s'.", vmNativeFilterTimeStart, stepper.StepMonth, stepper.StepDay, stepper.StepHour),
+			Name: vmNativeStepInterval,
+			Usage: fmt.Sprintf("The time interval to split the migration into steps. For example, to migrate 1y of data with '--%s=month' vmctl will execute it in 12 separate requests from the beginning of the time range to its end. To reverse the order use '--%s'. Requires setting '--%s'. Valid values are '%s','%s','%s','%s','%s'.",
+				vmNativeStepInterval, vmNativeFilterTimeReverse, vmNativeFilterTimeStart, stepper.StepMonth, stepper.StepWeek, stepper.StepDay, stepper.StepHour, stepper.StepMinute),
+			Value: stepper.StepMonth,
+		},
+		&cli.BoolFlag{
+			Name:  vmNativeFilterTimeReverse,
+			Usage: fmt.Sprintf("Whether to reverse the order of time intervals split by '--%s' cmd-line flag. When set, the migration will start from the newest to the oldest data.", vmNativeStepInterval),
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  vmNativeDisableHTTPKeepAlive,
+			Usage: "Disable HTTP persistent connections for requests made to VictoriaMetrics components during export",
+			Value: false,
 		},
 		&cli.StringFlag{
 			Name: vmNativeSrcAddr,
@@ -371,6 +395,16 @@ var (
 			EnvVars: []string{"VM_NATIVE_SRC_PASSWORD"},
 		},
 		&cli.StringFlag{
+			Name: vmNativeSrcHeaders,
+			Usage: "Optional HTTP headers to send with each request to the corresponding source address. \n" +
+				"For example, --vm-native-src-headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding source address. \n" +
+				"Multiple headers must be delimited by '^^': --vm-native-src-headers='header1:value1^^header2:value2'",
+		},
+		&cli.StringFlag{
+			Name:  vmNativeSrcBearerToken,
+			Usage: "Optional bearer auth token to use for the corresponding `--vm-native-src-addr`",
+		},
+		&cli.StringFlag{
 			Name: vmNativeDstAddr,
 			Usage: "VictoriaMetrics address to perform import to. \n" +
 				" Should be the same as --httpListenAddr value for single-node version or vminsert component." +
@@ -387,6 +421,16 @@ var (
 			Usage:   "VictoriaMetrics password for basic auth",
 			EnvVars: []string{"VM_NATIVE_DST_PASSWORD"},
 		},
+		&cli.StringFlag{
+			Name: vmNativeDstHeaders,
+			Usage: "Optional HTTP headers to send with each request to the corresponding destination address. \n" +
+				"For example, --vm-native-dst-headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding destination address. \n" +
+				"Multiple headers must be delimited by '^^': --vm-native-dst-headers='header1:value1^^header2:value2'",
+		},
+		&cli.StringFlag{
+			Name:  vmNativeDstBearerToken,
+			Usage: "Optional bearer auth token to use for the corresponding `--vm-native-dst-addr`",
+		},
 		&cli.StringSliceFlag{
 			Name:  vmExtraLabel,
 			Value: nil,
@@ -396,25 +440,52 @@ var (
 		&cli.Int64Flag{
 			Name: vmRateLimit,
 			Usage: "Optional data transfer rate limit in bytes per second.\n" +
-				"By default the rate limit is disabled. It can be useful for limiting load on source or destination databases.",
+				"By default, the rate limit is disabled. It can be useful for limiting load on source or destination databases.",
+		},
+		&cli.BoolFlag{
+			Name: vmInterCluster,
+			Usage: "Enables cluster-to-cluster migration mode with automatic tenants data migration.\n" +
+				fmt.Sprintf(" In this mode --%s flag format is: 'http://vmselect:8481/'. --%s flag format is: http://vminsert:8480/. \n", vmNativeSrcAddr, vmNativeDstAddr) +
+				" TenantID will be appended automatically after discovering tenants from src.",
+		},
+		&cli.UintFlag{
+			Name:  vmConcurrency,
+			Usage: "Number of workers concurrently performing import requests to VM",
+			Value: 2,
+		},
+		&cli.BoolFlag{
+			Name:  vmNativeDisableRetries,
+			Usage: "Defines whether to disable retries with backoff policy for migration process",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name: vmNativeDisableBinaryProtocol,
+			Usage: "Whether to use https://docs.victoriametrics.com/#how-to-export-data-in-json-line-format" +
+				"instead of https://docs.victoriametrics.com/#how-to-export-data-in-native-format API." +
+				"Binary export/import API protocol implies less network and resource usage, as it transfers compressed binary data blocks." +
+				"Non-binary export/import API is less efficient, but supports deduplication if it is configured on vm-native-src-addr side.",
+			Value: false,
 		},
 	}
 )
 
 const (
-	remoteRead                 = "remote-read"
-	remoteReadUseStream        = "remote-read-use-stream"
-	remoteReadConcurrency      = "remote-read-concurrency"
-	remoteReadFilterTimeStart  = "remote-read-filter-time-start"
-	remoteReadFilterTimeEnd    = "remote-read-filter-time-end"
-	remoteReadFilterLabel      = "remote-read-filter-label"
-	remoteReadFilterLabelValue = "remote-read-filter-label-value"
-	remoteReadStepInterval     = "remote-read-step-interval"
-	remoteReadSrcAddr          = "remote-read-src-addr"
-	remoteReadUser             = "remote-read-user"
-	remoteReadPassword         = "remote-read-password"
-	remoteReadHTTPTimeout      = "remote-read-http-timeout"
-	remoteReadHeaders          = "remote-read-headers"
+	remoteRead                   = "remote-read"
+	remoteReadUseStream          = "remote-read-use-stream"
+	remoteReadConcurrency        = "remote-read-concurrency"
+	remoteReadFilterTimeStart    = "remote-read-filter-time-start"
+	remoteReadFilterTimeEnd      = "remote-read-filter-time-end"
+	remoteReadFilterTimeReverse  = "remote-read-filter-time-reverse"
+	remoteReadFilterLabel        = "remote-read-filter-label"
+	remoteReadFilterLabelValue   = "remote-read-filter-label-value"
+	remoteReadStepInterval       = "remote-read-step-interval"
+	remoteReadSrcAddr            = "remote-read-src-addr"
+	remoteReadUser               = "remote-read-user"
+	remoteReadPassword           = "remote-read-password"
+	remoteReadHTTPTimeout        = "remote-read-http-timeout"
+	remoteReadHeaders            = "remote-read-headers"
+	remoteReadInsecureSkipVerify = "remote-read-insecure-skip-verify"
+	remoteReadDisablePathAppend  = "remote-read-disable-path-append"
 )
 
 var (
@@ -425,9 +496,10 @@ var (
 			Value: 1,
 		},
 		&cli.TimestampFlag{
-			Name:   remoteReadFilterTimeStart,
-			Usage:  "The time filter in RFC3339 format to select timeseries with timestamp equal or higher than provided value. E.g. '2020-01-01T20:07:00Z'",
-			Layout: time.RFC3339,
+			Name:     remoteReadFilterTimeStart,
+			Usage:    "The time filter in RFC3339 format to select timeseries with timestamp equal or higher than provided value. E.g. '2020-01-01T20:07:00Z'",
+			Layout:   time.RFC3339,
+			Required: true,
 		},
 		&cli.TimestampFlag{
 			Name:   remoteReadFilterTimeEnd,
@@ -451,13 +523,18 @@ var (
 		},
 		&cli.BoolFlag{
 			Name:  remoteReadUseStream,
-			Usage: "Defines whether to use SAMPLES or STREAMED_XOR_CHUNKS mode. By default is uses SAMPLES mode. See https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/#streamed-chunks",
+			Usage: "Defines whether to use SAMPLES or STREAMED_XOR_CHUNKS mode. By default, is uses SAMPLES mode. See https://prometheus.io/docs/prometheus/latest/querying/remote_read_api/#streamed-chunks",
 			Value: false,
 		},
 		&cli.StringFlag{
-			Name:     remoteReadStepInterval,
-			Usage:    fmt.Sprintf("Split export data into chunks. Requires setting --%s. Valid values are %q,%q,%q,%q.", remoteReadFilterTimeStart, stepper.StepMonth, stepper.StepDay, stepper.StepHour, stepper.StepMinute),
-			Required: true,
+			Name: remoteReadStepInterval,
+			Usage: fmt.Sprintf("The time interval to split the migration into steps. For example, to migrate 1y of data with '--%s=month' vmctl will execute it in 12 separate requests from the beginning of the time range to its end. To reverse the order use '--%s'. Requires setting '--%s'. Valid values are '%s','%s','%s','%s','%s'.",
+				remoteReadStepInterval, remoteReadFilterTimeReverse, remoteReadFilterTimeStart, stepper.StepMonth, stepper.StepWeek, stepper.StepDay, stepper.StepHour, stepper.StepMinute), Required: true,
+		},
+		&cli.BoolFlag{
+			Name:  remoteReadFilterTimeReverse,
+			Usage: fmt.Sprintf("Whether to reverse the order of time intervals split by '--%s' cmd-line flag. When set, the migration will start from the newest to the oldest data.", remoteReadStepInterval),
+			Value: false,
 		},
 		&cli.StringFlag{
 			Name:     remoteReadSrcAddr,
@@ -476,7 +553,7 @@ var (
 		},
 		&cli.DurationFlag{
 			Name:  remoteReadHTTPTimeout,
-			Usage: "Timeout defines timeout for HTTP write request to remote storage",
+			Usage: "Timeout defines timeout for HTTP requests made by remote read client",
 		},
 		&cli.StringFlag{
 			Name:  remoteReadHeaders,
@@ -484,6 +561,16 @@ var (
 			Usage: "Optional HTTP headers to send with each request to the corresponding remote source storage \n" +
 				"For example, --remote-read-headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding remote source storage. \n" +
 				"Multiple headers must be delimited by '^^': --remote-read-headers='header1:value1^^header2:value2'",
+		},
+		&cli.BoolFlag{
+			Name:  remoteReadInsecureSkipVerify,
+			Usage: "Whether to skip TLS certificate verification when connecting to the remote read address",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  remoteReadDisablePathAppend,
+			Usage: "Whether to disable automatic appending of the /api/v1/read suffix to --remote-read-src-addr",
+			Value: false,
 		},
 	}
 )

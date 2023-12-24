@@ -82,10 +82,10 @@ type NodeDaemonEndpoints struct {
 	KubeletEndpoint DaemonEndpoint
 }
 
-// getTargetLabels returs labels for the given n.
+// getTargetLabels returns labels for the given n.
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#node
-func (n *Node) getTargetLabels(gw *groupWatcher) []*promutils.Labels {
+func (n *Node) getTargetLabels(_ *groupWatcher) []*promutils.Labels {
 	addr := getNodeAddr(n.Status.Addresses)
 	if len(addr) == 0 {
 		// Skip node without address

@@ -35,7 +35,7 @@ func NewLabelsFromMap(m map[string]string) *Labels {
 
 // MarshalYAML implements yaml.Marshaler interface.
 func (x *Labels) MarshalYAML() (interface{}, error) {
-	m := x.toMap()
+	m := x.ToMap()
 	return m, nil
 }
 
@@ -49,9 +49,9 @@ func (x *Labels) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// MarshalJSON returns JSON respresentation for x.
+// MarshalJSON returns JSON representation for x.
 func (x *Labels) MarshalJSON() ([]byte, error) {
-	m := x.toMap()
+	m := x.ToMap()
 	return json.Marshal(m)
 }
 
@@ -74,7 +74,8 @@ func (x *Labels) InitFromMap(m map[string]string) {
 	x.Sort()
 }
 
-func (x *Labels) toMap() map[string]string {
+// ToMap returns a map for the given labels x.
+func (x *Labels) ToMap() map[string]string {
 	labels := x.GetLabels()
 	m := make(map[string]string, len(labels))
 	for _, label := range labels {
@@ -187,6 +188,22 @@ func (x *Labels) Get(name string) string {
 	return ""
 }
 
+// Set label value for label with given name
+// If the label with the given name doesn't exist, it adds as the new label
+func (x *Labels) Set(name, value string) {
+	if name == "" || value == "" {
+		return
+	}
+	labels := x.GetLabels()
+	for i, label := range labels {
+		if label.Name == name {
+			labels[i].Value = value
+			return
+		}
+	}
+	x.Add(name, value)
+}
+
 // InternStrings interns all the strings used in x labels.
 func (x *Labels) InternStrings() {
 	labels := x.GetLabels()
@@ -234,7 +251,7 @@ func (x *Labels) RemoveDuplicates() {
 
 // RemoveMetaLabels removes all the `__meta_` labels from x.
 //
-// See https://www.robustperception.io/life-of-a-label fo details.
+// See https://www.robustperception.io/life-of-a-label for details.
 func (x *Labels) RemoveMetaLabels() {
 	src := x.Labels
 	dst := x.Labels[:0]
@@ -254,8 +271,7 @@ func (x *Labels) RemoveLabelsWithDoubleUnderscorePrefix() {
 	dst := x.Labels[:0]
 	for _, label := range src {
 		name := label.Name
-		// A hack: do not delete __vm_filepath label, since it is used by internal logic for FileSDConfig.
-		if strings.HasPrefix(name, "__") && name != "__vm_filepath" {
+		if strings.HasPrefix(name, "__") {
 			continue
 		}
 		dst = append(dst, label)
@@ -293,10 +309,21 @@ func PutLabels(x *Labels) {
 
 var labelsPool sync.Pool
 
+// MustNewLabelsFromString creates labels from s, which can have the form `metric{labels}`.
+//
+// This function must be used only in tests. Use NewLabelsFromString in production code.
+func MustNewLabelsFromString(metricWithLabels string) *Labels {
+	labels, err := NewLabelsFromString(metricWithLabels)
+	if err != nil {
+		logger.Panicf("BUG: cannot parse %q: %s", metricWithLabels, err)
+	}
+	return labels
+}
+
 // NewLabelsFromString creates labels from s, which can have the form `metric{labels}`.
 //
-// This function must be used only in tests
-func NewLabelsFromString(metricWithLabels string) *Labels {
+// This function must be used only in non performance-critical code, since it allocates too much
+func NewLabelsFromString(metricWithLabels string) (*Labels, error) {
 	stripDummyMetric := false
 	if strings.HasPrefix(metricWithLabels, "{") {
 		// Add a dummy metric name, since the parser needs it
@@ -311,10 +338,10 @@ func NewLabelsFromString(metricWithLabels string) *Labels {
 		err = fmt.Errorf("error during metric parse: %s", s)
 	})
 	if err != nil {
-		logger.Panicf("BUG: cannot parse %q: %s", metricWithLabels, err)
+		return nil, err
 	}
 	if len(rows.Rows) != 1 {
-		logger.Panicf("BUG: unexpected number of rows parsed; got %d; want 1", len(rows.Rows))
+		return nil, fmt.Errorf("unexpected number of rows parsed; got %d; want 1", len(rows.Rows))
 	}
 	r := rows.Rows[0]
 	var x Labels
@@ -324,5 +351,5 @@ func NewLabelsFromString(metricWithLabels string) *Labels {
 	for _, tag := range r.Tags {
 		x.Add(tag.Key, tag.Value)
 	}
-	return &x
+	return &x, nil
 }

@@ -2,6 +2,7 @@ package remotewrite
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,15 +16,21 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", "Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. "+
-		"By default the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data "+
+	forcePromProto = flagutil.NewArrayBool("remoteWrite.forcePromProto", "Whether to force Prometheus remote write protocol for sending data "+
+		"to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol")
+	forceVMProto = flagutil.NewArrayBool("remoteWrite.forceVMProto", "Whether to force VictoriaMetrics remote write protocol for sending data "+
+		"to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol")
+
+	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", 0, "Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. "+
+		"By default, the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data "+
 		"is sent after temporary unavailability of the remote storage")
-	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", "Timeout for sending a single block of data to the corresponding -remoteWrite.url")
+	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", time.Minute, "Timeout for sending a single block of data to the corresponding -remoteWrite.url")
 	proxyURL    = flagutil.NewArrayString("remoteWrite.proxyURL", "Optional proxy URL for writing data to the corresponding -remoteWrite.url. "+
 		"Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234")
 
@@ -32,9 +39,9 @@ var (
 		"to the corresponding -remoteWrite.url")
 	tlsKeyFile = flagutil.NewArrayString("remoteWrite.tlsKeyFile", "Optional path to client-side TLS certificate key to use when connecting to the corresponding -remoteWrite.url")
 	tlsCAFile  = flagutil.NewArrayString("remoteWrite.tlsCAFile", "Optional path to TLS CA file to use for verifying connections to the corresponding -remoteWrite.url. "+
-		"By default system CA is used")
+		"By default, system CA is used")
 	tlsServerName = flagutil.NewArrayString("remoteWrite.tlsServerName", "Optional TLS server name to use for connections to the corresponding -remoteWrite.url. "+
-		"By default the server name from -remoteWrite.url is used")
+		"By default, the server name from -remoteWrite.url is used")
 
 	headers = flagutil.NewArrayString("remoteWrite.headers", "Optional HTTP headers to send with each request to the corresponding -remoteWrite.url. "+
 		"For example, -remoteWrite.headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding -remoteWrite.url. "+
@@ -69,8 +76,12 @@ var (
 type client struct {
 	sanitizedURL   string
 	remoteWriteURL string
-	fq             *persistentqueue.FastQueue
-	hc             *http.Client
+
+	// Whether to use VictoriaMetrics remote write protocol for sending the data to remoteWriteURL
+	useVMProto bool
+
+	fq *persistentqueue.FastQueue
+	hc *http.Client
 
 	sendBlock func(block []byte) bool
 	authCfg   *promauth.Config
@@ -95,12 +106,15 @@ type client struct {
 func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persistentqueue.FastQueue, concurrency int) *client {
 	authCfg, err := getAuthConfig(argIdx)
 	if err != nil {
-		logger.Panicf("FATAL: cannot initialize auth config for remoteWrite.url=%q: %s", remoteWriteURL, err)
+		logger.Fatalf("cannot initialize auth config for -remoteWrite.url=%q: %s", remoteWriteURL, err)
 	}
-	tlsCfg := authCfg.NewTLSConfig()
+	tlsCfg, err := authCfg.NewTLSConfig()
+	if err != nil {
+		logger.Fatalf("cannot initialize tls config for -remoteWrite.url=%q: %s", remoteWriteURL, err)
+	}
 	awsCfg, err := getAWSAPIConfig(argIdx)
 	if err != nil {
-		logger.Fatalf("FATAL: cannot initialize AWS Config for remoteWrite.url=%q: %s", remoteWriteURL, err)
+		logger.Fatalf("cannot initialize AWS Config for -remoteWrite.url=%q: %s", remoteWriteURL, err)
 	}
 	tr := &http.Transport{
 		DialContext:         statDial,
@@ -122,24 +136,44 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		}
 		tr.Proxy = http.ProxyURL(pu)
 	}
+	hc := &http.Client{
+		Transport: tr,
+		Timeout:   sendTimeout.GetOptionalArg(argIdx),
+	}
 	c := &client{
 		sanitizedURL:   sanitizedURL,
 		remoteWriteURL: remoteWriteURL,
 		authCfg:        authCfg,
 		awsCfg:         awsCfg,
 		fq:             fq,
-		hc: &http.Client{
-			Transport: tr,
-			Timeout:   sendTimeout.GetOptionalArgOrDefault(argIdx, time.Minute),
-		},
-		stopCh: make(chan struct{}),
+		hc:             hc,
+		stopCh:         make(chan struct{}),
 	}
 	c.sendBlock = c.sendBlockHTTP
+
+	useVMProto := forceVMProto.GetOptionalArg(argIdx)
+	usePromProto := forcePromProto.GetOptionalArg(argIdx)
+	if useVMProto && usePromProto {
+		logger.Fatalf("-remoteWrite.useVMProto and -remoteWrite.usePromProto cannot be set simultaneously for -remoteWrite.url=%s", sanitizedURL)
+	}
+	if !useVMProto && !usePromProto {
+		// Auto-detect whether the remote storage supports VictoriaMetrics remote write protocol.
+		doRequest := func(url string) (*http.Response, error) {
+			return c.doRequest(url, nil)
+		}
+		useVMProto = common.HandleVMProtoClientHandshake(c.remoteWriteURL, doRequest)
+		if !useVMProto {
+			logger.Infof("the remote storage at %q doesn't support VictoriaMetrics remote write protocol. Switching to Prometheus remote write protocol. "+
+				"See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol", sanitizedURL)
+		}
+	}
+	c.useVMProto = useVMProto
+
 	return c
 }
 
 func (c *client) init(argIdx, concurrency int, sanitizedURL string) {
-	if bytesPerSec := rateLimit.GetOptionalArgOrDefault(argIdx, 0); bytesPerSec > 0 {
+	if bytesPerSec := rateLimit.GetOptionalArg(argIdx); bytesPerSec > 0 {
 		logger.Infof("applying %d bytes per second rate limit for -remoteWrite.url=%q", bytesPerSec, sanitizedURL)
 		c.rl.perSecondLimit = int64(bytesPerSec)
 	}
@@ -148,7 +182,7 @@ func (c *client) init(argIdx, concurrency int, sanitizedURL string) {
 	c.bytesSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_bytes_sent_total{url=%q}`, c.sanitizedURL))
 	c.blocksSent = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_blocks_sent_total{url=%q}`, c.sanitizedURL))
 	c.rateLimit = metrics.GetOrCreateGauge(fmt.Sprintf(`vmagent_remotewrite_rate_limit{url=%q}`, c.sanitizedURL), func() float64 {
-		return float64(rateLimit.GetOptionalArgOrDefault(argIdx, 0))
+		return float64(rateLimit.GetOptionalArg(argIdx))
 	})
 	c.requestDuration = metrics.GetOrCreateHistogram(fmt.Sprintf(`vmagent_remotewrite_duration_seconds{url=%q}`, c.sanitizedURL))
 	c.requestsOKCount = metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="2XX"}`, c.sanitizedURL))
@@ -227,7 +261,7 @@ func getAuthConfig(argIdx int) (*promauth.Config, error) {
 	}
 	authCfg, err := opts.NewConfig()
 	if err != nil {
-		return nil, fmt.Errorf("cannot populate OAuth2 config for remoteWrite idx: %d, err: %w", argIdx, err)
+		return nil, fmt.Errorf("cannot populate auth config for remoteWrite idx: %d, err: %w", argIdx, err)
 	}
 	return authCfg, nil
 }
@@ -271,7 +305,7 @@ func (c *client) runWorker() {
 				continue
 			}
 			// Return unsent block to the queue.
-			c.fq.MustWriteBlock(block)
+			c.fq.MustWriteBlockIgnoreDisabledPQ(block)
 			return
 		case <-c.stopCh:
 			// c must be stopped. Wait for a while in the hope the block will be sent.
@@ -280,49 +314,85 @@ func (c *client) runWorker() {
 			case ok := <-ch:
 				if !ok {
 					// Return unsent block to the queue.
-					c.fq.MustWriteBlock(block)
+					c.fq.MustWriteBlockIgnoreDisabledPQ(block)
 				}
 			case <-time.After(graceDuration):
 				// Return unsent block to the queue.
-				c.fq.MustWriteBlock(block)
+				c.fq.MustWriteBlockIgnoreDisabledPQ(block)
 			}
 			return
 		}
 	}
 }
 
-// sendBlockHTTP returns false only if c.stopCh is closed.
+func (c *client) doRequest(url string, body []byte) (*http.Response, error) {
+	req, err := c.newRequest(url, body)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.hc.Do(req)
+	if err == nil {
+		return resp, nil
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	// It is likely connection became stale or timed out during the first request.
+	// Make another attempt in hope request will succeed.
+	// If not, the error should be handled by the caller as usual.
+	// This should help with https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4139
+	req, err = c.newRequest(url, body)
+	if err != nil {
+		return nil, fmt.Errorf("second attempt: %w", err)
+	}
+	resp, err = c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("second attempt: %w", err)
+	}
+	return resp, nil
+}
+
+func (c *client) newRequest(url string, body []byte) (*http.Request, error) {
+	reqBody := bytes.NewBuffer(body)
+	req, err := http.NewRequest(http.MethodPost, url, reqBody)
+	if err != nil {
+		logger.Panicf("BUG: unexpected error from http.NewRequest(%q): %s", url, err)
+	}
+	err = c.authCfg.SetHeaders(req, true)
+	if err != nil {
+		return nil, err
+	}
+	h := req.Header
+	h.Set("User-Agent", "vmagent")
+	h.Set("Content-Type", "application/x-protobuf")
+	if c.useVMProto {
+		h.Set("Content-Encoding", "zstd")
+		h.Set("X-VictoriaMetrics-Remote-Write-Version", "1")
+	} else {
+		h.Set("Content-Encoding", "snappy")
+		h.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+	}
+	if c.awsCfg != nil {
+		sigv4Hash := awsapi.HashHex(body)
+		if err := c.awsCfg.SignRequest(req, sigv4Hash); err != nil {
+			return nil, fmt.Errorf("cannot sign remoteWrite request with AWS sigv4: %w", err)
+		}
+	}
+	return req, nil
+}
+
+// sendBlockHTTP sends the given block to c.remoteWriteURL.
+//
+// The function returns false only if c.stopCh is closed.
 // Otherwise it tries sending the block to remote storage indefinitely.
 func (c *client) sendBlockHTTP(block []byte) bool {
 	c.rl.register(len(block), c.stopCh)
 	retryDuration := time.Second
 	retriesCount := 0
-	c.bytesSent.Add(len(block))
-	c.blocksSent.Inc()
-	sigv4Hash := ""
-	if c.awsCfg != nil {
-		sigv4Hash = awsapi.HashHex(block)
-	}
 
 again:
-	req, err := http.NewRequest("POST", c.remoteWriteURL, bytes.NewBuffer(block))
-	if err != nil {
-		logger.Panicf("BUG: unexpected error from http.NewRequest(%q): %s", c.sanitizedURL, err)
-	}
-	c.authCfg.SetHeaders(req, true)
-	h := req.Header
-	h.Set("User-Agent", "vmagent")
-	h.Set("Content-Type", "application/x-protobuf")
-	h.Set("Content-Encoding", "snappy")
-	h.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
-	if c.awsCfg != nil {
-		if err := c.awsCfg.SignRequest(req, sigv4Hash); err != nil {
-			// there is no need in retry, request will be rejected by client.Do and retried by code below
-			logger.Warnf("cannot sign remoteWrite request with AWS sigv4: %s", err)
-		}
-	}
 	startTime := time.Now()
-	resp, err := c.hc.Do(req)
+	resp, err := c.doRequest(c.remoteWriteURL, block)
 	c.requestDuration.UpdateDuration(startTime)
 	if err != nil {
 		c.errorsCount.Inc()
@@ -347,6 +417,8 @@ again:
 	if statusCode/100 == 2 {
 		_ = resp.Body.Close()
 		c.requestsOKCount.Inc()
+		c.bytesSent.Add(len(block))
+		c.blocksSent.Inc()
 		return true
 	}
 	metrics.GetOrCreateCounter(fmt.Sprintf(`vmagent_remotewrite_requests_total{url=%q, status_code="%d"}`, c.sanitizedURL, statusCode)).Inc()

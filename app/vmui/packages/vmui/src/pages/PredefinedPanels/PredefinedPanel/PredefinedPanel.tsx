@@ -4,7 +4,6 @@ import { AxisRange, YaxisState } from "../../../state/graph/reducer";
 import GraphView from "../../../components/Views/GraphView/GraphView";
 import { useFetchQuery } from "../../../hooks/useFetchQuery";
 import Spinner from "../../../components/Main/Spinner/Spinner";
-import StepConfigurator from "../../../components/Configurators/StepConfigurator/StepConfigurator";
 import GraphSettings from "../../../components/Configurators/GraphSettings/GraphSettings";
 import { marked } from "marked";
 import { useTimeDispatch, useTimeState } from "../../../state/time/TimeStateContext";
@@ -12,6 +11,8 @@ import { InfoIcon } from "../../../components/Main/Icons";
 import "./style.scss";
 import Alert from "../../../components/Main/Alert/Alert";
 import Tooltip from "../../../components/Main/Tooltip/Tooltip";
+import { useGraphState } from "../../../state/graph/GraphStateContext";
+import useDeviceDetect from "../../../hooks/useDeviceDetect";
 
 export interface PredefinedPanelsProps extends PanelSettings {
   filename: string;
@@ -26,13 +27,13 @@ const PredefinedPanel: FC<PredefinedPanelsProps> = ({
   filename,
   alias
 }) => {
-
+  const { isMobile } = useDeviceDetect();
   const { period } = useTimeState();
+  const { customStep } = useGraphState();
   const dispatch = useTimeDispatch();
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(true);
-  const [customStep, setCustomStep] = useState<number>(period.step || 1);
+  const [visible, setVisible] = useState(false);
   const [yaxis, setYaxis] = useState<YaxisState>({
     limits: {
       enable: false,
@@ -73,7 +74,7 @@ const PredefinedPanel: FC<PredefinedPanelsProps> = ({
     return () => {
       if (containerRef.current) observer.unobserve(containerRef.current);
     };
-  }, []);
+  }, [containerRef]);
 
   if (!validExpr) return (
     <Alert variant="error">
@@ -116,12 +117,6 @@ const PredefinedPanel: FC<PredefinedPanelsProps> = ({
       <h3 className="vm-predefined-panel-header__title">
         {title || ""}
       </h3>
-      <div className="vm-predefined-panel-header__step">
-        <StepConfigurator
-          defaultStep={period.step}
-          setStep={setCustomStep}
-        />
-      </div>
       <GraphSettings
         yaxis={yaxis}
         setYaxisLimits={setYaxisLimits}
@@ -144,6 +139,7 @@ const PredefinedPanel: FC<PredefinedPanelsProps> = ({
         setYaxisLimits={setYaxisLimits}
         setPeriod={setPeriod}
         fullWidth={false}
+        height={isMobile ? window.innerHeight * 0.5 : 500}
       />
       }
     </div>

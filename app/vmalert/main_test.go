@@ -8,10 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/rule"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 )
+
+func init() {
+	// Disable rand sleep on group start during tests in order to speed up test execution.
+	// Rand sleep is needed only in prod code.
+	rule.SkipRandSleepOnGroupStart = true
+}
 
 func TestGetExternalURL(t *testing.T) {
 	expURL := "https://vicotriametrics.com/path"
@@ -90,17 +98,18 @@ groups:
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = os.Remove(f.Name()) }()
 	writeToFile(t, f.Name(), rules1)
 
-	*rulesCheckInterval = 200 * time.Millisecond
+	*configCheckInterval = 200 * time.Millisecond
 	*rulePath = []string{f.Name()}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &manager{
-		querierBuilder: &fakeQuerier{},
-		groups:         make(map[uint64]*Group),
+		querierBuilder: &datasource.FakeQuerier{},
+		groups:         make(map[uint64]*rule.Group),
 		labels:         map[string]string{},
-		notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&fakeNotifier{}} },
+		notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&notifier.FakeNotifier{}} },
 		rw:             &remotewrite.Client{},
 	}
 
@@ -117,14 +126,37 @@ groups:
 		return len(m.groups)
 	}
 
-	time.Sleep(*rulesCheckInterval * 2)
+	checkCfg := func(err error) {
+		cErr := getLastConfigError()
+		cfgSuc := configSuccess.Get()
+		if err != nil {
+			if cErr == nil {
+				t.Fatalf("expected to have config error %s; got nil instead", cErr)
+			}
+			if cfgSuc != 0 {
+				t.Fatalf("expected to have metric configSuccess to be set to 0; got %d instead", cfgSuc)
+			}
+			return
+		}
+
+		if cErr != nil {
+			t.Fatalf("unexpected config error: %s", cErr)
+		}
+		if cfgSuc != 1 {
+			t.Fatalf("expected to have metric configSuccess to be set to 1; got %d instead", cfgSuc)
+		}
+	}
+
+	time.Sleep(*configCheckInterval * 2)
+	checkCfg(nil)
 	groupsLen := lenLocked(m)
 	if groupsLen != 1 {
 		t.Fatalf("expected to have exactly 1 group loaded; got %d", groupsLen)
 	}
 
 	writeToFile(t, f.Name(), rules2)
-	time.Sleep(*rulesCheckInterval * 2)
+	time.Sleep(*configCheckInterval * 2)
+	checkCfg(nil)
 	groupsLen = lenLocked(m)
 	if groupsLen != 2 {
 		fmt.Println(m.groups)
@@ -133,7 +165,8 @@ groups:
 
 	writeToFile(t, f.Name(), rules1)
 	procutil.SelfSIGHUP()
-	time.Sleep(*rulesCheckInterval / 2)
+	time.Sleep(*configCheckInterval / 2)
+	checkCfg(nil)
 	groupsLen = lenLocked(m)
 	if groupsLen != 1 {
 		t.Fatalf("expected to have exactly 1 group loaded; got %d", groupsLen)
@@ -141,7 +174,8 @@ groups:
 
 	writeToFile(t, f.Name(), `corrupted`)
 	procutil.SelfSIGHUP()
-	time.Sleep(*rulesCheckInterval / 2)
+	time.Sleep(*configCheckInterval / 2)
+	checkCfg(fmt.Errorf("config error"))
 	groupsLen = lenLocked(m)
 	if groupsLen != 1 { // should remain unchanged
 		t.Fatalf("expected to have exactly 1 group loaded; got %d", groupsLen)

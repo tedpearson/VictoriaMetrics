@@ -1,83 +1,42 @@
-import React, { FC, useState } from "preact/compat";
-import { isMacOs } from "../../../utils/detect-os";
+import React, { FC, useCallback } from "preact/compat";
 import { getAppModeEnable } from "../../../utils/app-mode";
 import Button from "../Button/Button";
 import { KeyboardIcon } from "../Icons";
 import Modal from "../Modal/Modal";
 import "./style.scss";
 import Tooltip from "../Tooltip/Tooltip";
+import keyList from "./constants/keyList";
+import { isMacOs } from "../../../utils/detect-device";
+import useBoolean from "../../../hooks/useBoolean";
+import useEventListener from "../../../hooks/useEventListener";
 
-const ctrlMeta = isMacOs() ? "Cmd" : "Ctrl";
+const title = "Shortcut keys";
+const isMac = isMacOs();
+const keyOpenHelp = isMac ? "Cmd + /" : "F1";
 
-const keyList = [
-  {
-    title: "Query",
-    list: [
-      {
-        keys: ["Enter"],
-        description: "Run"
-      },
-      {
-        keys: ["Shift", "Enter"],
-        description: "Multi-line queries"
-      },
-      {
-        keys: [ctrlMeta, "Arrow Up"],
-        description: "Previous command from the Query history"
-      },
-      {
-        keys: [ctrlMeta, "Arrow Down"],
-        description: "Next command from the Query history"
-      }
-    ]
-  },
-  {
-    title: "Graph",
-    list: [
-      {
-        keys: [ctrlMeta, "Scroll Up"],
-        description: "Zoom in"
-      },
-      {
-        keys: [ctrlMeta, "Scroll Down"],
-        description: "Zoom out"
-      },
-      {
-        keys: [ctrlMeta, "Click and Drag"],
-        description: "Move the graph left/right"
-      },
-    ]
-  },
-  {
-    title: "Legend",
-    list: [
-      {
-        keys: ["Mouse Click"],
-        description: "Select series"
-      },
-      {
-        keys: [ctrlMeta, "Mouse Click"],
-        description: "Toggle multiple series"
-      }
-    ]
-  }
-];
-
-const ShortcutKeys: FC = () => {
-  const [openList, setOpenList] = useState(false);
+const ShortcutKeys: FC<{ showTitle?: boolean }> = ({ showTitle }) => {
   const appModeEnable = getAppModeEnable();
 
-  const handleOpen = () => {
-    setOpenList(true);
-  };
+  const {
+    value: openList,
+    setTrue: handleOpen,
+    setFalse: handleClose,
+  } = useBoolean(false);
 
-  const handleClose = () => {
-    setOpenList(false);
-  };
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    const openOnMac = isMac && e.key === "/" && e.metaKey;
+    const openOnOther = !isMac && e.key === "F1" && !e.metaKey;
+    if (openOnMac || openOnOther) {
+      handleOpen();
+    }
+  }, [handleOpen]);
+
+  useEventListener("keydown", handleKeyDown);
 
   return <>
     <Tooltip
-      title="Shortcut keys"
+      open={showTitle === true ? false : undefined}
+      title={`${title} (${keyOpenHelp})`}
       placement="bottom-center"
     >
       <Button
@@ -86,7 +45,10 @@ const ShortcutKeys: FC = () => {
         color="primary"
         startIcon={<KeyboardIcon/>}
         onClick={handleOpen}
-      />
+        ariaLabel={title}
+      >
+        {showTitle && title}
+      </Button>
     </Tooltip>
 
     {openList && (
@@ -100,24 +62,20 @@ const ShortcutKeys: FC = () => {
               className="vm-shortcuts-section"
               key={section.title}
             >
+              {section.readMore && (
+                <div className="vm-shortcuts-section__read-more">{section.readMore}</div>
+              )}
               <h3 className="vm-shortcuts-section__title">
                 {section.title}
               </h3>
               <div className="vm-shortcuts-section-list">
-                {section.list.map(l => (
+                {section.list.map((l, i) => (
                   <div
                     className="vm-shortcuts-section-list-item"
-                    key={l.keys.join("+")}
+                    key={`${section.title}_${i}`}
                   >
                     <div className="vm-shortcuts-section-list-item__key">
-                      {l.keys.map((k, i) => (
-                        <>
-                          <code key={k}>
-                            {k}
-                          </code>
-                          {i !== l.keys.length - 1 ? "+" : ""}
-                        </>
-                      ))}
+                      {l.keys}
                     </div>
                     <p className="vm-shortcuts-section-list-item__description">
                       {l.description}

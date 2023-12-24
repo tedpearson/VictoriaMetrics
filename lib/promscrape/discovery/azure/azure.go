@@ -43,7 +43,7 @@ type SDConfig struct {
 	ProxyClientConfig promauth.ProxyClientConfig `yaml:",inline"`
 }
 
-// GetLabels returns Consul labels according to sdc.
+// GetLabels returns Azure labels according to sdc.
 func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	ac, err := getAPIConfig(sdc, baseDir)
 	if err != nil {
@@ -58,7 +58,11 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.c.Stop()
+	}
 }
 
 func appendMachineLabels(vms []virtualMachine, port int, sdc *SDConfig) []*promutils.Labels {
@@ -96,6 +100,9 @@ func appendMachineLabels(vms []virtualMachine, port int, sdc *SDConfig) []*promu
 			}
 			if vm.scaleSet != "" {
 				m.Add("__meta_azure_machine_scale_set", vm.scaleSet)
+			}
+			if vm.Properties.HardwareProfile.VMSize != "" {
+				m.Add("__meta_azure_machine_size", vm.Properties.HardwareProfile.VMSize)
 			}
 			for k, v := range vm.Tags {
 				m.Add(discoveryutils.SanitizeLabelName("__meta_azure_machine_tag_"+k), v)

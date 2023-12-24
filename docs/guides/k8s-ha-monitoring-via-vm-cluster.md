@@ -1,3 +1,13 @@
+---
+weight: 9
+title: HA monitoring setup in Kubernetes via VictoriaMetrics Cluster
+menu:
+  docs:
+    parent: "guides"
+    weight: 9
+aliases:
+- /guides/k8s-ha-monitoring-via-vm-cluster.html
+---
 # HA monitoring setup in Kubernetes via VictoriaMetrics Cluster
 
 
@@ -56,7 +66,7 @@ EOF
 </div>
 
 * The `Helm install vmcluster vm/victoria-metrics-cluster` command installs [VictoriaMetrics cluster](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html) to the default [namespace](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/).
-* `dedup.minScrapeInterval: 1ms` configures [de-deplication](https://docs.victoriametrics.com/#deduplication) for the cluster that de-duplicates data points in the same time series if they fall within the same discrete 1s bucket. The earliest data point will be kept. In the case of equal timestamps, an arbitrary data point will be kept.
+* `dedup.minScrapeInterval: 1ms` configures [de-duplication](https://docs.victoriametrics.com/#deduplication) for the cluster that de-duplicates data points in the same time series if they fall within the same discrete 1ms bucket. The earliest data point will be kept. In the case of equal timestamps, an arbitrary data point will be kept.
 * `replicationFactor: 2` Replication factor for the ingested data, i.e. how many copies should be made among distinct `-storageNode` instances. If the replication factor is greater than one, the deduplication must be enabled on the remote storage side.
 * `podAnnotations: prometheus.io/scrape: "true"` enables the scraping of metrics from the vmselect, vminsert and vmstorage pods.
 * `podAnnotations:prometheus.io/port: "some_port" ` enables the scraping of metrics from the vmselect, vminsert and vmstorage pods from corresponding ports.
@@ -253,7 +263,7 @@ The expected output is:
 vmagent-victoria-metrics-agent-57ddbdc55d-h4ljb                1/1     Running   0          13s
 ```
 
-## 4. Verifying HA of VictoraMetrics Cluster
+## 4. Verifying HA of VictoriaMetrics Cluster
 
 Run the following command to check that VictoriaMetrics services are up and running:
 <div class="with-copy" markdown="1">
@@ -294,7 +304,7 @@ The expected output:
 vmcluster-victoria-metrics-cluster-vmselect    ClusterIP   10.88.2.69    <none>        8481/TCP                     1m
 ```
 
-Run the following command to make `vmselect`'s port accessable from the local machine:
+Run the following command to make `vmselect`'s port accessible from the local machine:
 
 <div class="with-copy" markdown="1">
 
@@ -368,19 +378,19 @@ To test via Grafana, we need to install it first. [Install and connect Grafana t
 
 
 <p align="center">
-  <img src="guide-vmcluster-k8s-ha-explore.png" width="800" alt="grafana explore">
+  <img src="k8s-ha-monitoring-via-vm-cluster_explore.webp" width="800" alt="grafana explore">
 </p>
 
 Choose `victoriametrics` from the list of datasources and enter `count(up{kubernetes_pod_name=~".*vmselect.*"})` to the **Metric browser** field as shown on the screenshot, then press **Run query** button:
 
 <p align="center">
-  <img src="guide-vmcluster-k8s-ha-explore-count-up.png" width="800" alt="">
+  <img src="k8s-ha-monitoring-via-vm-cluster_explore-count-up.webp" width="800" alt="">
 </p>
 
 The expected output is:
 
 <p align="center">
-  <img src="guide-vmcluster-k8s-ha-explore-count-up-graph.png" width="800" alt="">
+  <img src="k8s-ha-monitoring-via-vm-cluster_explore-count-up-graph.webp" width="800" alt="">
 </p>
 
 ## 5. High Availability
@@ -414,7 +424,7 @@ Return to Grafana Explore and press the  **Run query** button again.
 The expected output is:
 
 <p align="center">
-  <img src="guide-vmcluster-k8s-ha-explore-count-up-graph.png" width="800" alt="">
+  <img src="k8s-ha-monitoring-via-vm-cluster_explore-count-up-graph.webp" width="800" alt="">
 </p>
 
 As you can see, after we scaled down the `vmstorage` replicas number from three to two pods, metrics are still available and correct. The response is not partial as it was before scaling. Also we see that query `count(up{kubernetes_pod_name=~".*vmselect.*"})` returns the same value as before.
@@ -422,7 +432,7 @@ As you can see, after we scaled down the `vmstorage` replicas number from three 
 To confirm that the number of `vmstorage` pods is equivalent to two, execute the following request in Grafana Explore:
 
 <p align="center">
-  <img src="guide-vmcluster-k8s-ha-explore-count-up-graph2.png" width="800" alt="">
+  <img src="k8s-ha-monitoring-via-vm-cluster_explore-count-up-graph2.webp" width="800" alt="">
 </p>
 
 

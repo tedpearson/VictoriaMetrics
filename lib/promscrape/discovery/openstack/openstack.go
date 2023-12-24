@@ -51,11 +51,15 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	case "instance":
 		return getInstancesLabels(cfg)
 	default:
-		return nil, fmt.Errorf("unexpected `role`: %q; must be one of `instance` or `hypervisor`; skipping it", sdc.Role)
+		return nil, fmt.Errorf("skipping unexpected role=%q; must be one of `instance` or `hypervisor`", sdc.Role)
 	}
 }
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.client.CloseIdleConnections()
+	}
 }

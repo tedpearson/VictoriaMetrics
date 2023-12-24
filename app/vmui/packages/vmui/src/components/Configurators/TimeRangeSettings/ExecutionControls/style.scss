@@ -9,6 +9,11 @@
     border-radius: calc($button-radius + 1px);
     min-width: 107px;
 
+    &_mobile {
+      flex-direction: column;
+      gap: $padding-medium;
+    }
+
     &__arrow {
       display: flex;
       align-items: center;
@@ -28,5 +33,11 @@
     overflow: auto;
     padding: $padding-small 0;
     font-size: $font-size;
+
+    &_mobile {
+      width: 100%;
+      max-height: calc(($vh * 100) - 70px);
+      padding: 0;
+    }
   }
 }

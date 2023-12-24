@@ -50,11 +50,15 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	case "nodes":
 		return getNodesLabels(cfg)
 	default:
-		return nil, fmt.Errorf("unexpected `role`: %q; must be one of `tasks`, `services` or `nodes`; skipping it", sdc.Role)
+		return nil, fmt.Errorf("skipping unexpected role=%q; must be one of `tasks`, `services` or `nodes`", sdc.Role)
 	}
 }
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.client.Stop()
+	}
 }

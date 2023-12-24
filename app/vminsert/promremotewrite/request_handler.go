@@ -8,8 +8,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
-	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/promremotewrite"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/promremotewrite/stream"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -24,10 +23,9 @@ func InsertHandler(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(req.Body, func(tss []prompb.TimeSeries) error {
-			return insertRows(tss, extraLabels)
-		})
+	isVMRemoteWrite := req.Header.Get("Content-Encoding") == "zstd"
+	return stream.Parse(req.Body, isVMRemoteWrite, func(tss []prompb.TimeSeries) error {
+		return insertRows(tss, extraLabels)
 	})
 }
 

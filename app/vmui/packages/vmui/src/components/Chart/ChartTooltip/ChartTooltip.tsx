@@ -1,38 +1,42 @@
-import React, { FC, useEffect, useMemo, useRef, useState } from "preact/compat";
-import uPlot, { Series } from "uplot";
-import { MetricResult } from "../../../api/types";
-import { formatPrettyNumber, getColorLine, getLegendLabel } from "../../../utils/uplot/helpers";
-import dayjs from "dayjs";
-import { DATE_FULL_TIMEZONE_FORMAT } from "../../../constants/date";
+import React, { FC, useCallback, useEffect, useRef, useState } from "preact/compat";
+import { MouseEvent as ReactMouseEvent } from "react";
+import useEventListener from "../../../hooks/useEventListener";
 import ReactDOM from "react-dom";
-import get from "lodash.get";
+import classNames from "classnames";
+import uPlot from "uplot";
 import Button from "../../Main/Button/Button";
 import { CloseIcon, DragIcon } from "../../Main/Icons";
-import classNames from "classnames";
-import { MouseEvent as ReactMouseEvent } from "react";
-import "./style.scss";
+import { SeriesItemStatsFormatted } from "../../../types";
+import { STATS_ORDER } from "../../../constants/graph";
 
 export interface ChartTooltipProps {
-  id: string,
-  u: uPlot,
-  metrics: MetricResult[],
-  series: Series[],
-  unit?: string,
-  isSticky?: boolean,
-  tooltipOffset: { left: number, top: number },
-  tooltipIdx: { seriesIdx: number, dataIdx: number },
-  onClose?: (id: string) => void
+  u?: uPlot;
+  id: string;
+  title?: string;
+  dates: string[];
+  value: string | number | null;
+  point: { top: number, left: number };
+  unit?: string;
+  statsFormatted?: SeriesItemStatsFormatted;
+  isSticky?: boolean;
+  info?: string;
+  marker?: string;
+  show?: boolean;
+  onClose?: (id: string) => void;
 }
 
 const ChartTooltip: FC<ChartTooltipProps> = ({
   u,
   id,
+  title,
+  dates,
+  value,
+  point,
   unit = "",
-  metrics,
-  series,
-  tooltipIdx,
-  tooltipOffset,
+  info,
+  statsFormatted,
   isSticky,
+  marker,
   onClose
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -41,88 +45,67 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
   const [moving, setMoving] = useState(false);
   const [moved, setMoved] = useState(false);
 
-  const [seriesIdx, setSeriesIdx] = useState(tooltipIdx.seriesIdx);
-  const [dataIdx, setDataIdx] = useState(tooltipIdx.dataIdx);
-
-  const targetPortal = useMemo(() => u.root.querySelector(".u-wrap"), [u]);
-
-  const value = useMemo(() => get(u, ["data", seriesIdx, dataIdx], 0), [u, seriesIdx, dataIdx]);
-  const valueFormat = useMemo(() => formatPrettyNumber(value), [value]);
-  const dataTime = useMemo(() => u.data[0][dataIdx], [u, dataIdx]);
-  const date = useMemo(() => dayjs(new Date(dataTime * 1000)).format(DATE_FULL_TIMEZONE_FORMAT), [dataTime]);
-
-  const color = useMemo(() => getColorLine(series[seriesIdx]?.label || ""), [series, seriesIdx]);
-
-  const name = useMemo(() => {
-    const metricName = (series[seriesIdx]?.label || "").replace(/{.+}/gmi, "").trim();
-    return getLegendLabel(metricName);
-  }, []);
-
-  const fields = useMemo(() => {
-    const metric = metrics[seriesIdx - 1]?.metric || {};
-    const fields = Object.keys(metric).filter(k => k !== "__name__");
-    return fields.map(key => `${key}="${metric[key]}"`);
-  }, [metrics, seriesIdx]);
-
   const handleClose = () => {
     onClose && onClose(id);
   };
 
-  const handleMouseDown = (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>) => {
+  const handleMouseDown = (e: ReactMouseEvent) => {
     setMoved(true);
     setMoving(true);
     const { clientX, clientY } = e;
     setPosition({ top: clientY, left: clientX });
   };
 
-  const handleMouseMove = (e: MouseEvent) => {
+  const handleMouseMove = useCallback((e: MouseEvent) => {
     if (!moving) return;
     const { clientX, clientY } = e;
     setPosition({ top: clientY, left: clientX });
-  };
+  }, [moving]);
 
   const handleMouseUp = () => {
     setMoving(false);
   };
 
   const calcPosition = () => {
-    if (!tooltipRef.current) return;
+    if (!tooltipRef.current || !u) return;
 
-    const topOnChart = u.valToPos((value || 0), series[seriesIdx]?.scale || "1");
-    const leftOnChart = u.valToPos(dataTime, "x");
-    const { width: tooltipWidth, height: tooltipHeight } = tooltipRef.current.getBoundingClientRect();
-    const { width, height } = u.over.getBoundingClientRect();
+    const { top, left } = point;
+    const uPlotPosition = {
+      left: parseFloat(u.over.style.left),
+      top: parseFloat(u.over.style.top)
+    };
+
+    const {
+      width: uPlotWidth,
+      height: uPlotHeight
+    } = u.over.getBoundingClientRect();
+
+    const {
+      width: tooltipWidth,
+      height: tooltipHeight
+    } = tooltipRef.current.getBoundingClientRect();
 
     const margin = 10;
-    const overflowX = leftOnChart + tooltipWidth >= width ? tooltipWidth + (2 * margin) : 0;
-    const overflowY = topOnChart + tooltipHeight >= height ? tooltipHeight + (2 * margin) : 0;
+    const overflowX = left + tooltipWidth >= uPlotWidth ? tooltipWidth + (2 * margin) : 0;
+    const overflowY = top + tooltipHeight >= uPlotHeight ? tooltipHeight + (2 * margin) : 0;
 
-    setPosition({
-      top: topOnChart + tooltipOffset.top + margin - overflowY,
-      left: leftOnChart + tooltipOffset.left + margin - overflowX
-    });
+    const position = {
+      top: top + uPlotPosition.top + margin - overflowY,
+      left: left + uPlotPosition.left + margin - overflowX
+    };
+
+    if (position.left < 0) position.left = 20;
+    if (position.top < 0) position.top = 20;
+
+    setPosition(position);
   };
 
-  useEffect(calcPosition, [u, value, dataTime, seriesIdx, tooltipOffset, tooltipRef]);
+  useEffect(calcPosition, [u, value, point, tooltipRef]);
 
-  useEffect(() => {
-    setSeriesIdx(tooltipIdx.seriesIdx);
-    setDataIdx(tooltipIdx.dataIdx);
-  }, [tooltipIdx]);
+  useEventListener("mousemove", handleMouseMove);
+  useEventListener("mouseup", handleMouseUp);
 
-  useEffect(() => {
-    if (moving) {
-      document.addEventListener("mousemove", handleMouseMove);
-      document.addEventListener("mouseup", handleMouseUp);
-    }
-
-    return () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [moving]);
-
-  if (!targetPortal || tooltipIdx.seriesIdx < 0 || tooltipIdx.dataIdx < 0) return null;
+  if (!u) return null;
 
   return ReactDOM.createPortal((
     <div
@@ -136,7 +119,14 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
       style={position}
     >
       <div className="vm-chart-tooltip-header">
-        <div className="vm-chart-tooltip-header__date">{date}</div>
+        {title && (
+          <div className="vm-chart-tooltip-header__title">
+            {title}
+          </div>
+        )}
+        <div className="vm-chart-tooltip-header__date">
+          {dates.map((date, i) => <span key={i}>{date}</span>)}
+        </div>
         {isSticky && (
           <>
             <Button
@@ -145,6 +135,7 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
               size="small"
               startIcon={<DragIcon/>}
               onMouseDown={handleMouseDown}
+              ariaLabel="drag the tooltip"
             />
             <Button
               className="vm-chart-tooltip-header__close"
@@ -152,30 +143,38 @@ const ChartTooltip: FC<ChartTooltipProps> = ({
               size="small"
               startIcon={<CloseIcon/>}
               onClick={handleClose}
+              ariaLabel="close the tooltip"
             />
           </>
         )}
       </div>
       <div className="vm-chart-tooltip-data">
-        <div
-          className="vm-chart-tooltip-data__marker"
-          style={{ background: color }}
-        />
-        <p>
-          {name}:
-          <b className="vm-chart-tooltip-data__value">{valueFormat}</b>
-          {unit}
+        {marker && (
+          <span
+            className="vm-chart-tooltip-data__marker"
+            style={{ background: marker }}
+          />
+        )}
+        <p className="vm-chart-tooltip-data__value">
+          <b>{value}</b>{unit}
         </p>
       </div>
-      {!!fields.length && (
-        <div className="vm-chart-tooltip-info">
-          {fields.map((f, i) => (
-            <div key={`${f}_${i}`}>{f}</div>
+      {statsFormatted && (
+        <table className="vm-chart-tooltip-stats">
+          {STATS_ORDER.map((key, i) => (
+            <div
+              className="vm-chart-tooltip-stats-row"
+              key={i}
+            >
+              <span className="vm-chart-tooltip-stats-row__key">{key}:</span>
+              <span className="vm-chart-tooltip-stats-row__value">{statsFormatted[key]}</span>
+            </div>
           ))}
-        </div>
+        </table>
       )}
+      {info && <p className="vm-chart-tooltip__info">{info}</p>}
     </div>
-  ), targetPortal);
+  ), u.root);
 };
 
 export default ChartTooltip;

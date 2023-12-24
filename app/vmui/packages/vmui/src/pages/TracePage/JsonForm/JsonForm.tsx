@@ -5,8 +5,9 @@ import Button from "../../../components/Main/Button/Button";
 import Trace from "../../../components/TraceQuery/Trace";
 import { ErrorTypes } from "../../../types";
 import classNames from "classnames";
-import { useSnack } from "../../../contexts/Snackbar";
+import useCopyToClipboard from "../../../hooks/useCopyToClipboard";
 import { CopyIcon, RestartIcon } from "../../../components/Main/Icons";
+import useDeviceDetect from "../../../hooks/useDeviceDetect";
 
 interface JsonFormProps {
   defaultJson?: string
@@ -27,7 +28,8 @@ const JsonForm: FC<JsonFormProps> = ({
   onClose,
   onUpload,
 }) => {
-  const { showInfoMessage } = useSnack();
+  const copyToClipboard = useCopyToClipboard();
+  const { isMobile } = useDeviceDetect();
 
   const [json, setJson] = useState(defaultJson);
   const [title, setTitle] = useState(defaultTile);
@@ -56,8 +58,7 @@ const JsonForm: FC<JsonFormProps> = ({
   };
 
   const handlerCopy = async () => {
-    await navigator.clipboard.writeText(json);
-    showInfoMessage({ text: "Formatted JSON has been copied", type: "success" });
+    await copyToClipboard(json, "Formatted JSON has been copied");
   };
 
   const handleReset = () => {
@@ -77,7 +78,9 @@ const JsonForm: FC<JsonFormProps> = ({
     <div
       className={classNames({
         "vm-json-form": true,
-        "vm-json-form_one-field": !displayTitle
+        "vm-json-form_one-field": !displayTitle,
+        "vm-json-form_one-field_mobile": !displayTitle && isMobile,
+        "vm-json-form_mobile": isMobile
       })}
     >
       {displayTitle && (
@@ -96,6 +99,7 @@ const JsonForm: FC<JsonFormProps> = ({
         error={error}
         autofocus
         onChange={handleChangeJson}
+        onEnter={handleApply}
         disabled={!editable}
       />
       <div className="vm-json-form-footer">

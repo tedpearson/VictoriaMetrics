@@ -26,32 +26,33 @@ var (
 	maxResponseHeadersSize = flagutil.NewBytes("promscrape.maxResponseHeadersSize", 4096, "The maximum size of http response headers from Prometheus scrape targets")
 	disableCompression     = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
 		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
-		"It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine grained control")
+		"It is possible to set 'disable_compression: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control")
 	disableKeepAlive = flag.Bool("promscrape.disableKeepAlive", false, "Whether to disable HTTP keep-alive connections when scraping all the targets. "+
 		"This may be useful when targets has no support for HTTP keep-alive connection. "+
-		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine grained control. "+
+		"It is possible to set 'disable_keepalive: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control. "+
 		"Note that disabling HTTP keep-alive may increase load on both vmagent and scrape targets")
 	streamParse = flag.Bool("promscrape.streamParse", false, "Whether to enable stream parsing for metrics obtained from scrape targets. This may be useful "+
 		"for reducing memory usage when millions of metrics are exposed per each scrape target. "+
-		"It is posible to set 'stream_parse: true' individually per each 'scrape_config' section in '-promscrape.config' for fine grained control")
+		"It is possible to set 'stream_parse: true' individually per each 'scrape_config' section in '-promscrape.config' for fine-grained control")
 )
 
 type client struct {
 	// hc is the default client optimized for common case of scraping targets with moderate number of metrics.
 	hc *fasthttp.HostClient
 
-	// sc (aka `stream client`) is used instead of hc if ScrapeWork.ParseStream is set.
+	// sc (aka `stream client`) is used instead of hc if ScrapeWork.StreamParse is set.
 	// It may be useful for scraping targets with millions of metrics per target.
 	sc *http.Client
 
+	ctx                     context.Context
 	scrapeURL               string
 	scrapeTimeoutSecondsStr string
 	hostPort                string
 	requestURI              string
-	setHeaders              func(req *http.Request)
-	setProxyHeaders         func(req *http.Request)
-	setFasthttpHeaders      func(req *fasthttp.Request)
-	setFasthttpProxyHeaders func(req *fasthttp.Request)
+	setHeaders              func(req *http.Request) error
+	setProxyHeaders         func(req *http.Request) error
+	setFasthttpHeaders      func(req *fasthttp.Request) error
+	setFasthttpProxyHeaders func(req *fasthttp.Request) error
 	denyRedirects           bool
 	disableCompression      bool
 	disableKeepAlive        bool
@@ -72,14 +73,15 @@ func concatTwoStrings(x, y string) string {
 	b := bb.B[:0]
 	b = append(b, x...)
 	b = append(b, y...)
-	s := bytesutil.ToUnsafeString(b)
-	s = bytesutil.InternString(s)
+	s := bytesutil.InternBytes(b)
 	bb.B = b
 	bbPool.Put(bb)
 	return s
 }
 
-func newClient(sw *ScrapeWork) *client {
+const scrapeUserAgent = "vm_promscrape"
+
+func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
 	var u fasthttp.URI
 	u.Update(sw.ScrapeURL)
 	hostPort := string(u.Host())
@@ -88,10 +90,14 @@ func newClient(sw *ScrapeWork) *client {
 	isTLS := string(u.Scheme()) == "https"
 	var tlsCfg *tls.Config
 	if isTLS {
-		tlsCfg = sw.AuthConfig.NewTLSConfig()
+		var err error
+		tlsCfg, err = sw.AuthConfig.NewTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("cannot initialize tls config: %w", err)
+		}
 	}
-	setProxyHeaders := func(req *http.Request) {}
-	setFasthttpProxyHeaders := func(req *fasthttp.Request) {}
+	setProxyHeaders := func(req *http.Request) error { return nil }
+	setFasthttpProxyHeaders := func(req *fasthttp.Request) error { return nil }
 	proxyURL := sw.ProxyURL
 	if !isTLS && proxyURL.IsHTTPOrHTTPS() {
 		// Send full sw.ScrapeURL in requests to a proxy host for non-TLS scrape targets
@@ -102,14 +108,18 @@ func newClient(sw *ScrapeWork) *client {
 		requestURI = sw.ScrapeURL
 		isTLS = pu.Scheme == "https"
 		if isTLS {
-			tlsCfg = sw.ProxyAuthConfig.NewTLSConfig()
+			var err error
+			tlsCfg, err = sw.ProxyAuthConfig.NewTLSConfig()
+			if err != nil {
+				return nil, fmt.Errorf("cannot initialize proxy tls config: %w", err)
+			}
 		}
 		proxyURLOrig := proxyURL
-		setProxyHeaders = func(req *http.Request) {
-			proxyURLOrig.SetHeaders(sw.ProxyAuthConfig, req)
+		setProxyHeaders = func(req *http.Request) error {
+			return proxyURLOrig.SetHeaders(sw.ProxyAuthConfig, req)
 		}
-		setFasthttpProxyHeaders = func(req *fasthttp.Request) {
-			proxyURLOrig.SetFasthttpHeaders(sw.ProxyAuthConfig, req)
+		setFasthttpProxyHeaders = func(req *fasthttp.Request) error {
+			return proxyURLOrig.SetFasthttpHeaders(sw.ProxyAuthConfig, req)
 		}
 		proxyURL = &proxy.URL{}
 	}
@@ -117,20 +127,21 @@ func newClient(sw *ScrapeWork) *client {
 	dialAddr = addMissingPort(dialAddr, isTLS)
 	dialFunc, err := newStatDialFunc(proxyURL, sw.ProxyAuthConfig)
 	if err != nil {
-		logger.Fatalf("cannot create dial func: %s", err)
+		return nil, fmt.Errorf("cannot create dial func: %w", err)
 	}
 	hc := &fasthttp.HostClient{
-		Addr:                         dialAddr,
-		Name:                         "vm_promscrape",
+		Addr: dialAddr,
+		// Name used in User-Agent request header
+		Name:                         scrapeUserAgent,
 		Dial:                         dialFunc,
 		IsTLS:                        isTLS,
 		TLSConfig:                    tlsCfg,
 		MaxIdleConnDuration:          2 * sw.ScrapeInterval,
 		ReadTimeout:                  sw.ScrapeTimeout,
 		WriteTimeout:                 10 * time.Second,
-		MaxResponseBodySize:          maxScrapeSize.N,
+		MaxResponseBodySize:          maxScrapeSize.IntN(),
 		MaxIdempotentRequestAttempts: 1,
-		ReadBufferSize:               maxResponseHeadersSize.N,
+		ReadBufferSize:               maxResponseHeadersSize.IntN(),
 	}
 	var sc *http.Client
 	var proxyURLFunc func(*http.Request) (*url.URL, error)
@@ -148,44 +159,42 @@ func newClient(sw *ScrapeWork) *client {
 			DialContext:            statStdDial,
 			MaxIdleConnsPerHost:    100,
 			MaxResponseHeaderBytes: int64(maxResponseHeadersSize.N),
-
-			// Set timeout for receiving the first response byte,
-			// since the duration for reading the full response can be much bigger because of stream parsing.
-			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1017#issuecomment-767235047
-			ResponseHeaderTimeout: sw.ScrapeTimeout,
 		},
-
-		// Set 30x bigger timeout than the sw.ScrapeTimeout, since the duration for reading the full response
-		// can be much bigger because of stream parsing.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1017#issuecomment-767235047
-		Timeout: 30 * sw.ScrapeTimeout,
+		Timeout: sw.ScrapeTimeout,
 	}
 	if sw.DenyRedirects {
 		sc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
 	}
-	return &client{
+
+	c := &client{
 		hc:                      hc,
+		ctx:                     ctx,
 		sc:                      sc,
 		scrapeURL:               sw.ScrapeURL,
 		scrapeTimeoutSecondsStr: fmt.Sprintf("%.3f", sw.ScrapeTimeout.Seconds()),
 		hostPort:                hostPort,
 		requestURI:              requestURI,
-		setHeaders:              func(req *http.Request) { sw.AuthConfig.SetHeaders(req, true) },
-		setProxyHeaders:         setProxyHeaders,
-		setFasthttpHeaders:      func(req *fasthttp.Request) { sw.AuthConfig.SetFasthttpHeaders(req, true) },
+		setHeaders: func(req *http.Request) error {
+			return sw.AuthConfig.SetHeaders(req, true)
+		},
+		setProxyHeaders: setProxyHeaders,
+		setFasthttpHeaders: func(req *fasthttp.Request) error {
+			return sw.AuthConfig.SetFasthttpHeaders(req, true)
+		},
 		setFasthttpProxyHeaders: setFasthttpProxyHeaders,
 		denyRedirects:           sw.DenyRedirects,
 		disableCompression:      sw.DisableCompression,
 		disableKeepAlive:        sw.DisableKeepAlive,
 	}
+	return c, nil
 }
 
 func (c *client) GetStreamReader() (*streamReader, error) {
 	deadline := time.Now().Add(c.sc.Timeout)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	req, err := http.NewRequestWithContext(ctx, "GET", c.scrapeURL, nil)
+	ctx, cancel := context.WithDeadline(c.ctx, deadline)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.scrapeURL, nil)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("cannot create request for %q: %w", c.scrapeURL, err)
@@ -199,8 +208,15 @@ func (c *client) GetStreamReader() (*streamReader, error) {
 	// Set X-Prometheus-Scrape-Timeout-Seconds like Prometheus does, since it is used by some exporters such as PushProx.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1179#issuecomment-813117162
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
-	c.setHeaders(req)
-	c.setProxyHeaders(req)
+	req.Header.Set("User-Agent", scrapeUserAgent)
+	if err := c.setHeaders(req); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+	}
+	if err := c.setProxyHeaders(req); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+	}
 	scrapeRequests.Inc()
 	resp, err := c.sc.Do(req)
 	if err != nil {
@@ -216,12 +232,13 @@ func (c *client) GetStreamReader() (*streamReader, error) {
 			c.scrapeURL, resp.StatusCode, http.StatusOK, respBody)
 	}
 	scrapesOK.Inc()
-	return &streamReader{
+	sr := &streamReader{
 		r:           resp.Body,
 		cancel:      cancel,
 		scrapeURL:   c.scrapeURL,
 		maxBodySize: int64(c.hc.MaxResponseBodySize),
-	}, nil
+	}
+	return sr, nil
 }
 
 // checks fasthttp status code for redirect as standard http/client does.
@@ -247,8 +264,12 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	// Set X-Prometheus-Scrape-Timeout-Seconds like Prometheus does, since it is used by some exporters such as PushProx.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1179#issuecomment-813117162
 	req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", c.scrapeTimeoutSecondsStr)
-	c.setFasthttpHeaders(req)
-	c.setFasthttpProxyHeaders(req)
+	if err := c.setFasthttpHeaders(req); err != nil {
+		return nil, fmt.Errorf("failed to set request headers for %q: %w", c.scrapeURL, err)
+	}
+	if err := c.setFasthttpProxyHeaders(req); err != nil {
+		return nil, fmt.Errorf("failed to set proxy request headers for %q: %w", c.scrapeURL, err)
+	}
 	if !*disableCompression && !c.disableCompression {
 		req.Header.Set("Accept-Encoding", "gzip")
 	}
@@ -259,10 +280,14 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	swapResponseBodies := len(dst) == 0
 	if swapResponseBodies {
 		// An optimization: write response directly to dst.
-		// This should reduce memory uage when scraping big targets.
+		// This should reduce memory usage when scraping big targets.
 		dst = resp.SwapBody(dst)
 	}
-	err := doRequestWithPossibleRetry(c.hc, req, resp, deadline)
+
+	ctx, cancel := context.WithDeadline(c.ctx, deadline)
+	defer cancel()
+
+	err := doRequestWithPossibleRetry(ctx, c.hc, req, resp)
 	statusCode := resp.StatusCode()
 	redirectsCount := 0
 	for err == nil && isStatusRedirect(statusCode) {
@@ -282,7 +307,7 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 			break
 		}
 		req.URI().UpdateBytes(location)
-		err = doRequestWithPossibleRetry(c.hc, req, resp, deadline)
+		err = doRequestWithPossibleRetry(ctx, c.hc, req, resp)
 		statusCode = resp.StatusCode()
 		redirectsCount++
 	}
@@ -323,6 +348,11 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 		dst = append(dst, resp.Body()...)
 	}
 	fasthttp.ReleaseResponse(resp)
+	if len(dst) > c.hc.MaxResponseBodySize {
+		maxScrapeSizeExceeded.Inc()
+		return dst, fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize=%d (the actual response size is %d bytes); "+
+			"either reduce the response size for the target or increase -promscrape.maxScrapeSize", c.scrapeURL, maxScrapeSize.N, len(dst))
+	}
 	if statusCode != fasthttp.StatusOK {
 		metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_scrapes_total{status_code="%d"}`, statusCode)).Inc()
 		return dst, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
@@ -344,8 +374,46 @@ var (
 	scrapeRetries         = metrics.NewCounter(`vm_promscrape_scrape_retries_total`)
 )
 
-func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
-	return discoveryutils.DoRequestWithPossibleRetry(hc, req, resp, deadline, scrapeRequests, scrapeRetries)
+func doRequestWithPossibleRetry(ctx context.Context, hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response) error {
+	scrapeRequests.Inc()
+
+	var reqErr error
+	// Return true if the request execution is completed and retry is not required
+	attempt := func() bool {
+		// Use DoCtx instead of Do in order to support context cancellation
+		reqErr = hc.DoCtx(ctx, req, resp)
+		if reqErr == nil {
+			statusCode := resp.StatusCode()
+			if statusCode != fasthttp.StatusTooManyRequests {
+				return true
+			}
+		} else if reqErr != fasthttp.ErrConnectionClosed && !strings.Contains(reqErr.Error(), "broken pipe") {
+			return true
+		}
+		return false
+	}
+
+	if attempt() {
+		return reqErr
+	}
+
+	// The first attempt was unsuccessful. Use exponential backoff for further attempts.
+	// Perform the second attempt immediately after the first attempt - this should help
+	// in cases when the remote side closes the keep-alive connection before the first attempt.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3293
+	sleepTime := time.Second
+	// It is expected that the deadline is already set to ctx, so the loop below
+	// should eventually finish if all the attempt() calls are unsuccessful.
+	for {
+		scrapeRetries.Inc()
+		if attempt() {
+			return reqErr
+		}
+		sleepTime += sleepTime
+		if !discoveryutils.SleepCtx(ctx, sleepTime) {
+			return reqErr
+		}
+	}
 }
 
 type streamReader struct {

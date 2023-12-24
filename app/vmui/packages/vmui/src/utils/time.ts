@@ -1,22 +1,25 @@
-import { RelativeTimeOption, TimeParams, TimePeriod } from "../types";
+import { RelativeTimeOption, TimeParams, TimePeriod, Timezone } from "../types";
 import dayjs, { UnitTypeShort } from "dayjs";
-import duration from "dayjs/plugin/duration";
-import utc from "dayjs/plugin/utc";
 import { getQueryStringValue } from "./query-string";
 import { DATE_ISO_FORMAT } from "../constants/date";
-
-dayjs.extend(duration);
-dayjs.extend(utc);
+import timezones from "../constants/timezones";
 
 const MAX_ITEMS_PER_CHART = window.innerWidth / 4;
+const MAX_ITEMS_PER_HISTOGRAM = window.innerWidth / 40;
 
 export const limitsDurations = { min: 1, max: 1.578e+11 }; // min: 1 ms, max: 5 years
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+const supportedValuesOf = Intl.supportedValuesOf;
+export const supportedTimezones = supportedValuesOf ? supportedValuesOf("timeZone") as string[] : timezones;
+
+// The list of supported units could be the following -
+// https://prometheus.io/docs/prometheus/latest/querying/basics/#time-durations
 export const supportedDurations = [
-  { long: "days", short: "d", possible: "day" },
-  { long: "weeks", short: "w", possible: "week" },
-  { long: "months", short: "M", possible: "mon" },
   { long: "years", short: "y", possible: "year" },
+  { long: "weeks", short: "w", possible: "week" },
+  { long: "days", short: "d", possible: "day" },
   { long: "hours", short: "h", possible: "hour" },
   { long: "minutes", short: "m", possible: "min" },
   { long: "seconds", short: "s", possible: "sec" },
@@ -26,6 +29,30 @@ export const supportedDurations = [
 const shortDurations = supportedDurations.map(d => d.short);
 
 export const roundToMilliseconds = (num: number): number => Math.round(num*1000)/1000;
+
+export const humanizeSeconds = (num: number): string => {
+  return getDurationFromMilliseconds(dayjs.duration(num, "seconds").asMilliseconds());
+};
+
+export const roundStep = (step: number) => {
+  let result = roundToMilliseconds(step);
+  const integerStep = Math.round(step);
+
+  if (step >= 100) {
+    result = integerStep - (integerStep%10); // integer multiple of 10
+  }
+  if (step < 100 && step >= 10) {
+    result = integerStep - (integerStep%5); // integer multiple of 5
+  }
+  if (step < 10 && step >= 1) {
+    result = integerStep; // integer
+  }
+  if (step < 1 && step > 0.01) {
+    result = Math.round(step * 40) / 40; // float to thousandths multiple of 5
+  }
+  const humanize = humanizeSeconds(result || 0.001);
+  return humanize.replace(/\s/g, "");
+};
 
 export const isSupportedDuration = (str: string): Partial<Record<UnitTypeShort, string>> | undefined => {
 
@@ -37,10 +64,10 @@ export const isSupportedDuration = (str: string): Partial<Record<UnitTypeShort, 
   }
 };
 
-export const getTimeperiodForDuration = (dur: string, date?: Date): TimeParams => {
-  const n = (date || new Date()).valueOf() / 1000;
-
-  const durItems = dur.trim().split(" ");
+export const getSecondsFromDuration = (dur: string) => {
+  const shortSupportedDur = supportedDurations.map(d => d.short).join("|");
+  const regexp = new RegExp(`\\d+[${shortSupportedDur}]+`, "g");
+  const durItems = dur.match(regexp) || [];
 
   const durObject = durItems.reduce((prev, curr) => {
 
@@ -57,31 +84,40 @@ export const getTimeperiodForDuration = (dur: string, date?: Date): TimeParams =
     }
   }, {});
 
-  const delta = dayjs.duration(durObject).asSeconds();
-  const step = roundToMilliseconds(delta / MAX_ITEMS_PER_CHART) || 0.001;
+  return dayjs.duration(durObject).asSeconds();
+};
+
+export const getStepFromDuration = (dur: number, histogram?: boolean) => {
+  const size = histogram ? MAX_ITEMS_PER_HISTOGRAM : MAX_ITEMS_PER_CHART;
+  return roundStep(dur / size);
+};
+
+export const getTimeperiodForDuration = (dur: string, date?: Date): TimeParams => {
+  const n = (date || dayjs().toDate()).valueOf() / 1000;
+  const delta = getSecondsFromDuration(dur);
 
   return {
     start: n - delta,
     end: n,
-    step: step,
-    date: formatDateToUTC(date || new Date())
+    step: getStepFromDuration(delta),
+    date: formatDateToUTC(date || dayjs().toDate())
   };
 };
 
-export const formatDateToLocal = (date: Date): string => {
-  return dayjs(date).utcOffset(0, true).local().format(DATE_ISO_FORMAT);
+export const formatDateToLocal = (date: string): Date => {
+  return dayjs(date).utcOffset(0, true).toDate();
 };
 
 export const formatDateToUTC = (date: Date): string => {
-  return dayjs(date).utc().format(DATE_ISO_FORMAT);
+  return dayjs.tz(date).utc().format(DATE_ISO_FORMAT);
 };
 
 export const formatDateForNativeInput = (date: Date): string => {
-  return dayjs(date).format(DATE_ISO_FORMAT);
+  return dayjs.tz(date).format(DATE_ISO_FORMAT);
 };
 
-export const getDateNowUTC = (): Date => {
-  return  new Date(dayjs().utc().format(DATE_ISO_FORMAT));
+export const getDateNowUTC = (): string => {
+  return dayjs().utc().format(DATE_ISO_FORMAT);
 };
 
 export const getDurationFromMilliseconds = (ms: number): string => {
@@ -92,7 +128,7 @@ export const getDurationFromMilliseconds = (ms: number): string => {
   const days = Math.floor(ms / (1000 * 60 * 60 * 24));
   const durs: UnitTypeShort[] = ["d", "h", "m", "s", "ms"];
   const values = [days, hours, minutes, seconds, milliseconds].map((t, i) => t ? `${t}${durs[i]}` : "");
-  return values.filter(t => t).join(" ");
+  return values.filter(t => t).join("");
 };
 
 export const getDurationFromPeriod = (p: TimePeriod): string => {
@@ -115,7 +151,13 @@ export const checkDurationLimit = (dur: string): string => {
   return dur;
 };
 
-export const dateFromSeconds = (epochTimeInSeconds: number): Date => new Date(epochTimeInSeconds * 1000);
+export const dateFromSeconds = (epochTimeInSeconds: number): Date => {
+  const date = dayjs(epochTimeInSeconds * 1000);
+  return date.isValid() ? date.toDate() : new Date();
+};
+
+const getYesterday = () => dayjs().tz().subtract(1, "day").endOf("day").toDate();
+const getToday = () => dayjs().tz().endOf("day").toDate();
 
 export const relativeTimeOptions: RelativeTimeOption[] = [
   { title: "Last 5 minutes", duration: "5m" },
@@ -132,11 +174,11 @@ export const relativeTimeOptions: RelativeTimeOption[] = [
   { title: "Last 90 days", duration: "90d" },
   { title: "Last 180 days", duration: "180d" },
   { title: "Last 1 year", duration: "1y" },
-  { title: "Yesterday", duration: "1d", until: () => dayjs().subtract(1, "day").endOf("day").toDate() },
-  { title: "Today", duration: "1d", until: () => dayjs().endOf("day").toDate() },
+  { title: "Yesterday", duration: "1d", until: getYesterday },
+  { title: "Today", duration: "1d", until: getToday },
 ].map(o => ({
   id: o.title.replace(/\s/g, "_").toLocaleLowerCase(),
-  until: o.until ? o.until : () => dayjs().toDate(),
+  until: o.until ? o.until : () => dayjs().tz().toDate(),
   ...o
 }));
 
@@ -150,4 +192,38 @@ export const getRelativeTime = ({ relativeTimeId, defaultDuration, defaultEndInp
     duration: target ? target.duration : defaultDuration,
     endInput: target ? target.until() : defaultEndInput
   };
+};
+
+export const getUTCByTimezone = (timezone: string) => {
+  const date = dayjs().tz(timezone);
+  return `UTC${date.format("Z")}`;
+};
+
+export const getTimezoneList = (search = "") => {
+  const regexp = new RegExp(search, "i");
+
+  return supportedTimezones.reduce((acc: {[key: string]: Timezone[]}, region) => {
+    const zone = (region.match(/^(.*?)\//) || [])[1] || "unknown";
+    const utc = getUTCByTimezone(region);
+    const utcForSearch = utc.replace(/UTC|0/, "");
+    const regionForSearch = region.replace(/[/_]/g, " ");
+    const item = {
+      region,
+      utc,
+      search: `${region} ${utc} ${regionForSearch} ${utcForSearch}`
+    };
+    const includeZone = !search || (search && regexp.test(item.search));
+
+    if (includeZone && acc[zone]) {
+      acc[zone].push(item);
+    } else if (includeZone) {
+      acc[zone] = [item];
+    }
+
+    return acc;
+  }, {});
+};
+
+export const setTimezone = (timezone: string) => {
+  dayjs.tz.setDefault(timezone);
 };

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -11,8 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/remoteread"
 	"github.com/urfave/cli/v2"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/backoff"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/native"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/remoteread"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/opentsdb"
@@ -20,7 +25,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
-	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native/stream"
 )
 
 func main() {
@@ -35,9 +40,6 @@ func main() {
 		Name:    "vmctl",
 		Usage:   "VictoriaMetrics command-line tool",
 		Version: buildinfo.Version,
-		// Disable `-version` flag to avoid conflict with lib/buildinfo flags
-		// see https://github.com/urfave/cli/issues/1560
-		HideVersion: true,
 		Commands: []*cli.Command{
 			{
 				Name:  "opentsdb",
@@ -65,13 +67,13 @@ func main() {
 					// disable progress bars since openTSDB implementation
 					// does not use progress bar pool
 					vmCfg.DisableProgressBar = true
-					importer, err := vm.NewImporter(vmCfg)
+					importer, err := vm.NewImporter(ctx, vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
 
-					otsdbProcessor := newOtsdbProcessor(otsdbClient, importer, c.Int(otsdbConcurrency))
-					return otsdbProcessor.run(c.Bool(globalSilent), c.Bool(globalVerbose))
+					otsdbProcessor := newOtsdbProcessor(otsdbClient, importer, c.Int(otsdbConcurrency), c.Bool(globalSilent), c.Bool(globalVerbose))
+					return otsdbProcessor.run()
 				},
 			},
 			{
@@ -100,7 +102,7 @@ func main() {
 					}
 
 					vmCfg := initConfigVM(c)
-					importer, err = vm.NewImporter(vmCfg)
+					importer, err = vm.NewImporter(ctx, vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
@@ -111,8 +113,10 @@ func main() {
 						c.Int(influxConcurrency),
 						c.String(influxMeasurementFieldSeparator),
 						c.Bool(influxSkipDatabaseLabel),
-						c.Bool(influxPrometheusMode))
-					return processor.run(c.Bool(globalSilent), c.Bool(globalVerbose))
+						c.Bool(influxPrometheusMode),
+						c.Bool(globalSilent),
+						c.Bool(globalVerbose))
+					return processor.run()
 				},
 			},
 			{
@@ -121,14 +125,16 @@ func main() {
 				Flags: mergeFlags(globalFlags, remoteReadFlags, vmFlags),
 				Action: func(c *cli.Context) error {
 					rr, err := remoteread.NewClient(remoteread.Config{
-						Addr:       c.String(remoteReadSrcAddr),
-						Username:   c.String(remoteReadUser),
-						Password:   c.String(remoteReadPassword),
-						Timeout:    c.Duration(remoteReadHTTPTimeout),
-						UseStream:  c.Bool(remoteReadUseStream),
-						Headers:    c.String(remoteReadHeaders),
-						LabelName:  c.String(remoteReadFilterLabel),
-						LabelValue: c.String(remoteReadFilterLabelValue),
+						Addr:               c.String(remoteReadSrcAddr),
+						Username:           c.String(remoteReadUser),
+						Password:           c.String(remoteReadPassword),
+						Timeout:            c.Duration(remoteReadHTTPTimeout),
+						UseStream:          c.Bool(remoteReadUseStream),
+						Headers:            c.String(remoteReadHeaders),
+						LabelName:          c.String(remoteReadFilterLabel),
+						LabelValue:         c.String(remoteReadFilterLabelValue),
+						InsecureSkipVerify: c.Bool(remoteReadInsecureSkipVerify),
+						DisablePathAppend:  c.Bool(remoteReadDisablePathAppend),
 					})
 					if err != nil {
 						return fmt.Errorf("error create remote read client: %s", err)
@@ -136,7 +142,7 @@ func main() {
 
 					vmCfg := initConfigVM(c)
 
-					importer, err := vm.NewImporter(vmCfg)
+					importer, err := vm.NewImporter(ctx, vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
@@ -145,13 +151,16 @@ func main() {
 						src: rr,
 						dst: importer,
 						filter: remoteReadFilter{
-							timeStart: c.Timestamp(remoteReadFilterTimeStart),
-							timeEnd:   c.Timestamp(remoteReadFilterTimeEnd),
-							chunk:     c.String(remoteReadStepInterval),
+							timeStart:   c.Timestamp(remoteReadFilterTimeStart),
+							timeEnd:     c.Timestamp(remoteReadFilterTimeEnd),
+							chunk:       c.String(remoteReadStepInterval),
+							timeReverse: c.Bool(remoteReadFilterTimeReverse),
 						},
-						cc: c.Int(remoteReadConcurrency),
+						cc:        c.Int(remoteReadConcurrency),
+						isSilent:  c.Bool(globalSilent),
+						isVerbose: c.Bool(globalVerbose),
 					}
-					return rmp.run(ctx, c.Bool(globalSilent), c.Bool(globalVerbose))
+					return rmp.run(ctx)
 				},
 			},
 			{
@@ -162,7 +171,7 @@ func main() {
 					fmt.Println("Prometheus import mode")
 
 					vmCfg := initConfigVM(c)
-					importer, err = vm.NewImporter(vmCfg)
+					importer, err = vm.NewImporter(ctx, vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
@@ -191,7 +200,7 @@ func main() {
 			{
 				Name:  "vm-native",
 				Usage: "Migrate time series between VictoriaMetrics installations via native binary format",
-				Flags: vmNativeFlags,
+				Flags: mergeFlags(globalFlags, vmNativeFlags),
 				Action: func(c *cli.Context) error {
 					fmt.Println("VictoriaMetrics Native import mode")
 
@@ -199,25 +208,57 @@ func main() {
 						return fmt.Errorf("flag %q can't be empty", vmNativeFilterMatch)
 					}
 
+					disableKeepAlive := c.Bool(vmNativeDisableHTTPKeepAlive)
+
+					var srcExtraLabels []string
+					srcAddr := strings.Trim(c.String(vmNativeSrcAddr), "/")
+					srcAuthConfig, err := auth.Generate(
+						auth.WithBasicAuth(c.String(vmNativeSrcUser), c.String(vmNativeSrcPassword)),
+						auth.WithBearer(c.String(vmNativeSrcBearerToken)),
+						auth.WithHeaders(c.String(vmNativeSrcHeaders)))
+					if err != nil {
+						return fmt.Errorf("error initilize auth config for source: %s", srcAddr)
+					}
+					srcHTTPClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: disableKeepAlive}}
+
+					dstAddr := strings.Trim(c.String(vmNativeDstAddr), "/")
+					dstExtraLabels := c.StringSlice(vmExtraLabel)
+					dstAuthConfig, err := auth.Generate(
+						auth.WithBasicAuth(c.String(vmNativeDstUser), c.String(vmNativeDstPassword)),
+						auth.WithBearer(c.String(vmNativeDstBearerToken)),
+						auth.WithHeaders(c.String(vmNativeDstHeaders)))
+					if err != nil {
+						return fmt.Errorf("error initilize auth config for destination: %s", dstAddr)
+					}
+					dstHTTPClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: disableKeepAlive}}
+
 					p := vmNativeProcessor{
-						rateLimit: c.Int64(vmRateLimit),
-						filter: filter{
-							match:     c.String(vmNativeFilterMatch),
-							timeStart: c.String(vmNativeFilterTimeStart),
-							timeEnd:   c.String(vmNativeFilterTimeEnd),
-							chunk:     c.String(vmNativeStepInterval),
+						rateLimit:    c.Int64(vmRateLimit),
+						interCluster: c.Bool(vmInterCluster),
+						filter: native.Filter{
+							Match:       c.String(vmNativeFilterMatch),
+							TimeStart:   c.String(vmNativeFilterTimeStart),
+							TimeEnd:     c.String(vmNativeFilterTimeEnd),
+							Chunk:       c.String(vmNativeStepInterval),
+							TimeReverse: c.Bool(vmNativeFilterTimeReverse),
 						},
-						src: &vmNativeClient{
-							addr:     strings.Trim(c.String(vmNativeSrcAddr), "/"),
-							user:     c.String(vmNativeSrcUser),
-							password: c.String(vmNativeSrcPassword),
+						src: &native.Client{
+							AuthCfg:     srcAuthConfig,
+							Addr:        srcAddr,
+							ExtraLabels: srcExtraLabels,
+							HTTPClient:  srcHTTPClient,
 						},
-						dst: &vmNativeClient{
-							addr:        strings.Trim(c.String(vmNativeDstAddr), "/"),
-							user:        c.String(vmNativeDstUser),
-							password:    c.String(vmNativeDstPassword),
-							extraLabels: c.StringSlice(vmExtraLabel),
+						dst: &native.Client{
+							AuthCfg:     dstAuthConfig,
+							Addr:        dstAddr,
+							ExtraLabels: dstExtraLabels,
+							HTTPClient:  dstHTTPClient,
 						},
+						backoff:        backoff.New(),
+						cc:             c.Int(vmConcurrency),
+						disableRetries: c.Bool(vmNativeDisableRetries),
+						isSilent:       c.Bool(globalSilent),
+						isNative:       !c.Bool(vmNativeDisableBinaryProtocol),
 					}
 					return p.run(ctx)
 				},
@@ -245,7 +286,7 @@ func main() {
 						return cli.Exit(fmt.Errorf("cannot open exported block at path=%q err=%w", blockPath, err), 1)
 					}
 					var blocksCount uint64
-					if err := parser.ParseStream(f, isBlockGzipped, func(block *parser.Block) error {
+					if err := stream.Parse(f, isBlockGzipped, func(block *stream.Block) error {
 						atomic.AddUint64(&blocksCount, 1)
 						return nil
 					}); err != nil {

@@ -56,6 +56,7 @@ func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []*promutils.Labels 
 		for _, epp := range eps.Ports {
 			for _, addr := range ess.Addresses {
 				m := getEndpointSliceLabelsForAddressAndPort(gw, podPortsSeen, addr, eps, ess, epp, p, svc)
+				// Remove possible duplicate labels, which can appear after getEndpointSliceLabelsForAddressAndPort() call
 				m.RemoveDuplicates()
 				ms = append(ms, m)
 			}
@@ -83,9 +84,15 @@ func (eps *EndpointSlice) getTargetLabels(gw *groupWatcher) []*promutils.Labels 
 				m.Add("__address__", addr)
 				p.appendCommonLabels(m, gw)
 				p.appendContainerLabels(m, c, &cp)
+
+				// Prometheus sets endpoints_name and namespace labels for all endpoints
+				// Even if port is not matching service port.
+				// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4154
+				p.appendEndpointSliceLabels(m, eps)
 				if svc != nil {
 					svc.appendCommonLabels(m)
 				}
+				// Remove possible duplicate labels, which can appear after appendCommonLabels() calls
 				m.RemoveDuplicates()
 				ms = append(ms, m)
 			}

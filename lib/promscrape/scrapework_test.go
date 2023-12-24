@@ -10,6 +10,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
 )
 
@@ -40,8 +41,8 @@ func TestIsAutoMetric(t *testing.T) {
 func TestAppendExtraLabels(t *testing.T) {
 	f := func(sourceLabels, extraLabels string, honorLabels bool, resultExpected string) {
 		t.Helper()
-		src := promutils.NewLabelsFromString(sourceLabels)
-		extra := promutils.NewLabelsFromString(extraLabels)
+		src := promutils.MustNewLabelsFromString(sourceLabels)
+		extra := promutils.MustNewLabelsFromString(extraLabels)
 		var labels promutils.Labels
 		labels.Labels = appendExtraLabels(src.GetLabels(), extra.GetLabels(), 0, honorLabels)
 		result := labels.String()
@@ -103,9 +104,11 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
 	}
 
 	timestamp := int64(123000)
+	tsmGlobal.Register(&sw)
 	if err := sw.scrapeInternal(timestamp, timestamp); err == nil {
 		t.Fatalf("expecting non-nil error")
 	}
+	tsmGlobal.Unregister(&sw)
 	if pushDataErr != nil {
 		t.Fatalf("unexpected error: %s", pushDataErr)
 	}
@@ -151,11 +154,13 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 		}
 
 		timestamp := int64(123000)
+		tsmGlobal.Register(&sw)
 		if err := sw.scrapeInternal(timestamp, timestamp); err != nil {
 			if !strings.Contains(err.Error(), "sample_limit") {
 				t.Fatalf("unexpected error: %s", err)
 			}
 		}
+		tsmGlobal.Unregister(&sw)
 		if pushDataErr != nil {
 			t.Fatalf("unexpected error: %s", pushDataErr)
 		}
@@ -360,9 +365,27 @@ func TestScrapeWorkScrapeInternalSuccess(t *testing.T) {
 	`, &ScrapeWork{
 		ScrapeTimeout: time.Second * 42,
 	}, `
-		exported_up{bar="baz"} 34.44 123
-		exported_scrape_series_added 3.435 123
+		up{bar="baz"} 34.44 123
 		bar{a="b",c="d"} -3e4 123
+		exported_scrape_series_added 3.435 123
+		up 1 123
+		scrape_duration_seconds 0 123
+		scrape_samples_scraped 3 123
+		scrape_samples_post_metric_relabeling 3 123
+		scrape_timeout_seconds 42 123
+		scrape_series_added 3 123
+	`)
+	f(`
+		up{bar="baz"} 34.44
+		bar{a="b",c="d"} -3e4
+		scrape_series_added 3.435
+	`, &ScrapeWork{
+		ScrapeTimeout: time.Second * 42,
+		HonorLabels:   true,
+	}, `
+		up{bar="baz"} 34.44 123
+		bar{a="b",c="d"} -3e4 123
+		scrape_series_added 3.435 123
 		up 1 123
 		scrape_samples_scraped 3 123
 		scrape_duration_seconds 0 123
@@ -686,6 +709,42 @@ func TestAddRowToTimeseriesNoRelabeling(t *testing.T) {
 		`metric{a="e",foo="bar"} 0 123`)
 }
 
+func TestSendStaleSeries(t *testing.T) {
+	f := func(lastScrape, currScrape string, staleMarksExpected int) {
+		t.Helper()
+		var sw scrapeWork
+		sw.Config = &ScrapeWork{
+			NoStaleMarkers: false,
+		}
+		common.StartUnmarshalWorkers()
+		defer common.StopUnmarshalWorkers()
+
+		var staleMarks int
+		sw.PushData = func(at *auth.Token, wr *prompbmarshal.WriteRequest) {
+			staleMarks += len(wr.Timeseries)
+		}
+		sw.sendStaleSeries(lastScrape, currScrape, 0, false)
+		if staleMarks != staleMarksExpected {
+			t.Fatalf("unexpected number of stale marks; got %d; want %d", staleMarks, staleMarksExpected)
+		}
+	}
+	generateScrape := func(n int) string {
+		w := strings.Builder{}
+		for i := 0; i < n; i++ {
+			w.WriteString(fmt.Sprintf("foo_%d 1\n", i))
+		}
+		return w.String()
+	}
+
+	f("", "", 0)
+	f(generateScrape(10), generateScrape(10), 0)
+	f(generateScrape(10), "", 10)
+	f("", generateScrape(10), 0)
+	f(generateScrape(10), generateScrape(3), 7)
+	f(generateScrape(3), generateScrape(10), 0)
+	f(generateScrape(20000), generateScrape(10), 19990)
+}
+
 func parsePromRow(data string) *parser.Row {
 	var rows parser.Rows
 	errLogger := func(s string) {
@@ -794,7 +853,7 @@ func timeseriesToString(ts *prompbmarshal.TimeSeries) string {
 }
 
 func mustParseRelabelConfigs(config string) *promrelabel.ParsedConfigs {
-	pcs, err := promrelabel.ParseRelabelConfigsData([]byte(config), false)
+	pcs, err := promrelabel.ParseRelabelConfigsData([]byte(config))
 	if err != nil {
 		panic(fmt.Errorf("cannot parse %q: %w", config, err))
 	}

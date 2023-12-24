@@ -13,7 +13,11 @@ import (
 func TestParseAuthConfigFailure(t *testing.T) {
 	f := func(s string) {
 		t.Helper()
-		_, err := parseAuthConfig([]byte(s))
+		ac, err := parseAuthConfig([]byte(s))
+		if err != nil {
+			return
+		}
+		_, err = parseAuthConfigUsers(ac)
 		if err == nil {
 			t.Fatalf("expecting non-nil error")
 		}
@@ -202,7 +206,11 @@ users:
 func TestParseAuthConfigSuccess(t *testing.T) {
 	f := func(s string, expectedAuthConfig map[string]*UserInfo) {
 		t.Helper()
-		m, err := parseAuthConfig([]byte(s))
+		ac, err := parseAuthConfig([]byte(s))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		m, err := parseAuthConfigUsers(ac)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
@@ -213,20 +221,26 @@ func TestParseAuthConfigSuccess(t *testing.T) {
 	}
 
 	// Single user
+	insecureSkipVerifyTrue := true
 	f(`
 users:
 - username: foo
   password: bar
   url_prefix: http://aaa:343/bbb
+  max_concurrent_requests: 5
+  tls_insecure_skip_verify: true
 `, map[string]*UserInfo{
 		getAuthToken("", "foo", "bar"): {
-			Username:  "foo",
-			Password:  "bar",
-			URLPrefix: mustParseURL("http://aaa:343/bbb"),
+			Username:              "foo",
+			Password:              "bar",
+			URLPrefix:             mustParseURL("http://aaa:343/bbb"),
+			MaxConcurrentRequests: 5,
+			TLSInsecureSkipVerify: &insecureSkipVerifyTrue,
 		},
 	})
 
 	// Multiple url_prefix entries
+	insecureSkipVerifyFalse := false
 	f(`
 users:
 - username: foo
@@ -234,6 +248,10 @@ users:
   url_prefix:
   - http://node1:343/bbb
   - http://node2:343/bbb
+  tls_insecure_skip_verify: false
+  retry_status_codes: [500, 501]
+  load_balancing_policy: first_available
+  drop_src_path_prefix_parts: 1
 `, map[string]*UserInfo{
 		getAuthToken("", "foo", "bar"): {
 			Username: "foo",
@@ -242,6 +260,10 @@ users:
 				"http://node1:343/bbb",
 				"http://node2:343/bbb",
 			}),
+			TLSInsecureSkipVerify:  &insecureSkipVerifyFalse,
+			RetryStatusCodes:       []int{500, 501},
+			LoadBalancingPolicy:    "first_available",
+			DropSrcPathPrefixParts: 1,
 		},
 	})
 
@@ -278,7 +300,7 @@ users:
 `, map[string]*UserInfo{
 		getAuthToken("foo", "", ""): {
 			BearerToken: "foo",
-			URLMap: []URLMap{
+			URLMaps: []URLMap{
 				{
 					SrcPaths:  getSrcPaths([]string{"/api/v1/query", "/api/v1/query_range", "/api/v1/label/[^./]+/.+"}),
 					URLPrefix: mustParseURL("http://vmselect/select/0/prometheus"),
@@ -289,14 +311,16 @@ users:
 						"http://vminsert1/insert/0/prometheus",
 						"http://vminsert2/insert/0/prometheus",
 					}),
-					Headers: []Header{
-						{
-							Name:  "foo",
-							Value: "bar",
-						},
-						{
-							Name:  "xxx",
-							Value: "y",
+					HeadersConf: HeadersConf{
+						RequestHeaders: []Header{
+							{
+								Name:  "foo",
+								Value: "bar",
+							},
+							{
+								Name:  "xxx",
+								Value: "y",
+							},
 						},
 					},
 				},
@@ -304,7 +328,7 @@ users:
 		},
 		getAuthToken("", "foo", ""): {
 			BearerToken: "foo",
-			URLMap: []URLMap{
+			URLMaps: []URLMap{
 				{
 					SrcPaths:  getSrcPaths([]string{"/api/v1/query", "/api/v1/query_range", "/api/v1/label/[^./]+/.+"}),
 					URLPrefix: mustParseURL("http://vmselect/select/0/prometheus"),
@@ -315,14 +339,16 @@ users:
 						"http://vminsert1/insert/0/prometheus",
 						"http://vminsert2/insert/0/prometheus",
 					}),
-					Headers: []Header{
-						{
-							Name:  "foo",
-							Value: "bar",
-						},
-						{
-							Name:  "xxx",
-							Value: "y",
+					HeadersConf: HeadersConf{
+						RequestHeaders: []Header{
+							{
+								Name:  "foo",
+								Value: "bar",
+							},
+							{
+								Name:  "xxx",
+								Value: "y",
+							},
 						},
 					},
 				},
@@ -350,7 +376,129 @@ users:
 			URLPrefix: mustParseURL("https://bar/x"),
 		},
 	})
+	// with default url
+	f(`
+users:
+- bearer_token: foo
+  url_map:
+  - src_paths: ["/api/v1/query","/api/v1/query_range","/api/v1/label/[^./]+/.+"]
+    url_prefix: http://vmselect/select/0/prometheus
+  - src_paths: ["/api/v1/write"]
+    url_prefix: ["http://vminsert1/insert/0/prometheus","http://vminsert2/insert/0/prometheus"]
+    headers:
+    - "foo: bar"
+    - "xxx: y"
+  default_url:
+  - http://default1/select/0/prometheus
+  - http://default2/select/0/prometheus
+`, map[string]*UserInfo{
+		getAuthToken("foo", "", ""): {
+			BearerToken: "foo",
+			URLMaps: []URLMap{
+				{
+					SrcPaths:  getSrcPaths([]string{"/api/v1/query", "/api/v1/query_range", "/api/v1/label/[^./]+/.+"}),
+					URLPrefix: mustParseURL("http://vmselect/select/0/prometheus"),
+				},
+				{
+					SrcPaths: getSrcPaths([]string{"/api/v1/write"}),
+					URLPrefix: mustParseURLs([]string{
+						"http://vminsert1/insert/0/prometheus",
+						"http://vminsert2/insert/0/prometheus",
+					}),
+					HeadersConf: HeadersConf{
+						RequestHeaders: []Header{
+							{
+								Name:  "foo",
+								Value: "bar",
+							},
+							{
+								Name:  "xxx",
+								Value: "y",
+							},
+						},
+					},
+				},
+			},
+			DefaultURL: mustParseURLs([]string{
+				"http://default1/select/0/prometheus",
+				"http://default2/select/0/prometheus",
+			}),
+		},
+		getAuthToken("", "foo", ""): {
+			BearerToken: "foo",
+			URLMaps: []URLMap{
+				{
+					SrcPaths:  getSrcPaths([]string{"/api/v1/query", "/api/v1/query_range", "/api/v1/label/[^./]+/.+"}),
+					URLPrefix: mustParseURL("http://vmselect/select/0/prometheus"),
+				},
+				{
+					SrcPaths: getSrcPaths([]string{"/api/v1/write"}),
+					URLPrefix: mustParseURLs([]string{
+						"http://vminsert1/insert/0/prometheus",
+						"http://vminsert2/insert/0/prometheus",
+					}),
+					HeadersConf: HeadersConf{
+						RequestHeaders: []Header{
+							{
+								Name:  "foo",
+								Value: "bar",
+							},
+							{
+								Name:  "xxx",
+								Value: "y",
+							},
+						},
+					},
+				},
+			},
+			DefaultURL: mustParseURLs([]string{
+				"http://default1/select/0/prometheus",
+				"http://default2/select/0/prometheus",
+			}),
+		},
+	})
 
+}
+
+func TestParseAuthConfigPassesTLSVerificationConfig(t *testing.T) {
+	c := `
+users:
+- username: foo
+  password: bar
+  url_prefix: https://aaa/bbb
+  max_concurrent_requests: 5
+  tls_insecure_skip_verify: true
+
+unauthorized_user:
+  url_prefix: http://aaa:343/bbb
+  max_concurrent_requests: 5
+  tls_insecure_skip_verify: false
+`
+
+	ac, err := parseAuthConfig([]byte(c))
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	m, err := parseAuthConfigUsers(ac)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	ui := m[getAuthToken("", "foo", "bar")]
+	if !isSetBool(ui.TLSInsecureSkipVerify, true) || !ui.httpTransport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("unexpected TLSInsecureSkipVerify value for user foo")
+	}
+
+	if !isSetBool(ac.UnauthorizedUser.TLSInsecureSkipVerify, false) || ac.UnauthorizedUser.httpTransport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatalf("unexpected TLSInsecureSkipVerify value for unauthorized_user")
+	}
+}
+
+func isSetBool(boolP *bool, expectedValue bool) bool {
+	if boolP == nil {
+		return false
+	}
+	return *boolP == expectedValue
 }
 
 func getSrcPaths(paths []string) []*SrcPath {
@@ -390,15 +538,17 @@ func mustParseURL(u string) *URLPrefix {
 }
 
 func mustParseURLs(us []string) *URLPrefix {
-	pus := make([]*url.URL, len(us))
+	bus := make([]*backendURL, len(us))
 	for i, u := range us {
 		pu, err := url.Parse(u)
 		if err != nil {
 			panic(fmt.Errorf("BUG: cannot parse %q: %w", u, err))
 		}
-		pus[i] = pu
+		bus[i] = &backendURL{
+			url: pu,
+		}
 	}
 	return &URLPrefix{
-		urls: pus,
+		bus: bus,
 	}
 }

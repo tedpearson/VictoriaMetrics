@@ -180,11 +180,9 @@ func (m *Manager) Providers() []*Provider {
 // Run starts the background processing.
 func (m *Manager) Run() error {
 	go m.sender()
-	for range m.ctx.Done() {
-		m.cancelDiscoverers()
-		return m.ctx.Err()
-	}
-	return nil
+	<-m.ctx.Done()
+	m.cancelDiscoverers()
+	return m.ctx.Err()
 }
 
 // SyncCh returns a read only channel used by all the clients to receive target updates.
@@ -428,11 +426,11 @@ func (m *Manager) registerProviders(cfgs Configs, setName string) int {
 		}
 		typ := cfg.Name()
 		d, err := cfg.NewDiscoverer(DiscovererOptions{
-			Logger:            log.With(m.logger, "discovery", typ),
+			Logger:            log.With(m.logger, "discovery", typ, "config", setName),
 			HTTPClientOptions: m.httpOpts,
 		})
 		if err != nil {
-			level.Error(m.logger).Log("msg", "Cannot create service discovery", "err", err, "type", typ)
+			level.Error(m.logger).Log("msg", "Cannot create service discovery", "err", err, "type", typ, "config", setName)
 			failed++
 			return
 		}

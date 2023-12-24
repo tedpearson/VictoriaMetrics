@@ -153,6 +153,10 @@ func (c *Client) Explore() ([]*Series, error) {
 		return nil, fmt.Errorf("failed to get field keys: %s", err)
 	}
 
+	if len(mFields) < 1 {
+		return nil, fmt.Errorf("found no numeric fields for import in database %q", c.database)
+	}
+
 	series, err := c.getSeries()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get series: %s", err)
@@ -162,7 +166,8 @@ func (c *Client) Explore() ([]*Series, error) {
 	for _, s := range series {
 		fields, ok := mFields[s.Measurement]
 		if !ok {
-			return nil, fmt.Errorf("can't find field keys for measurement %q", s.Measurement)
+			log.Printf("skip measurement %q since it has no fields", s.Measurement)
+			continue
 		}
 		for _, field := range fields {
 			is := &Series{
@@ -353,10 +358,13 @@ func (c *Client) getSeries() ([]*Series, error) {
 func (c *Client) do(q influx.Query) ([]queryValues, error) {
 	res, err := c.Query(q)
 	if err != nil {
-		return nil, fmt.Errorf("query %q err: %s", q.Command, err)
+		return nil, fmt.Errorf("query error: %s", err)
+	}
+	if res.Error() != nil {
+		return nil, fmt.Errorf("response error: %s", res.Error())
 	}
 	if len(res.Results) < 1 {
-		return nil, fmt.Errorf("exploration query %q returned 0 results", q.Command)
+		return nil, fmt.Errorf("query returned 0 results")
 	}
 	return parseResult(res.Results[0])
 }

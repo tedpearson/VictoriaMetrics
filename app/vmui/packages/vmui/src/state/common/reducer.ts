@@ -1,18 +1,30 @@
 import { getDefaultServer } from "../../utils/default-server-url";
 import { getQueryStringValue } from "../../utils/query-string";
+import { getFromStorage, saveToStorage } from "../../utils/storage";
+import { Theme } from "../../types";
+import { isDarkTheme } from "../../utils/theme";
+import { removeTrailingSlash } from "../../utils/url";
 
 export interface AppState {
   serverUrl: string;
-  tenantId: number;
+  tenantId: string;
+  theme: Theme;
+  isDarkTheme: boolean | null;
 }
 
 export type Action =
   | { type: "SET_SERVER", payload: string }
-  | { type: "SET_TENANT_ID", payload: number }
+  | { type: "SET_THEME", payload: Theme }
+  | { type: "SET_TENANT_ID", payload: string }
+  | { type: "SET_DARK_THEME" }
+
+const tenantId = getQueryStringValue("g0.tenantID", "") as string;
 
 export const initialState: AppState = {
-  serverUrl: getDefaultServer(),
-  tenantId: Number(getQueryStringValue("g0.tenantID", 0)),
+  serverUrl: removeTrailingSlash(getDefaultServer(tenantId)),
+  tenantId,
+  theme: (getFromStorage("THEME") || Theme.system) as Theme,
+  isDarkTheme: null
 };
 
 export function reducer(state: AppState, action: Action): AppState {
@@ -20,12 +32,23 @@ export function reducer(state: AppState, action: Action): AppState {
     case "SET_SERVER":
       return {
         ...state,
-        serverUrl: action.payload
+        serverUrl: removeTrailingSlash(action.payload)
       };
     case "SET_TENANT_ID":
       return {
         ...state,
         tenantId: action.payload
+      };
+    case "SET_THEME":
+      saveToStorage("THEME", action.payload);
+      return {
+        ...state,
+        theme: action.payload,
+      };
+    case "SET_DARK_THEME":
+      return {
+        ...state,
+        isDarkTheme: isDarkTheme(state.theme)
       };
     default:
       throw new Error();

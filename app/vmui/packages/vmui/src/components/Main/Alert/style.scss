@@ -10,10 +10,15 @@
   background-color: $color-background-block;
   border-radius: $border-radius-medium;
   box-shadow: $box-shadow;
-  font-size: $font-size-medium;
-  font-weight: 500;
+  font-size: $font-size;
+  font-weight: normal;
   color: $color-text;
-  line-height: 20px;
+  line-height: 1.5;
+
+  &_mobile {
+    align-items: flex-start;
+    border-radius: 0;
+  }
 
   &:after {
     position: absolute;
@@ -25,6 +30,10 @@
     border-radius: $border-radius-medium;
     z-index: 1;
     opacity: 0.1;
+  }
+
+  &_mobile:after {
+    border-radius: 0;
   }
 
   &__icon,
@@ -48,8 +57,8 @@
     color: $color-success;
 
     &:after {
-     background-color: $color-success;
-   }
+      background-color: $color-success;
+    }
   }
 
   &_error {
@@ -74,5 +83,15 @@
     &:after {
       background-color: $color-warning;
     }
+  }
+
+  &_dark {
+    &:after {
+      opacity: 0.1;
+    }
+  }
+
+  &_dark &__content {
+    filter: none;
   }
 }

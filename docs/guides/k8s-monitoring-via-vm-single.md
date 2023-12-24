@@ -1,3 +1,13 @@
+---
+weight: 2
+title: Kubernetes monitoring via VictoriaMetrics Single
+menu:
+  docs:
+    parent: "guides"
+    weight: 2
+aliases:
+- /guides/k8s-monitoring-via-vm-single.html
+---
 # Kubernetes monitoring via VictoriaMetrics Single
 
 
@@ -17,7 +27,7 @@ We will use:
 * [kubectl 1.21](https://kubernetes.io/docs/tasks/tools/install-kubectl)
 
 <p align="center">
-  <img src="guide-vmsingle-k8s-scheme.png" width="800" alt="VictoriaMetrics Single on Kubernetes cluster">
+  <img src="k8s-monitoring-via-vm-single_k8s-scheme.webp" width="800" alt="VictoriaMetrics Single on Kubernetes cluster">
 </p>
 
 ## 1. VictoriaMetrics Helm repository
@@ -296,8 +306,8 @@ EOF
 By running this command we:
 * Install Grafana from Helm repository.
 * Provision VictoriaMetrics datasource with the url from the output above which we copied before.
-* Add this [https://grafana.com/grafana/dashboards/10229](https://grafana.com/grafana/dashboards/10229) dashboard for VictoriaMetrics.
-* Add this [https://grafana.com/grafana/dashboards/14205](https://grafana.com/grafana/dashboards/14205) dashboard to see Kubernetes cluster metrics.
+* Add this [https://grafana.com/grafana/dashboards/10229-victoriametrics/](https://grafana.com/grafana/dashboards/10229-victoriametrics/) dashboard for VictoriaMetrics.
+* Add this [https://grafana.com/grafana/dashboards/14205-kubernetes-cluster-monitoring-via-prometheus/](https://grafana.com/grafana/dashboards/14205-kubernetes-cluster-monitoring-via-prometheus/) dashboard to see Kubernetes cluster metrics.
 
 
 Check the output log in your terminal.
@@ -331,17 +341,17 @@ Now Grafana should be accessible on the [http://127.0.0.1:3000](http://127.0.0.1
 To check that VictoriaMetrics has collects metrics from the k8s cluster open in browser [http://127.0.0.1:3000/dashboards](http://127.0.0.1:3000/dashboards) and choose `Kubernetes Cluster Monitoring (via Prometheus)` dashboard. Use `admin` for login and `password` that you previously obtained from kubectl. 
 
 <p align="center">
-  <img src="guide-vmsingle-grafana-dashboards.png" width="800" alt="">
+  <img src="k8s-monitoring-via-vm-single_grafana-dashboards.webp" width="800" alt="">
 </p>
 
 You will see something like this:
 <p align="center">
-  <img src="guide-vmsingle-grafana-k8s-dashboard.png" width="800" alt="">
+  <img src="k8s-monitoring-via-vm-single_grafana-k8s-dashboard.webp" width="800" alt="">
 </p>
 
 VictoriaMetrics dashboard also available to use:
 <p align="center">
-  <img src="guide-vmsingle-grafana.png" width="800" alt="">
+  <img src="k8s-monitoring-via-vm-single_grafana.webp" width="800" alt="">
 </p>
 
 ## 5. Final thoughts

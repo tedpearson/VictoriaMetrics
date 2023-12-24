@@ -41,8 +41,7 @@ func JoinHostPort(host string, port int) string {
 	}
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(port), 10)
-	s := bytesutil.ToUnsafeString(b)
-	s = bytesutil.InternString(s)
+	s := bytesutil.InternBytes(b)
 	bb.B = b
 	bbPool.Put(bb)
 	return s
@@ -61,5 +60,30 @@ func TestEqualLabelss(t *testing.T, got, want []*promutils.Labels) {
 	}
 	if !reflect.DeepEqual(gotCopy, want) {
 		t.Fatalf("unexpected labels:\ngot\n%v\nwant\n%v", gotCopy, want)
+	}
+}
+
+// AddTagsToLabels adds <prefix>_tags (separated with tagSeparator) to labels
+// and exposes individual tags via <prefix>_tag_* labels, so users could move all the tags
+// into the discovered scrape target with the following relabeling rule in the way similar to kubernetes_sd_configs:
+//
+//   - action: labelmap
+//     regex: <prefix>_tag_(.+)
+//
+// This solves https://stackoverflow.com/questions/44339461/relabeling-in-prometheus
+func AddTagsToLabels(m *promutils.Labels, tags []string, prefix, tagSeparator string) {
+	// We surround the separated list with the separator as well. This way regular expressions
+	// in relabeling rules don't have to consider tag positions.
+	m.Add(prefix+"tags", tagSeparator+strings.Join(tags, tagSeparator)+tagSeparator)
+
+	for _, tag := range tags {
+		k := tag
+		v := ""
+		if n := strings.IndexByte(tag, '='); n >= 0 {
+			k = tag[:n]
+			v = tag[n+1:]
+		}
+		m.Add(SanitizeLabelName(prefix+"tag_"+k), v)
+		m.Add(SanitizeLabelName(prefix+"tagpresent_"+k), "true")
 	}
 }

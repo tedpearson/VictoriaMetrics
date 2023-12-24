@@ -6,7 +6,7 @@
       "type": "grafana",
       "id": "grafana",
       "name": "Grafana",
-      "version": "9.2.6"
+      "version": "9.2.7"
     },
     {
       "type": "datasource",
@@ -65,14 +65,39 @@
           "uid": "$ds"
         },
         "enable": true,
-        "expr": "sum(ALERTS{alertgroup=\"vmcluster\",alertstate=\"firing\",show_at=\"dashboard\"}) by(alertname)",
+        "expr": "sum(ALERTS{job=~\"$job\", instance=~\"$instance\", alertgroup=\"vmcluster\",alertstate=\"firing\",show_at=\"dashboard\"}) by(alertname)",
         "iconColor": "red",
         "name": "alerts",
         "titleFormat": "{{alertname}}"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$ds"
+        },
+        "enable": true,
+        "expr": "sum(vm_app_version{job=~\"$job\", instance=~\"$instance\"}) by(version) unless (sum(vm_app_version{job=~\"$job\", instance=~\"$instance\"} offset 20m) by(version))",
+        "hide": true,
+        "iconColor": "dark-blue",
+        "name": "version change",
+        "textFormat": "{{version}}",
+        "titleFormat": "Version change"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$ds"
+        },
+        "enable": true,
+        "expr": "sum(changes(vm_app_start_timestamp{job=~\"$job\", instance=~\"$instance\"})) by(job)",
+        "hide": true,
+        "iconColor": "dark-yellow",
+        "name": "restarts",
+        "textFormat": "{{job}} restarted"
       }
     ]
   },
-  "description": "Overview for cluster VictoriaMetrics v1.83.0 or higher",
+  "description": "Overview for cluster VictoriaMetrics v1.86.0 or higher",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -171,7 +196,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -179,7 +204,7 @@
             "uid": "$ds"
           },
           "exemplar": true,
-          "expr": "sum(vm_rows{job=~\"$job_storage\", type!=\"indexdb\"})",
+          "expr": "sum(vm_rows{job=~\"$job_storage\", type!~\"indexdb.*\"})",
           "format": "time_series",
           "instant": true,
           "interval": "",
@@ -240,7 +265,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -311,7 +336,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -381,7 +406,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -451,7 +476,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -521,7 +546,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -591,7 +616,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -599,7 +624,7 @@
             "uid": "$ds"
           },
           "exemplar": true,
-          "expr": "sum(vm_data_size_bytes{job=~\"$job_storage\", type!=\"indexdb\"}) / sum(vm_rows{job=~\"$job_storage\", type!=\"indexdb\"})",
+          "expr": "sum(vm_data_size_bytes{job=~\"$job_storage\"}) / sum(vm_rows{job=~\"$job_storage\", type!~\"indexdb.*\"})",
           "format": "time_series",
           "instant": true,
           "interval": "",
@@ -660,7 +685,7 @@
         "text": {},
         "textMode": "auto"
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -762,7 +787,7 @@
           }
         ]
       },
-      "pluginVersion": "9.2.6",
+      "pluginVersion": "9.2.7",
       "targets": [
         {
           "datasource": {
@@ -1102,7 +1127,7 @@
             "uid": "$ds"
           },
           "editorMode": "code",
-          "expr": "sum(rate(vm_http_requests_total{job=~\"$job\", instance=~\"$instance\", path!~\"/favicon.ico\"}[$__rate_interval])) by (path) > 0",
+          "expr": "sum(rate(vm_http_requests_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) by (path) > 0",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "{{path}}",
@@ -1476,7 +1501,13 @@
               "mode": "off"
             }
           },
-          "links": [],
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Drilldown",
+              "url": "/d/oS7Bi_0Wz?viewPanel=203&var-job=${__field.labels.job}&var-ds=$ds&var-instance=$instance&${__url_time_range}"
+            }
+          ],
           "mappings": [],
           "min": 0,
           "thresholds": {
@@ -1563,7 +1594,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Percentage of used memory (resident).\nThe application's performance will significantly degrade when memory usage is close to 100%.",
+          "description": "Percentage of used RSS memory (resident).\nThe RSS memory shows the amount of memory recently accessed by the application. It includes anonymous memory and data from recently accessed files (aka page cache).\nThe application's performance will significantly degrade when memory usage is close to 100%.\n\nClick on the line and choose Drilldown to show memory usage per instance",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -1629,7 +1660,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 14
+            "y": 38
           },
           "id": 66,
           "links": [],
@@ -1675,7 +1706,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Share for memory allocated by the process itself. When memory usage reaches 100% it will be likely OOM-killed.",
+          "description": "Share for memory allocated by the process itself. When memory usage reaches 100% it will be likely OOM-killed.\nSafe memory usage % considered to be below 80%\n\nClick on the line and choose Drilldown to show memory usage per instance",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -1741,7 +1772,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 14
+            "y": 38
           },
           "id": 138,
           "links": [],
@@ -1852,7 +1883,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 22
+            "y": 46
           },
           "id": 64,
           "links": [],
@@ -1972,7 +2003,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 22
+            "y": 46
           },
           "id": 122,
           "links": [],
@@ -2113,7 +2144,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 30
+            "y": 54
           },
           "id": 117,
           "links": [],
@@ -2161,6 +2192,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
+          "description": "Shows the number of read/write syscalls such as read, pread, write, pwrite.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -2196,6 +2228,7 @@
                   "mode": "off"
                 }
               },
+              "links": [],
               "mappings": [],
               "thresholds": {
                 "mode": "absolute",
@@ -2212,15 +2245,29 @@
               },
               "unit": "short"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/read .*/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.transform",
+                    "value": "negative-Y"
+                  }
+                ]
+              }
+            ]
           },
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 30
+            "y": 54
           },
-          "id": 119,
+          "id": 204,
+          "links": [],
           "options": {
             "legend": {
               "calcs": [
@@ -2248,14 +2295,32 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "sum(max_over_time(vm_tcplistener_conns{job=~\"$job\", instance=~\"$instance\"}[$__interval])) by(job)",
+              "expr": "sum(rate(process_io_read_syscalls_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) by(job) > 0",
+              "format": "time_series",
+              "hide": false,
               "interval": "",
-              "legendFormat": "{{job}}",
+              "intervalFactor": 1,
+              "legendFormat": "read {{job}}",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "sum(rate(process_io_write_syscalls_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) by(job) > 0",
+              "format": "time_series",
+              "hide": false,
+              "interval": "",
+              "intervalFactor": 1,
+              "legendFormat": "write {{job}}",
+              "range": true,
+              "refId": "B"
             }
           ],
-          "title": "TCP connections ($instance)",
+          "title": "Disk write/read calls ($instance)",
           "type": "timeseries"
         },
         {
@@ -2323,7 +2388,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 38
+            "y": 62
           },
           "id": 68,
           "links": [],
@@ -2428,9 +2493,9 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 38
+            "y": 62
           },
-          "id": 120,
+          "id": 119,
           "options": {
             "legend": {
               "calcs": [
@@ -2458,14 +2523,14 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "sum(rate(vm_tcplistener_accepts_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) by(job)",
+              "expr": "sum(max_over_time(vm_tcplistener_conns{job=~\"$job\", instance=~\"$instance\"}[$__interval])) by(job)",
               "interval": "",
-              "legendFormat": "__auto",
+              "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
             }
           ],
-          "title": "TCP connections rate ($instance)",
+          "title": "TCP connections ($instance)",
           "type": "timeseries"
         },
         {
@@ -2533,7 +2598,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 46
+            "y": 70
           },
           "id": 70,
           "links": [],
@@ -2574,6 +2639,108 @@
             }
           ],
           "title": "Threads ($instance)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$ds"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 70
+          },
+          "id": 120,
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "9.1.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "sum(rate(vm_tcplistener_accepts_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval])) by(job)",
+              "interval": "",
+              "legendFormat": "__auto",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "TCP connections rate ($instance)",
           "type": "timeseries"
         }
       ],
@@ -2675,7 +2842,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 15
+            "y": 31
           },
           "id": 102,
           "options": {
@@ -2730,7 +2897,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "The percentage of slow inserts comparing to total insertion rate during the last 5 minutes. \n\nThe less value is better. If percentage remains high (>10%) during extended periods of time, then it is likely more RAM is needed for optimal handling of the current number of active time series. \n\nIn general, VictoriaMetrics requires ~1KB or RAM per active time series, so it should be easy calculating the required amounts of RAM for the current workload according to capacity planning docs. But the resulting number may be far from the real number because the required amounts of memory depends on may other factors such as the number of labels per time series and the length of label values.",
+          "description": "The percentage of slow inserts comparing to total insertion rate during the last 5 minutes. \n\nThe less value is better. If percentage remains high (>10%) during extended periods of time, then it is likely more RAM is needed for optimal handling of the current number of active time series. \n\nIn general, VictoriaMetrics requires ~1KB or RAM per active time series, so it should be easy calculating the required amounts of RAM for the current workload according to capacity planning docs. But the resulting number may be far from the real number because the required amounts of memory depends on many other factors such as the number of labels per time series and the length of label values. See also https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3976#issuecomment-1476883183",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -2789,7 +2956,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 15
+            "y": 31
           },
           "id": 108,
           "options": {
@@ -2890,7 +3057,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 23
+            "y": 39
           },
           "id": 142,
           "links": [
@@ -3001,7 +3168,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 23
+            "y": 39
           },
           "id": 107,
           "options": {
@@ -3100,7 +3267,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 31
+            "y": 47
           },
           "id": 170,
           "links": [],
@@ -3206,7 +3373,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 31
+            "y": 47
           },
           "id": 116,
           "links": [],
@@ -3308,7 +3475,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 39
+            "y": 55
           },
           "id": 144,
           "options": {
@@ -3336,7 +3503,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "max(\n    vm_cache_size_bytes{job=~\"$job_storage\", instance=~\"$instance\"} \n    /\n    vm_cache_size_max_bytes{job=~\"$job\", instance=~\"$instance\"}\n) by(type)",
+              "expr": "max(\n    vm_cache_size_bytes{job=~\"$job\", instance=~\"$instance\"} \n    /\n    vm_cache_size_max_bytes{job=~\"$job\", instance=~\"$instance\"}\n) by(type)",
               "interval": "",
               "legendFormat": "__auto",
               "range": true,
@@ -3411,7 +3578,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 39
+            "y": 55
           },
           "id": 58,
           "links": [],
@@ -3515,7 +3682,7 @@
             "h": 7,
             "w": 24,
             "x": 0,
-            "y": 48
+            "y": 64
           },
           "id": 183,
           "options": {
@@ -3663,7 +3830,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 5
+            "y": 21
           },
           "id": 76,
           "links": [],
@@ -3779,7 +3946,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 5
+            "y": 21
           },
           "id": 86,
           "links": [],
@@ -3904,7 +4071,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 14
+            "y": 30
           },
           "id": 80,
           "links": [],
@@ -4009,7 +4176,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 14
+            "y": 30
           },
           "id": 78,
           "links": [],
@@ -4125,7 +4292,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 22
+            "y": 38
           },
           "id": 82,
           "options": {
@@ -4232,7 +4399,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 22
+            "y": 38
           },
           "id": 74,
           "options": {
@@ -4491,7 +4658,7 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "min(vm_free_disk_space_bytes{job=~\"$job_storage\", instance=~\"$instance\"} \n/ \nignoring(path) (\n    (\n        rate(vm_rows_added_to_storage_total{job=~\"$job_storage\", instance=~\"$instance\"}[1d])\n        - \n        ignoring(type) rate(vm_deduplicated_samples_total{job=~\"$job_storage\", instance=~\"$instance\", type=\"merge\"}[1d])\n    ) * scalar(\n            sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type!=\"indexdb\"})\n            / \n            sum(vm_rows{job=~\"$job_storage\", instance=~\"$instance\", type!=\"indexdb\"})\n            )\n))",
+              "expr": "min(vm_free_disk_space_bytes{job=~\"$job_storage\", instance=~\"$instance\"} \n/ \nignoring(path) (\n    (\n        rate(vm_rows_added_to_storage_total{job=~\"$job_storage\", instance=~\"$instance\"}[1d])\n        - \n        ignoring(type) rate(vm_deduplicated_samples_total{job=~\"$job_storage\", instance=~\"$instance\", type=\"merge\"}[1d])\n    ) * scalar(\n            sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type!~\"indexdb.*\"})\n            / \n            sum(vm_rows{job=~\"$job_storage\", instance=~\"$instance\", type!~\"indexdb.*\"})\n            )\n))",
               "format": "time_series",
               "interval": "",
               "intervalFactor": 1,
@@ -4635,12 +4802,12 @@
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "avg(\n    rate(process_cpu_seconds_total{job=~\"$job_storage\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_storage\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    rate(process_cpu_seconds_total{job=~\"$job_storage\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_storage\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -4780,12 +4947,12 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "avg(\n    max_over_time(process_resident_memory_bytes{job=~\"$job_storage\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_storage\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    max_over_time(process_resident_memory_bytes{job=~\"$job_storage\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_storage\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -5011,7 +5178,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "max(\n    max_over_time(vm_concurrent_addrows_current{job=~\"$job_storage\", \n    instance=~\"$instance\"}[$__rate_interval])\n)",
+              "expr": "max(\n    max_over_time(vm_concurrent_insert_current{job=~\"$job_storage\", \n    instance=~\"$instance\"}[$__rate_interval])\n)",
               "interval": "",
               "legendFormat": "current",
               "range": true,
@@ -5024,7 +5191,7 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "min(vm_concurrent_addrows_capacity{job=~\"$job_storage\", instance=~\"$instance\"})",
+              "expr": "min(vm_concurrent_insert_capacity{job=~\"$job_storage\", instance=~\"$instance\"})",
               "hide": false,
               "interval": "",
               "legendFormat": "max",
@@ -5246,7 +5413,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Shows amount of on-disk space occupied by data points.",
+          "description": "Shows the percentage of used disk space. It is recommended to have at least 20% of free disk space for the best performance.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -5259,7 +5426,7 @@
                 "axisPlacement": "auto",
                 "barAlignment": 0,
                 "drawStyle": "line",
-                "fillOpacity": 10,
+                "fillOpacity": 0,
                 "gradientMode": "none",
                 "hideFrom": {
                   "legend": false,
@@ -5276,13 +5443,19 @@
                 "spanNulls": false,
                 "stacking": {
                   "group": "A",
-                  "mode": "normal"
+                  "mode": "none"
                 },
                 "thresholdsStyle": {
-                  "mode": "off"
+                  "mode": "line"
                 }
               },
-              "links": [],
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Drilldown",
+                  "url": "/d/oS7Bi_0Wz?viewPanel=200&var-ds=$ds&var-instance=$instance&${__url_time_range}"
+                }
+              ],
               "mappings": [],
               "min": 0,
               "thresholds": {
@@ -5297,7 +5470,7 @@
                   }
                 ]
               },
-              "unit": "bytes"
+              "unit": "percentunit"
             },
             "overrides": []
           },
@@ -5307,7 +5480,7 @@
             "x": 0,
             "y": 37
           },
-          "id": 18,
+          "id": 20,
           "links": [],
           "options": {
             "legend": {
@@ -5324,7 +5497,7 @@
             },
             "tooltip": {
               "mode": "multi",
-              "sort": "none"
+              "sort": "desc"
             }
           },
           "pluginVersion": "9.1.0",
@@ -5335,15 +5508,43 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type!=\"indexdb\"}) ",
+              "expr": "max(\n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) /\n    (\n        sum(vm_free_disk_space_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) +\n        sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)\n    ) \n)",
               "format": "time_series",
               "intervalFactor": 1,
-              "legendFormat": "disk usage",
+              "legendFormat": "max",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "min(\n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) /\n    (\n        sum(vm_free_disk_space_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) +\n        sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)\n    ) \n)",
+              "format": "time_series",
+              "hide": false,
+              "intervalFactor": 1,
+              "legendFormat": "min",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "quantile(0.5,\n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) /\n    (\n        sum(vm_free_disk_space_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance) +\n        sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)\n    ) \n)",
+              "format": "time_series",
+              "hide": false,
+              "intervalFactor": 1,
+              "legendFormat": "median",
+              "range": true,
+              "refId": "C"
             }
           ],
-          "title": "Disk space usage (datapoints) ($instance)",
+          "title": "Disk space usage %  ($instance)",
           "type": "timeseries"
         },
         {
@@ -5457,7 +5658,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Shows amount of on-disk space occupied by inverted index.",
+          "description": "Shows the percentage of used disk space by type: datapoints or indexdb. Normally, indexdb takes much less space comparing to datapoints. But with high churn rate the size of the indexdb could grow significantly.\n\nThe sum of the % can be > 100% since panel shows max % per-job and per-instance. It means different instance can have different ratio between datapoints and indexdb size.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -5470,7 +5671,7 @@
                 "axisPlacement": "auto",
                 "barAlignment": 0,
                 "drawStyle": "line",
-                "fillOpacity": 10,
+                "fillOpacity": 0,
                 "gradientMode": "none",
                 "hideFrom": {
                   "legend": false,
@@ -5487,13 +5688,19 @@
                 "spanNulls": false,
                 "stacking": {
                   "group": "A",
-                  "mode": "normal"
+                  "mode": "none"
                 },
                 "thresholdsStyle": {
-                  "mode": "off"
+                  "mode": "line"
                 }
               },
-              "links": [],
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Drilldown",
+                  "url": "/d/oS7Bi_0Wz?viewPanel=201&var-ds=$ds&var-instance=$instance&${__url_time_range}"
+                }
+              ],
               "mappings": [],
               "min": 0,
               "thresholds": {
@@ -5501,14 +5708,10 @@
                 "steps": [
                   {
                     "color": "green"
-                  },
-                  {
-                    "color": "red",
-                    "value": 80
                   }
                 ]
               },
-              "unit": "bytes"
+              "unit": "percentunit"
             },
             "overrides": []
           },
@@ -5518,7 +5721,7 @@
             "x": 0,
             "y": 45
           },
-          "id": 20,
+          "id": 202,
           "links": [],
           "options": {
             "legend": {
@@ -5535,7 +5738,7 @@
             },
             "tooltip": {
               "mode": "multi",
-              "sort": "none"
+              "sort": "desc"
             }
           },
           "pluginVersion": "9.1.0",
@@ -5546,15 +5749,29 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type=\"indexdb\"})",
+              "expr": "max(\n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\", type=~\"indexdb.*\"}) by(job, instance)\n    / \n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)\n)",
               "format": "time_series",
               "intervalFactor": 1,
-              "legendFormat": "disk usage",
+              "legendFormat": "indexdb",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "max(\n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\", type!~\"indexdb.*\"}) by(job, instance)\n    / \n    sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)\n)",
+              "format": "time_series",
+              "hide": false,
+              "intervalFactor": 1,
+              "legendFormat": "datapoints",
+              "range": true,
+              "refId": "B"
             }
           ],
-          "title": "Disk space usage (index)  ($instance)",
+          "title": "Disk space usage % by type  ($instance)",
           "type": "timeseries"
         },
         {
@@ -5755,7 +5972,7 @@
           "gridPos": {
             "h": 8,
             "w": 12,
-            "x": 12,
+            "x": 0,
             "y": 53
           },
           "id": 135,
@@ -5862,8 +6079,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -5879,7 +6095,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 82
+            "y": 98
           },
           "id": 92,
           "links": [],
@@ -5909,7 +6125,7 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "sum(rate(vm_http_requests_total{job=~\"$job_select\", instance=~\"$instance\", path!~\"/favicon.ico|/metrics\"}[$__rate_interval])) by (path) > 0",
+              "expr": "sum(rate(vm_http_requests_total{job=~\"$job_select\", instance=~\"$instance\"}[$__rate_interval])) by (path) > 0",
               "format": "time_series",
               "intervalFactor": 1,
               "legendFormat": "__auto",
@@ -5925,7 +6141,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Shows the max number of concurrent selects across instances.\n* `max` - equal to number of CPU * 2 by default. May be configured with `search.maxConcurrentRequests` flag\n* `current` - current number of goroutines busy with processing requests\n\nWhen `current` hits `max` constantly, it means one or more vmselect nodes are overloaded and require more CPU or better load balancing. If CPU panel shows there are free resources - try increasing  `search.maxConcurrentRequests`.",
+          "description": "Shows the max number of concurrent selects across instances.\n* `max` limit can be configured via `search.maxConcurrentRequests` flag\n* `current` shows the current number of goroutines busy with processing requests\n\nWhen `current` hits `max` constantly, it means one or more vmselect nodes are overloaded with number of requests. If you observe that CPU for vmselects is saturated, consider adding more vmselect replicas or increase CPU resources. If CPU panel shows a plenty of free resources - try increasing `search.maxConcurrentRequests`.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -5969,8 +6185,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -6006,7 +6221,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 82
+            "y": 98
           },
           "id": 95,
           "links": [],
@@ -6112,8 +6327,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -6129,7 +6343,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 90
+            "y": 106
           },
           "id": 163,
           "links": [],
@@ -6191,12 +6405,12 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "avg(\n    rate(process_cpu_seconds_total{job=~\"$job_select\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_select\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    rate(process_cpu_seconds_total{job=~\"$job_select\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_select\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -6257,8 +6471,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -6274,7 +6487,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 90
+            "y": 106
           },
           "id": 165,
           "links": [],
@@ -6336,12 +6549,12 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "avg(\n    max_over_time(process_resident_memory_bytes{job=~\"$job_select\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_select\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    max_over_time(process_resident_memory_bytes{job=~\"$job_select\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_select\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -6398,8 +6611,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -6415,7 +6627,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 98
+            "y": 114
           },
           "id": 178,
           "links": [],
@@ -6506,8 +6718,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -6523,7 +6734,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 98
+            "y": 114
           },
           "id": 180,
           "links": [],
@@ -6630,7 +6841,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 106
+            "y": 122
           },
           "id": 179,
           "links": [],
@@ -6737,7 +6948,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 106
+            "y": 122
           },
           "id": 181,
           "links": [],
@@ -6776,7 +6987,7 @@
               "refId": "A"
             }
           ],
-          "title": "Datapoints scanned per series ($instance)",
+          "title": "Datapoints scanned per query ($instance)",
           "type": "timeseries"
         },
         {
@@ -6855,7 +7066,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 114
+            "y": 130
           },
           "id": 93,
           "links": [],
@@ -6991,7 +7202,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 8
+            "y": 24
           },
           "id": 97,
           "links": [],
@@ -7021,7 +7232,7 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "sum(rate(vm_http_requests_total{job=~\"$job_insert\", instance=~\"$instance\", path!~\"/favicon.ico|/metrics\"}[$__rate_interval])) by (path) > 0",
+              "expr": "sum(rate(vm_http_requests_total{job=~\"$job_insert\", instance=~\"$instance\"}[$__rate_interval])) by (path) > 0",
               "format": "time_series",
               "intervalFactor": 1,
               "legendFormat": "__auto",
@@ -7037,7 +7248,7 @@
             "type": "prometheus",
             "uid": "$ds"
           },
-          "description": "Shows the max number of ongoing insertions.\n* `max` - equal to number of CPU * 4 by default. May be configured with `maxConcurrentInserts` flag;\n* `current` - current number of goroutines busy with processing requests.\n\n`-maxConcurrentInserts` limits the number of insert requests which may be actively processed at any given point in time. All the other insert requests are queued for up to `-insert.maxQueueDuration` in the hope they will get a chance to be processed. This queue is used mostly for absorbing spikes for incoming insert request rate.\n\nWhen `current` hits `max` constantly, it means vminsert node is overloaded and requires more CPU or higher limits.",
+          "description": "Shows the max number of ongoing insertions.\n* `max` - equal to number of CPU * 2 by default. May be configured with `maxConcurrentInserts` flag;\n* `current` - current number of goroutines busy with processing requests.\n\n`-maxConcurrentInserts` limits the number of insert requests which may be actively processed at any given point in time. All the other insert requests are queued for up to `-insert.maxQueueDuration` in the hope they will get a chance to be processed. This queue is used mostly for absorbing spikes for incoming insert request rate.\n\nWhen `current` hits `max` constantly, it means vminsert node is overloaded and requires more CPU or higher limits.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -7117,7 +7328,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 8
+            "y": 24
           },
           "id": 99,
           "links": [],
@@ -7241,7 +7452,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 16
+            "y": 32
           },
           "id": 185,
           "links": [],
@@ -7303,12 +7514,12 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "avg(\n    rate(process_cpu_seconds_total{job=~\"$job_insert\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_insert\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    rate(process_cpu_seconds_total{job=~\"$job_insert\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    process_cpu_cores_available{job=~\"$job_insert\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -7385,7 +7596,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 16
+            "y": 32
           },
           "id": 187,
           "links": [],
@@ -7447,12 +7658,12 @@
               },
               "editorMode": "code",
               "exemplar": true,
-              "expr": "avg(\n    max_over_time(process_resident_memory_bytes{job=~\"$job_insert\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_insert\", instance=~\"$instance\"}\n)",
+              "expr": "quantile(0.5,\n    max_over_time(process_resident_memory_bytes{job=~\"$job_insert\", instance=~\"$instance\"}[$__rate_interval])\n    /\n    vm_available_memory_bytes{job=~\"$job_insert\", instance=~\"$instance\"}\n)",
               "format": "time_series",
               "hide": false,
               "interval": "",
               "intervalFactor": 1,
-              "legendFormat": "avg",
+              "legendFormat": "median",
               "range": true,
               "refId": "C"
             }
@@ -7523,7 +7734,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 24
+            "y": 40
           },
           "id": 90,
           "links": [],
@@ -7631,7 +7842,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 24
+            "y": 40
           },
           "id": 88,
           "links": [],
@@ -7738,7 +7949,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 32
+            "y": 48
           },
           "id": 139,
           "links": [],
@@ -7845,7 +8056,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 32
+            "y": 48
           },
           "id": 114,
           "links": [],
@@ -7907,14 +8118,19 @@
             "h": 2,
             "w": 24,
             "x": 0,
-            "y": 9
+            "y": 84
           },
           "id": 198,
           "options": {
+            "code": {
+              "language": "plaintext",
+              "showLineNumbers": false,
+              "showMiniMap": false
+            },
             "content": "Drilldown row is used by other panels on the dashboard to show more detailed metrics per-instance.",
             "mode": "markdown"
           },
-          "pluginVersion": "9.1.0",
+          "pluginVersion": "9.2.7",
           "transparent": true,
           "type": "text"
         },
@@ -7966,7 +8182,8 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green"
+                    "color": "green",
+                    "value": null
                   }
                 ]
               },
@@ -7978,7 +8195,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 11
+            "y": 86
           },
           "id": 189,
           "links": [],
@@ -8067,7 +8284,8 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green"
+                    "color": "green",
+                    "value": null
                   }
                 ]
               },
@@ -8079,7 +8297,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 11
+            "y": 86
           },
           "id": 190,
           "links": [],
@@ -8168,7 +8386,8 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green"
+                    "color": "green",
+                    "value": null
                   }
                 ]
               },
@@ -8180,7 +8399,7 @@
             "h": 7,
             "w": 12,
             "x": 0,
-            "y": 19
+            "y": 94
           },
           "id": 192,
           "links": [],
@@ -8271,7 +8490,8 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green"
+                    "color": "green",
+                    "value": null
                   },
                   {
                     "color": "red",
@@ -8287,7 +8507,7 @@
             "h": 7,
             "w": 12,
             "x": 12,
-            "y": 19
+            "y": 94
           },
           "id": 196,
           "links": [],
@@ -8317,7 +8537,7 @@
                 "uid": "$ds"
               },
               "editorMode": "code",
-              "expr": "vm_free_disk_space_bytes{job=~\"$job_storage\", instance=~\"$instance\"} \n/ \nignoring(path) (\n    (\n        rate(vm_rows_added_to_storage_total{job=~\"$job_storage\", instance=~\"$instance\"}[1d])\n        - \n        ignoring(type) rate(vm_deduplicated_samples_total{job=~\"$job_storage\", instance=~\"$instance\", type=\"merge\"}[1d])\n    ) * scalar(\n            sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type!=\"indexdb\"})\n            / \n            sum(vm_rows{job=~\"$job_storage\", instance=~\"$instance\", type!=\"indexdb\"})\n            )\n)",
+              "expr": "vm_free_disk_space_bytes{job=~\"$job_storage\", instance=~\"$instance\"} \n/ \nignoring(path) (\n    (\n        rate(vm_rows_added_to_storage_total{job=~\"$job_storage\", instance=~\"$instance\"}[1d])\n        - \n        ignoring(type) rate(vm_deduplicated_samples_total{job=~\"$job_storage\", instance=~\"$instance\", type=\"merge\"}[1d])\n    ) * scalar(\n            sum(vm_data_size_bytes{job=~\"$job_storage\", instance=~\"$instance\", type!~\"indexdb.*\"})\n            / \n            sum(vm_rows{job=~\"$job_storage\", instance=~\"$instance\", type!~\"indexdb.*\"})\n            )\n)",
               "format": "time_series",
               "interval": "",
               "intervalFactor": 1,
@@ -8327,6 +8547,333 @@
             }
           ],
           "title": "Storage full ETA ($instance)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$ds"
+          },
+          "description": "Shows the percentage of used disk space. It is recommended to have at least 20% of free disk space for the best performance.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "links": [],
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 101
+          },
+          "id": 200,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "9.1.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\"}) by(job, instance)",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Disk space usage ($instance)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$ds"
+          },
+          "description": "",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "links": [],
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 101
+          },
+          "id": 201,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "9.1.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\", type=~\"indexdb.*\"}) by(job, instance)",
+              "format": "time_series",
+              "intervalFactor": 1,
+              "legendFormat": "{{job}}:{{instance}} (indexdb)",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "expr": "sum(vm_data_size_bytes{job=~\"$job\", instance=~\"$instance\", type!~\"indexdb.*\"}) by(job, instance)",
+              "format": "time_series",
+              "hide": false,
+              "intervalFactor": 1,
+              "legendFormat": "{{job}}:{{instance}} (datapoints)",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Disk space usage by type ($instance)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$ds"
+          },
+          "description": "Shows the rate of logging the messages by their level. Unexpected spike in rate is a good reason to check logs.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "bars",
+                "fillOpacity": 100,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "links": [],
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 109
+          },
+          "id": 203,
+          "links": [],
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true,
+              "sortBy": "Last *",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "9.1.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$ds"
+              },
+              "editorMode": "code",
+              "exemplar": true,
+              "expr": "sum(rate(vm_log_messages_total{job=~\"$job\",instance=~\"$instance\", level!=\"info\"}[$__rate_interval])) by (job, instance, level, location) > 0",
+              "format": "time_series",
+              "hide": false,
+              "interval": "5m",
+              "intervalFactor": 1,
+              "legendFormat": "__auto",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Logging rate",
           "type": "timeseries"
         }
       ],
@@ -8342,9 +8889,9 @@
     "list": [
       {
         "current": {
-          "selected": false,
-          "text": "VictoriaMetrics - cluster",
-          "value": "VictoriaMetrics - cluster"
+          "selected": true,
+          "text": "VictoriaMetrics",
+          "value": "VictoriaMetrics"
         },
         "hide": 0,
         "includeAll": false,
@@ -8364,81 +8911,6 @@
           "type": "prometheus",
           "uid": "$ds"
         },
-        "definition": "label_values(vm_app_version{version=~\"^vminsert.*\"}, job)",
-        "hide": 2,
-        "includeAll": false,
-        "multi": false,
-        "name": "job_insert",
-        "options": [],
-        "query": {
-          "query": "label_values(vm_app_version{version=~\"^vminsert.*\"}, job)",
-          "refId": "VictoriaMetrics-job_insert-Variable-Query"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "tagValuesQuery": "",
-        "tagsQuery": "",
-        "type": "query",
-        "useTags": false
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "$ds"
-        },
-        "definition": "label_values(vm_app_version{version=~\"^vmselect.*\"}, job)",
-        "hide": 2,
-        "includeAll": false,
-        "multi": false,
-        "name": "job_select",
-        "options": [],
-        "query": {
-          "query": "label_values(vm_app_version{version=~\"^vmselect.*\"}, job)",
-          "refId": "VictoriaMetrics-job_select-Variable-Query"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "tagValuesQuery": "",
-        "tagsQuery": "",
-        "type": "query",
-        "useTags": false
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "$ds"
-        },
-        "definition": "label_values(vm_app_version{version=~\"^vmstorage.*\"}, job)",
-        "hide": 2,
-        "includeAll": false,
-        "multi": false,
-        "name": "job_storage",
-        "options": [],
-        "query": {
-          "query": "label_values(vm_app_version{version=~\"^vmstorage.*\"}, job)",
-          "refId": "VictoriaMetrics-job_storage-Variable-Query"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "tagValuesQuery": "",
-        "tagsQuery": "",
-        "type": "query",
-        "useTags": false
-      },
-      {
-        "current": {},
-        "datasource": {
-          "type": "prometheus",
-          "uid": "$ds"
-        },
         "definition": "label_values(vm_app_version{version=~\"^vm(insert|select|storage).*\"}, job)",
         "hide": 0,
         "includeAll": true,
@@ -8448,6 +8920,81 @@
         "query": {
           "query": "label_values(vm_app_version{version=~\"^vm(insert|select|storage).*\"}, job)",
           "refId": "VictoriaMetrics-job-Variable-Query"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "tagValuesQuery": "",
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$ds"
+        },
+        "definition": "label_values(vm_app_version{job=~\"$job\", version=~\"^vminsert.*\"}, job)",
+        "hide": 2,
+        "includeAll": true,
+        "multi": true,
+        "name": "job_insert",
+        "options": [],
+        "query": {
+          "query": "label_values(vm_app_version{job=~\"$job\", version=~\"^vminsert.*\"}, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "tagValuesQuery": "",
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$ds"
+        },
+        "definition": "label_values(vm_app_version{job=~\"$job\", version=~\"^vmselect.*\"}, job)",
+        "hide": 2,
+        "includeAll": true,
+        "multi": true,
+        "name": "job_select",
+        "options": [],
+        "query": {
+          "query": "label_values(vm_app_version{job=~\"$job\", version=~\"^vmselect.*\"}, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "tagValuesQuery": "",
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$ds"
+        },
+        "definition": "label_values(vm_app_version{job=~\"$job\", version=~\"^vmstorage.*\"}, job)",
+        "hide": 2,
+        "includeAll": true,
+        "multi": true,
+        "name": "job_storage",
+        "options": [],
+        "query": {
+          "query": "label_values(vm_app_version{job=~\"$job\", version=~\"^vmstorage.*\"}, job)",
+          "refId": "StandardVariableQuery"
         },
         "refresh": 1,
         "regex": "",

@@ -14,7 +14,7 @@
     font-weight: bold;
     transform-style: preserve-3d;
     overflow: hidden;
-    line-height: 14px;
+    line-height: 1;
     box-shadow: $box-shadow;
     transition: box-shadow 200ms ease-in-out;
 
@@ -40,6 +40,10 @@
     gap: $padding-global;
     padding: 0;
 
+    @media (max-width: 1000px) {
+      grid-template-columns: 1fr;
+    }
+
     &-panel {
       position: relative;
       border-radius: $border-radius-medium;
@@ -57,7 +61,7 @@
         height: 20px;
         transform: scale(0);
         transition: transform 200ms ease-in-out;
-        cursor: se-resize;
+        cursor: ew-resize;
         z-index: 1;
 
         &:after {

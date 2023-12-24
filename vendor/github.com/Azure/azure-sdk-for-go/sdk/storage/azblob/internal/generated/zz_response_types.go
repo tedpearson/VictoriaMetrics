@@ -23,6 +23,9 @@ type AppendBlobClientAppendBlockFromURLResponse struct {
 	// BlobCommittedBlockCount contains the information returned from the x-ms-blob-committed-block-count header response.
 	BlobCommittedBlockCount *int32
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -49,9 +52,6 @@ type AppendBlobClientAppendBlockFromURLResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // AppendBlobClientAppendBlockResponse contains the response from method AppendBlobClient.AppendBlock.
@@ -65,6 +65,9 @@ type AppendBlobClientAppendBlockResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -91,9 +94,6 @@ type AppendBlobClientAppendBlockResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // AppendBlobClientCreateResponse contains the response from method AppendBlobClient.Create.
@@ -248,6 +248,9 @@ type BlobClientCopyFromURLResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -263,6 +266,9 @@ type BlobClientCopyFromURLResponse struct {
 	// ETag contains the information returned from the ETag header response.
 	ETag *azcore.ETag
 
+	// EncryptionScope contains the information returned from the x-ms-encryption-scope header response.
+	EncryptionScope *string
+
 	// LastModified contains the information returned from the Last-Modified header response.
 	LastModified *time.Time
 
@@ -274,9 +280,6 @@ type BlobClientCopyFromURLResponse struct {
 
 	// VersionID contains the information returned from the x-ms-version-id header response.
 	VersionID *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // BlobClientCreateSnapshotResponse contains the response from method BlobClient.CreateSnapshot.
@@ -407,6 +410,9 @@ type BlobClientDownloadResponse struct {
 	// CopyStatusDescription contains the information returned from the x-ms-copy-status-description header response.
 	CopyStatusDescription *string
 
+	// CreationTime contains the information returned from the x-ms-creation-time header response.
+	CreationTime *time.Time
+
 	// Date contains the information returned from the Date header response.
 	Date *time.Time
 
@@ -456,13 +462,13 @@ type BlobClientDownloadResponse struct {
 	LegalHold *bool
 
 	// Metadata contains the information returned from the x-ms-meta header response.
-	Metadata map[string]string
+	Metadata map[string]*string
 
 	// ObjectReplicationPolicyID contains the information returned from the x-ms-or-policy-id header response.
 	ObjectReplicationPolicyID *string
 
 	// ObjectReplicationRules contains the information returned from the x-ms-or header response.
-	ObjectReplicationRules map[string]string
+	ObjectReplicationRules map[string]*string
 
 	// RequestID contains the information returned from the x-ms-request-id header response.
 	RequestID *string
@@ -624,13 +630,13 @@ type BlobClientGetPropertiesResponse struct {
 	LegalHold *bool
 
 	// Metadata contains the information returned from the x-ms-meta header response.
-	Metadata map[string]string
+	Metadata map[string]*string
 
 	// ObjectReplicationPolicyID contains the information returned from the x-ms-or-policy-id header response.
 	ObjectReplicationPolicyID *string
 
 	// ObjectReplicationRules contains the information returned from the x-ms-or header response.
-	ObjectReplicationRules map[string]string
+	ObjectReplicationRules map[string]*string
 
 	// RehydratePriority contains the information returned from the x-ms-rehydrate-priority header response.
 	RehydratePriority *string
@@ -760,7 +766,7 @@ type BlobClientQueryResponse struct {
 	LeaseStatus *LeaseStatusType
 
 	// Metadata contains the information returned from the x-ms-meta header response.
-	Metadata map[string]string
+	Metadata map[string]*string
 
 	// RequestID contains the information returned from the x-ms-request-id header response.
 	RequestID *string
@@ -1008,6 +1014,9 @@ type BlockBlobClientCommitBlockListResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1037,9 +1046,6 @@ type BlockBlobClientCommitBlockListResponse struct {
 
 	// VersionID contains the information returned from the x-ms-version-id header response.
 	VersionID *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // BlockBlobClientGetBlockListResponse contains the response from method BlockBlobClient.GetBlockList.
@@ -1111,6 +1117,9 @@ type BlockBlobClientStageBlockFromURLResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1131,9 +1140,6 @@ type BlockBlobClientStageBlockFromURLResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // BlockBlobClientStageBlockResponse contains the response from method BlockBlobClient.StageBlock.
@@ -1141,6 +1147,9 @@ type BlockBlobClientStageBlockResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1161,9 +1170,6 @@ type BlockBlobClientStageBlockResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // BlockBlobClientUploadResponse contains the response from method BlockBlobClient.Upload.
@@ -1310,6 +1316,22 @@ type ContainerClientDeleteResponse struct {
 	Version *string
 }
 
+// ContainerClientFilterBlobsResponse contains the response from method ContainerClient.FilterBlobs.
+type ContainerClientFilterBlobsResponse struct {
+	FilterBlobSegment
+	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
+	ClientRequestID *string `xml:"ClientRequestID"`
+
+	// Date contains the information returned from the Date header response.
+	Date *time.Time `xml:"Date"`
+
+	// RequestID contains the information returned from the x-ms-request-id header response.
+	RequestID *string `xml:"RequestID"`
+
+	// Version contains the information returned from the x-ms-version header response.
+	Version *string `xml:"Version"`
+}
+
 // ContainerClientGetAccessPolicyResponse contains the response from method ContainerClient.GetAccessPolicy.
 type ContainerClientGetAccessPolicyResponse struct {
 	// BlobPublicAccess contains the information returned from the x-ms-blob-public-access header response.
@@ -1401,7 +1423,7 @@ type ContainerClientGetPropertiesResponse struct {
 	LeaseStatus *LeaseStatusType
 
 	// Metadata contains the information returned from the x-ms-meta header response.
-	Metadata map[string]string
+	Metadata map[string]*string
 
 	// RequestID contains the information returned from the x-ms-request-id header response.
 	RequestID *string
@@ -1410,7 +1432,7 @@ type ContainerClientGetPropertiesResponse struct {
 	Version *string
 }
 
-// ContainerClientListBlobFlatSegmentResponse contains the response from method ContainerClient.ListBlobFlatSegment.
+// ContainerClientListBlobFlatSegmentResponse contains the response from method ContainerClient.NewListBlobFlatSegmentPager.
 type ContainerClientListBlobFlatSegmentResponse struct {
 	ListBlobsFlatSegmentResponse
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
@@ -1429,7 +1451,7 @@ type ContainerClientListBlobFlatSegmentResponse struct {
 	Version *string `xml:"Version"`
 }
 
-// ContainerClientListBlobHierarchySegmentResponse contains the response from method ContainerClient.ListBlobHierarchySegment.
+// ContainerClientListBlobHierarchySegmentResponse contains the response from method ContainerClient.NewListBlobHierarchySegmentPager.
 type ContainerClientListBlobHierarchySegmentResponse struct {
 	ListBlobsHierarchySegmentResponse
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
@@ -1588,6 +1610,9 @@ type PageBlobClientClearPagesResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1605,9 +1630,6 @@ type PageBlobClientClearPagesResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // PageBlobClientCopyIncrementalResponse contains the response from method PageBlobClient.CopyIncremental.
@@ -1673,7 +1695,7 @@ type PageBlobClientCreateResponse struct {
 	VersionID *string
 }
 
-// PageBlobClientGetPageRangesDiffResponse contains the response from method PageBlobClient.GetPageRangesDiff.
+// PageBlobClientGetPageRangesDiffResponse contains the response from method PageBlobClient.NewGetPageRangesDiffPager.
 type PageBlobClientGetPageRangesDiffResponse struct {
 	PageList
 	// BlobContentLength contains the information returned from the x-ms-blob-content-length header response.
@@ -1698,7 +1720,7 @@ type PageBlobClientGetPageRangesDiffResponse struct {
 	Version *string `xml:"Version"`
 }
 
-// PageBlobClientGetPageRangesResponse contains the response from method PageBlobClient.GetPageRanges.
+// PageBlobClientGetPageRangesResponse contains the response from method PageBlobClient.NewGetPageRangesPager.
 type PageBlobClientGetPageRangesResponse struct {
 	PageList
 	// BlobContentLength contains the information returned from the x-ms-blob-content-length header response.
@@ -1776,6 +1798,9 @@ type PageBlobClientUploadPagesFromURLResponse struct {
 	// BlobSequenceNumber contains the information returned from the x-ms-blob-sequence-number header response.
 	BlobSequenceNumber *int64
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1802,9 +1827,6 @@ type PageBlobClientUploadPagesFromURLResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // PageBlobClientUploadPagesResponse contains the response from method PageBlobClient.UploadPages.
@@ -1815,6 +1837,9 @@ type PageBlobClientUploadPagesResponse struct {
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.
 	ClientRequestID *string
 
+	// ContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
+	ContentCRC64 []byte
+
 	// ContentMD5 contains the information returned from the Content-MD5 header response.
 	ContentMD5 []byte
 
@@ -1841,9 +1866,6 @@ type PageBlobClientUploadPagesResponse struct {
 
 	// Version contains the information returned from the x-ms-version header response.
 	Version *string
-
-	// XMSContentCRC64 contains the information returned from the x-ms-content-crc64 header response.
-	XMSContentCRC64 []byte
 }
 
 // ServiceClientFilterBlobsResponse contains the response from method ServiceClient.FilterBlobs.
@@ -1931,7 +1953,7 @@ type ServiceClientGetUserDelegationKeyResponse struct {
 	Version *string `xml:"Version"`
 }
 
-// ServiceClientListContainersSegmentResponse contains the response from method ServiceClient.ListContainersSegment.
+// ServiceClientListContainersSegmentResponse contains the response from method ServiceClient.NewListContainersSegmentPager.
 type ServiceClientListContainersSegmentResponse struct {
 	ListContainersSegmentResponse
 	// ClientRequestID contains the information returned from the x-ms-client-request-id header response.

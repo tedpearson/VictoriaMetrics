@@ -47,6 +47,7 @@ func addHTTPTargetLabels(src []httpGroupTarget, sourceURL string) []*promutils.L
 			m.AddFrom(labels)
 			m.Add("__address__", target)
 			m.Add("__meta_url", sourceURL)
+			// Remove possible duplicate labels, which can appear after AddFrom() call
 			m.RemoveDuplicates()
 			ms = append(ms, m)
 		}
@@ -56,5 +57,9 @@ func addHTTPTargetLabels(src []httpGroupTarget, sourceURL string) []*promutils.L
 
 // MustStop stops further usage for sdc.
 func (sdc *SDConfig) MustStop() {
-	configMap.Delete(sdc)
+	v := configMap.Delete(sdc)
+	if v != nil {
+		cfg := v.(*apiConfig)
+		cfg.client.Stop()
+	}
 }

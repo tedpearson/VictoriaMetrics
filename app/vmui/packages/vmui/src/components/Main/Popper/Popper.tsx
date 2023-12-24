@@ -1,8 +1,15 @@
-import React, { FC, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import React, { FC, MouseEvent as ReactMouseEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import classNames from "classnames";
 import ReactDOM from "react-dom";
 import "./style.scss";
 import useClickOutside from "../../../hooks/useClickOutside";
+import useDeviceDetect from "../../../hooks/useDeviceDetect";
+import Button from "../Button/Button";
+import { CloseIcon } from "../Icons";
+import { useLocation, useNavigate } from "react-router-dom";
+import useBoolean from "../../../hooks/useBoolean";
+import useEventListener from "../../../hooks/useEventListener";
+import { useCallback } from "preact/compat";
 
 interface PopperProps {
   children: ReactNode
@@ -12,7 +19,10 @@ interface PopperProps {
   placement?: "bottom-right" | "bottom-left" | "top-left" | "top-right"
   animation?: string
   offset?: {top: number, left: number}
-  clickOutside?: boolean
+  clickOutside?: boolean,
+  fullWidth?: boolean
+  title?: string
+  disabledFullScreen?: boolean
 }
 
 const Popper: FC<PopperProps> = ({
@@ -21,27 +31,24 @@ const Popper: FC<PopperProps> = ({
   placement = "bottom-left",
   open = false,
   onClose,
-  animation,
   offset = { top: 6, left: 0 },
-  clickOutside = true
+  clickOutside = true,
+  fullWidth,
+  title,
+  disabledFullScreen
 }) => {
-
-  const [isOpen, setIsOpen] = useState(true);
+  const { isMobile } = useDeviceDetect();
+  const navigate = useNavigate();
+  const location = useLocation();
   const [popperSize, setPopperSize] = useState({ width: 0, height: 0 });
 
+  const {
+    value: isOpen,
+    setValue: setIsOpen,
+    setFalse: handleClose,
+  } = useBoolean(false);
+
   const popperRef = useRef<HTMLDivElement>(null);
-
-  const onScrollWindow = () => {
-    setIsOpen(false);
-  };
-
-  useEffect(() => {
-    window.addEventListener("scroll", onScrollWindow);
-
-    return () => {
-      window.removeEventListener("scroll", onScrollWindow);
-    };
-  }, []);
 
   useEffect(() => {
     setIsOpen(open);
@@ -49,6 +56,13 @@ const Popper: FC<PopperProps> = ({
 
   useEffect(() => {
     if (!isOpen && onClose) onClose();
+    if (isOpen && isMobile && !disabledFullScreen) {
+      document.body.style.overflow = "hidden";
+    }
+
+    return () => {
+      document.body.style.overflow = "auto";
+    };
   }, [isOpen]);
 
   useEffect(() => {
@@ -62,13 +76,14 @@ const Popper: FC<PopperProps> = ({
   const popperStyle = useMemo(() => {
     const buttonEl = buttonRef.current;
 
-    if (!buttonEl|| !isOpen) return {};
+    if (!buttonEl || !isOpen) return {};
 
     const buttonPos = buttonEl.getBoundingClientRect();
 
     const position = {
       top: 0,
-      left: 0
+      left: 0,
+      width: "auto"
     };
 
     const needAlignRight = placement === "bottom-right" || placement === "top-right";
@@ -96,25 +111,63 @@ const Popper: FC<PopperProps> = ({
     if (isOverflowRight) position.left = buttonPos.right - popperSize.width - offsetLeft;
     if (isOverflowLeft) position.left = buttonPos.left + offsetLeft;
 
+    if (fullWidth) position.width = `${buttonPos.width}px`;
+    if (position.top < 0) position.top = 20;
+
     return position;
-  },[buttonRef, placement, isOpen, children]);
+  },[buttonRef, placement, isOpen, children, fullWidth]);
+
+  const handleClickClose = (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>) => {
+    e.stopPropagation();
+    onClose();
+  };
 
   if (clickOutside) useClickOutside(popperRef, () => setIsOpen(false), buttonRef);
 
-  const popperClasses = classNames({
-    "vm-popper": true,
-    "vm-popper_open": isOpen,
-    [`vm-popper_open_${animation}`]: animation,
-  });
+  useEffect(() => {
+    if (!popperRef.current || !isOpen || (isMobile && !disabledFullScreen)) return;
+    const { right, width } = popperRef.current.getBoundingClientRect();
+    if (right > window.innerWidth) {
+      const left = window.innerWidth - 20 - width;
+      popperRef.current.style.left = left < window.innerWidth ? "0" : `${left}px`;
+    }
+  }, [isOpen, popperRef]);
+
+  const handlePopstate = useCallback(() => {
+    if (isOpen && isMobile && !disabledFullScreen) {
+      navigate(location, { replace: true });
+      onClose();
+    }
+  }, [isOpen, isMobile, disabledFullScreen, location, onClose]);
+
+  useEventListener("scroll", handleClose);
+  useEventListener("popstate", handlePopstate);
 
   return (
     <>
-      {isOpen && ReactDOM.createPortal((
+      {(isOpen || !popperSize.width) && ReactDOM.createPortal((
         <div
-          className={popperClasses}
+          className={classNames({
+            "vm-popper": true,
+            "vm-popper_mobile": isMobile && !disabledFullScreen,
+            "vm-popper_open": (isMobile || Object.keys(popperStyle).length) && isOpen,
+          })}
           ref={popperRef}
-          style={popperStyle}
+          style={(isMobile && !disabledFullScreen) ? {} : popperStyle}
         >
+          {(title || (isMobile && !disabledFullScreen)) && (
+            <div className="vm-popper-header">
+              <p className="vm-popper-header__title">{title}</p>
+              <Button
+                variant="text"
+                size="small"
+                onClick={handleClickClose}
+                ariaLabel="close"
+              >
+                <CloseIcon/>
+              </Button>
+            </div>
+          )}
           {children}
         </div>), document.body)}
     </>

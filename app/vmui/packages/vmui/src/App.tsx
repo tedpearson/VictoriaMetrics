@@ -2,56 +2,77 @@ import React, { FC, useState } from "preact/compat";
 import { HashRouter, Route, Routes } from "react-router-dom";
 import router from "./router";
 import AppContextProvider from "./contexts/AppContextProvider";
-import HomeLayout from "./components/Home/HomeLayout";
+import MainLayout from "./layouts/MainLayout/MainLayout";
 import CustomPanel from "./pages/CustomPanel";
 import DashboardsLayout from "./pages/PredefinedPanels";
 import CardinalityPanel from "./pages/CardinalityPanel";
 import TopQueries from "./pages/TopQueries";
 import ThemeProvider from "./components/Main/ThemeProvider/ThemeProvider";
-import Spinner from "./components/Main/Spinner/Spinner";
 import TracePage from "./pages/TracePage";
+import ExploreMetrics from "./pages/ExploreMetrics";
+import PreviewIcons from "./components/Main/Icons/PreviewIcons";
+import WithTemplate from "./pages/WithTemplate";
+import Relabel from "./pages/Relabel";
+import ActiveQueries from "./pages/ActiveQueries";
 
 const App: FC = () => {
-
-  const [loadingTheme, setLoadingTheme] = useState(true);
-
-  if (loadingTheme) return (
-    <>
-      <Spinner/>
-      <ThemeProvider setLoadingTheme={setLoadingTheme}/>;
-    </>
-  );
+  const [loadedTheme, setLoadedTheme] = useState(false);
 
   return <>
     <HashRouter>
       <AppContextProvider>
-        <Routes>
-          <Route
-            path={"/"}
-            element={<HomeLayout/>}
-          >
-            <Route
-              path={router.home}
-              element={<CustomPanel/>}
-            />
-            <Route
-              path={router.dashboards}
-              element={<DashboardsLayout/>}
-            />
-            <Route
-              path={router.cardinality}
-              element={<CardinalityPanel/>}
-            />
-            <Route
-              path={router.topQueries}
-              element={<TopQueries/>}
-            />
-            <Route
-              path={router.trace}
-              element={<TracePage/>}
-            />
-          </Route>
-        </Routes>
+        <>
+          <ThemeProvider onLoaded={setLoadedTheme}/>
+          {loadedTheme && (
+            <Routes>
+              <Route
+                path={"/"}
+                element={<MainLayout/>}
+              >
+                <Route
+                  path={router.home}
+                  element={<CustomPanel/>}
+                />
+                <Route
+                  path={router.metrics}
+                  element={<ExploreMetrics/>}
+                />
+                <Route
+                  path={router.cardinality}
+                  element={<CardinalityPanel/>}
+                />
+                <Route
+                  path={router.topQueries}
+                  element={<TopQueries/>}
+                />
+                <Route
+                  path={router.trace}
+                  element={<TracePage/>}
+                />
+                <Route
+                  path={router.dashboards}
+                  element={<DashboardsLayout/>}
+                />
+                <Route
+                  path={router.withTemplate}
+                  element={<WithTemplate/>}
+                />
+                <Route
+                  path={router.relabel}
+                  element={<Relabel/>}
+                />
+                <Route
+                  path={router.activeQueries}
+                  element={<ActiveQueries/>}
+                />
+                <Route
+                  path={router.icons}
+                  element={<PreviewIcons/>}
+                />
+              </Route>
+            </Routes>
+          )}
+        </>
       </AppContextProvider>
     </HashRouter>
   </>;

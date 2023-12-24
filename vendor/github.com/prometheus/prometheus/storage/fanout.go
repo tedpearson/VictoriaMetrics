@@ -72,15 +72,15 @@ func (f *fanout) StartTime() (int64, error) {
 	return firstTime, nil
 }
 
-func (f *fanout) Querier(ctx context.Context, mint, maxt int64) (Querier, error) {
-	primary, err := f.primary.Querier(ctx, mint, maxt)
+func (f *fanout) Querier(mint, maxt int64) (Querier, error) {
+	primary, err := f.primary.Querier(mint, maxt)
 	if err != nil {
 		return nil, err
 	}
 
 	secondaries := make([]Querier, 0, len(f.secondaries))
 	for _, storage := range f.secondaries {
-		querier, err := storage.Querier(ctx, mint, maxt)
+		querier, err := storage.Querier(mint, maxt)
 		if err != nil {
 			// Close already open Queriers, append potential errors to returned error.
 			errs := tsdb_errors.NewMulti(err, primary.Close())
@@ -94,15 +94,15 @@ func (f *fanout) Querier(ctx context.Context, mint, maxt int64) (Querier, error)
 	return NewMergeQuerier([]Querier{primary}, secondaries, ChainedSeriesMerge), nil
 }
 
-func (f *fanout) ChunkQuerier(ctx context.Context, mint, maxt int64) (ChunkQuerier, error) {
-	primary, err := f.primary.ChunkQuerier(ctx, mint, maxt)
+func (f *fanout) ChunkQuerier(mint, maxt int64) (ChunkQuerier, error) {
+	primary, err := f.primary.ChunkQuerier(mint, maxt)
 	if err != nil {
 		return nil, err
 	}
 
 	secondaries := make([]ChunkQuerier, 0, len(f.secondaries))
 	for _, storage := range f.secondaries {
-		querier, err := storage.ChunkQuerier(ctx, mint, maxt)
+		querier, err := storage.ChunkQuerier(mint, maxt)
 		if err != nil {
 			// Close already open Queriers, append potential errors to returned error.
 			errs := tsdb_errors.NewMulti(err, primary.Close())
@@ -174,14 +174,14 @@ func (f *fanoutAppender) AppendExemplar(ref SeriesRef, l labels.Labels, e exempl
 	return ref, nil
 }
 
-func (f *fanoutAppender) AppendHistogram(ref SeriesRef, l labels.Labels, t int64, h *histogram.Histogram) (SeriesRef, error) {
-	ref, err := f.primary.AppendHistogram(ref, l, t, h)
+func (f *fanoutAppender) AppendHistogram(ref SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (SeriesRef, error) {
+	ref, err := f.primary.AppendHistogram(ref, l, t, h, fh)
 	if err != nil {
 		return ref, err
 	}
 
 	for _, appender := range f.secondaries {
-		if _, err := appender.AppendHistogram(ref, l, t, h); err != nil {
+		if _, err := appender.AppendHistogram(ref, l, t, h, fh); err != nil {
 			return 0, err
 		}
 	}
@@ -222,9 +222,10 @@ func (f *fanoutAppender) Rollback() (err error) {
 
 	for _, appender := range f.secondaries {
 		rollbackErr := appender.Rollback()
-		if err == nil {
+		switch {
+		case err == nil:
 			err = rollbackErr
-		} else if rollbackErr != nil {
+		case rollbackErr != nil:
 			level.Error(f.logger).Log("msg", "Squashed rollback error on rollback", "err", rollbackErr)
 		}
 	}

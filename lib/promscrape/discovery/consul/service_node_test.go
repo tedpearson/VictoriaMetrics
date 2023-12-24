@@ -10,7 +10,7 @@ import (
 func TestParseServiceNodesFailure(t *testing.T) {
 	f := func(s string) {
 		t.Helper()
-		sns, err := parseServiceNodes([]byte(s))
+		sns, err := ParseServiceNodes([]byte(s))
 		if err == nil {
 			t.Fatalf("expecting non-nil error")
 		}
@@ -43,7 +43,7 @@ func TestParseServiceNodesSuccess(t *testing.T) {
     "Service": {
       "ID": "redis",
       "Service": "redis",
-      "Tags": ["primary"],
+      "Tags": ["primary","foo=bar"],
       "Address": "10.1.10.12",
       "TaggedAddresses": {
         "lan": {
@@ -95,7 +95,7 @@ func TestParseServiceNodesSuccess(t *testing.T) {
   }
 ]
 `
-	sns, err := parseServiceNodes([]byte(data))
+	sns, err := ParseServiceNodes([]byte(data))
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -124,7 +124,11 @@ func TestParseServiceNodesSuccess(t *testing.T) {
 			"__meta_consul_service_port":                   "8000",
 			"__meta_consul_tagged_address_lan":             "10.1.10.12",
 			"__meta_consul_tagged_address_wan":             "10.1.10.12",
-			"__meta_consul_tags":                           ",primary,",
+			"__meta_consul_tag_foo":                        "bar",
+			"__meta_consul_tag_primary":                    "",
+			"__meta_consul_tagpresent_foo":                 "true",
+			"__meta_consul_tagpresent_primary":             "true",
+			"__meta_consul_tags":                           ",primary,foo=bar,",
 		}),
 	}
 	discoveryutils.TestEqualLabelss(t, labelss, expectedLabelss)

@@ -1,5 +1,13 @@
 ---
-sort: 13
+sort: 22
+weight: 22
+title: Quick start
+menu:
+  docs:
+    parent: 'victoriametrics'
+    weight: 22
+aliases:
+- /Quick-Start.html
 ---
 
 # Quick start
@@ -19,7 +27,7 @@ Single-server-VictoriaMetrics VictoriaMetrics is available as:
 * [Docker images](https://hub.docker.com/r/victoriametrics/victoria-metrics/)
 * [Snap packages](https://snapcraft.io/victoriametrics)
 * [Helm Charts](https://github.com/VictoriaMetrics/helm-charts#list-of-charts)
-* [Binary releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases)
+* [Binary releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest)
 * [Source code](https://github.com/VictoriaMetrics/VictoriaMetrics).
   See [How to build from sources](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#how-to-build-from-sources)
 * [VictoriaMetrics on Linode](https://www.linode.com/marketplace/apps/victoriametrics/victoriametrics/)
@@ -66,7 +74,7 @@ file.
 <div class="with-copy" markdown="1">
 
 ```console
-git clone https://github.com/VictoriaMetrics/VictoriaMetrics && 
+git clone https://github.com/VictoriaMetrics/VictoriaMetrics && cd VictoriaMetrics
 make docker-cluster-up
 ```
 
@@ -96,7 +104,7 @@ The same API is also used by
 [VMUI](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#vmui) - graphical User Interface
 for querying and visualizing metrics.
 
-[MetricsQL](https://docs.victoriametrics.com/MetricsQL.html) - is he query language for executing read queries
+[MetricsQL](https://docs.victoriametrics.com/MetricsQL.html) - is the query language for executing read queries
 in VictoriaMetrics. MetricsQL is a [PromQL](https://prometheus.io/docs/prometheus/latest/querying/basics) 
 -like query language with a powerful set of functions and features for working specifically with time series data.
 
@@ -137,8 +145,7 @@ VictoriaMetric team prepared a list of [Grafana dashboards](https://grafana.com/
 for the main components. Each dashboard contains a lot of useful information and tips. It is recommended
 to have these dashboards installed and up to date.
 
-The list of alerts for [single](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/deployment/docker/alerts.yml)
-and [cluster](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/cluster/deployment/docker/alerts.yml)
+Using the [recommended alerting rules](https://github.com/VictoriaMetrics/VictoriaMetrics/tree/master/deployment/docker#alerts)
 versions would also help to identify and notify about issues with the system.
 
 The rule of thumb is to have a separate installation of VictoriaMetrics or any other monitoring system
@@ -150,7 +157,7 @@ See more details in the article [VictoriaMetrics Monitoring](https://victoriamet
 ### Capacity planning
 
 See capacity planning sections in [docs](https://docs.victoriametrics.com) for
-[Single-server-VictoriaMetrics](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#capacity-planning).
+[Single-server-VictoriaMetrics](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#capacity-planning)
 and [VictoriaMetrics Cluster](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#capacity-planning).
 
 Capacity planning isn't possible without [monitoring](#monitoring), so consider configuring it first.
@@ -174,3 +181,8 @@ and [backups](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.htm
 To avoid excessive resource usage or performance degradation limits must be in place:
 * [Resource usage limits](https://docs.victoriametrics.com/FAQ.html#how-to-set-a-memory-limit-for-victoriametrics-components);
 * [Cardinality limiter](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#cardinality-limiter).
+
+### Security recommendations
+
+* [Security recommendations for single-node VictoriaMetrics](https://docs.victoriametrics.com/#security)
+* [Security recommendations for cluster version of VictoriaMetrics](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#security)

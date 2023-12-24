@@ -1,87 +1,73 @@
-import React, { FC } from "react";
-import QueryEditor from "../../../components/Configurators/QueryEditor/QueryEditor";
-import { useFetchQueryOptions } from "../../../hooks/useFetchQueryOptions";
-import { ErrorTypes } from "../../../types";
-import { useQueryDispatch, useQueryState } from "../../../state/query/QueryStateContext";
-import Switch from "../../../components/Main/Switch/Switch";
-import { PlayIcon } from "../../../components/Main/Icons";
+import React, { FC, useMemo } from "react";
+import { PlayIcon, QuestionIcon, RestartIcon, TipIcon, WikiIcon } from "../../../components/Main/Icons";
 import Button from "../../../components/Main/Button/Button";
 import TextField from "../../../components/Main/TextField/TextField";
 import "./style.scss";
-import { useMemo } from "preact/compat";
+import Tooltip from "../../../components/Main/Tooltip/Tooltip";
+import useDeviceDetect from "../../../hooks/useDeviceDetect";
+import classNames from "classnames";
+import { useEffect } from "preact/compat";
+import { useSearchParams } from "react-router-dom";
+import CardinalityTotals, { CardinalityTotalsProps } from "../CardinalityTotals/CardinalityTotals";
+import useSearchParamsFromObject from "../../../hooks/useSearchParamsFromObject";
+import useStateSearchParams from "../../../hooks/useStateSearchParams";
+import Hyperlink from "../../../components/Main/Hyperlink/Hyperlink";
 
-export interface CardinalityConfiguratorProps {
-  onSetHistory: (step: number) => void;
-  onSetQuery: (query: string) => void;
-  onRunQuery: () => void;
-  onTopNChange: (value: string) => void;
-  onFocusLabelChange: (value: string) => void;
-  query: string;
-  topN: number;
-  error?: ErrorTypes | string;
-  totalSeries: number;
-  totalLabelValuePairs: number;
-  date: string | null;
-  match: string | null;
-  focusLabel: string | null;
-}
+const CardinalityConfigurator: FC<CardinalityTotalsProps> = ({ isPrometheus, isCluster, ...props }) => {
+  const { isMobile } = useDeviceDetect();
+  const [searchParams] = useSearchParams();
+  const { setSearchParamsFromKeys } = useSearchParamsFromObject();
 
-const CardinalityConfigurator: FC<CardinalityConfiguratorProps> = ({
-  topN,
-  error,
-  query,
-  onSetHistory,
-  onRunQuery,
-  onSetQuery,
-  onTopNChange,
-  onFocusLabelChange,
-  totalSeries,
-  totalLabelValuePairs,
-  date,
-  match,
-  focusLabel
-}) => {
-  const { autocomplete } = useQueryState();
-  const queryDispatch = useQueryDispatch();
+  const showTips = searchParams.get("tips") || "";
+  const [match, setMatch] = useStateSearchParams("", "match");
+  const [focusLabel, setFocusLabel] = useStateSearchParams("", "focusLabel");
+  const [topN, setTopN] = useStateSearchParams(10, "topN");
 
-  const { queryOptions } = useFetchQueryOptions();
+  const errorTopN = useMemo(() => topN < 0 ? "Number must be bigger than zero" : "", [topN]);
 
-  const errorTopN = useMemo(() => topN < 1 ? "Number must be bigger than zero" : "", [topN]);
-
-  const onChangeAutocomplete = () => {
-    queryDispatch({ type: "TOGGLE_AUTOCOMPLETE" });
+  const handleTopNChange = (val: string) => {
+    const num = +val;
+    setTopN(isNaN(num) ? 0 : num);
   };
 
-  const handleArrowUp = () => {
-    onSetHistory(-1);
+  const handleRunQuery = () => {
+    setSearchParamsFromKeys({ match, topN, focusLabel });
   };
 
-  const handleArrowDown = () => {
-    onSetHistory(1);
+  const handleResetQuery = () => {
+    setSearchParamsFromKeys({ match: "", focusLabel: "" });
   };
 
-  return <div className="vm-cardinality-configurator vm-block">
+  const handleToggleTips = () => {
+    const showTips = searchParams.get("tips") || "";
+    setSearchParamsFromKeys({ tips: showTips ? "" : "true" });
+  };
+
+  useEffect(() => {
+    const matchQuery = searchParams.get("match");
+    const topNQuery = +(searchParams.get("topN") || 10);
+    const focusLabelQuery = searchParams.get("focusLabel");
+    if (matchQuery !== match) setMatch(matchQuery || "");
+    if (topNQuery !== topN) setTopN(topNQuery);
+    if (focusLabelQuery !== focusLabel) setFocusLabel(focusLabelQuery || "");
+  }, [searchParams]);
+
+  return <div
+    className={classNames({
+      "vm-cardinality-configurator": true,
+      "vm-cardinality-configurator_mobile": isMobile,
+      "vm-block": true,
+      "vm-block_mobile": isMobile,
+    })}
+  >
     <div className="vm-cardinality-configurator-controls">
       <div className="vm-cardinality-configurator-controls__query">
-        <QueryEditor
-          value={query || match || ""}
-          autocomplete={autocomplete}
-          options={queryOptions}
-          error={error}
-          onArrowUp={handleArrowUp}
-          onArrowDown={handleArrowDown}
-          onEnter={onRunQuery}
-          onChange={onSetQuery}
-          label={"Time series selector"}
-        />
-      </div>
-      <div className="vm-cardinality-configurator-controls__item">
         <TextField
-          label="Number of entries per table"
-          type="number"
-          value={topN}
-          error={errorTopN}
-          onChange={onTopNChange}
+          label="Time series selector"
+          type="string"
+          value={match}
+          onChange={setMatch}
+          onEnter={handleRunQuery}
         />
       </div>
       <div className="vm-cardinality-configurator-controls__item">
@@ -89,29 +75,86 @@ const CardinalityConfigurator: FC<CardinalityConfiguratorProps> = ({
           label="Focus label"
           type="text"
           value={focusLabel || ""}
-          onChange={onFocusLabelChange}
+          onChange={setFocusLabel}
+          onEnter={handleRunQuery}
+          endIcon={(
+            <Tooltip
+              title={(
+                <div>
+                  <p>To identify values with the highest number of series for the selected label.</p>
+                </div>
+              )}
+            >
+              <QuestionIcon/>
+            </Tooltip>
+          )}
         />
       </div>
-      <div className="vm-cardinality-configurator-controls__item">
-        <Switch
-          label={"Autocomplete"}
-          value={autocomplete}
-          onChange={onChangeAutocomplete}
+      <div className="vm-cardinality-configurator-controls__item vm-cardinality-configurator-controls__item_limit">
+        <TextField
+          label="Limit entries"
+          type="number"
+          value={isPrometheus ? 10 : topN}
+          error={errorTopN}
+          disabled={isPrometheus}
+          helperText={isPrometheus ? "not available for Prometheus" : ""}
+          onChange={handleTopNChange}
+          onEnter={handleRunQuery}
         />
       </div>
     </div>
     <div className="vm-cardinality-configurator-bottom">
-      <div className="vm-cardinality-configurator-bottom__info">
-        Analyzed <b>{totalSeries}</b> series with <b>{totalLabelValuePairs}</b> &quot;label=value&quot; pairs
-        at <b>{date}</b>{match && <span> for series selector <b>{match}</b></span>}.
-        Show top {topN} entries per table.
+      <CardinalityTotals
+        isPrometheus={isPrometheus}
+        isCluster={isCluster}
+        {...props}
+      />
+      {isCluster &&
+        <div className="vm-cardinality-configurator-bottom-helpful">
+          <Hyperlink
+            href="https://docs.victoriametrics.com/#cardinality-explorer-statistic-inaccurancy"
+            withIcon={true}
+          >
+            <WikiIcon/>
+          Statistic inaccuracy explanation
+          </Hyperlink>
+        </div>
+      }
+
+      <div className="vm-cardinality-configurator-bottom-helpful">
+        <Hyperlink
+          href="https://docs.victoriametrics.com/#cardinality-explorer"
+          withIcon={true}
+        >
+          <WikiIcon/>
+          Documentation
+        </Hyperlink>
       </div>
-      <Button
-        startIcon={<PlayIcon/>}
-        onClick={onRunQuery}
-      >
-        Execute Query
-      </Button>
+
+      <div className="vm-cardinality-configurator-bottom__execute">
+        <Tooltip title={showTips ? "Hide tips" : "Show tips"}>
+          <Button
+            variant="text"
+            color={showTips ? "warning" : "gray"}
+            startIcon={<TipIcon/>}
+            onClick={handleToggleTips}
+            ariaLabel="visibility tips"
+          />
+        </Tooltip>
+        <Button
+          variant="text"
+          startIcon={<RestartIcon/>}
+          onClick={handleResetQuery}
+        >
+          Reset
+        </Button>
+        <Button
+          startIcon={<PlayIcon/>}
+          onClick={handleRunQuery}
+        >
+          Execute Query
+        </Button>
+      </div>
     </div>
   </div>;
 };

@@ -59,7 +59,11 @@ func getServicesLabels(cfg *apiConfig) ([]*promutils.Labels, error) {
 }
 
 func getServices(cfg *apiConfig) ([]service, error) {
-	data, err := cfg.getAPIResponse("/services")
+	filtersQueryArg := ""
+	if cfg.role == "services" {
+		filtersQueryArg = cfg.filtersQueryArg
+	}
+	data, err := cfg.getAPIResponse("/services", filtersQueryArg)
 	if err != nil {
 		return nil, fmt.Errorf("cannot query dockerswarm api for services: %w", err)
 	}
@@ -119,6 +123,7 @@ func addServicesLabels(services []service, networksLabels map[string]*promutils.
 				m.Add("__meta_dockerswarm_service_endpoint_port_publish_mode", ep.PublishMode)
 				m.AddFrom(commonLabels)
 				m.AddFrom(networksLabels[vip.NetworkID])
+				// Remove possible duplicate labels, which can appear after AddFrom() calls
 				m.RemoveDuplicates()
 				added = true
 				ms = append(ms, m)
@@ -128,6 +133,7 @@ func addServicesLabels(services []service, networksLabels map[string]*promutils.
 				m.Add("__address__", discoveryutils.JoinHostPort(ip.String(), port))
 				m.AddFrom(commonLabels)
 				m.AddFrom(networksLabels[vip.NetworkID])
+				// Remove possible duplicate labels, which can appear after AddFrom() calls
 				m.RemoveDuplicates()
 				ms = append(ms, m)
 			}
