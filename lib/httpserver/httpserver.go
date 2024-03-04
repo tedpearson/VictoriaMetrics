@@ -31,31 +31,35 @@ import (
 )
 
 var (
-	tlsEnable       = flag.Bool("tls", false, "Whether to enable TLS for incoming HTTP requests at -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set")
-	tlsCertFile     = flag.String("tlsCertFile", "", "Path to file with TLS certificate if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated")
-	tlsKeyFile      = flag.String("tlsKeyFile", "", "Path to file with TLS key if -tls is set. The provided key file is automatically re-read every second, so it can be dynamically updated")
+	tlsEnable = flagutil.NewArrayBool("tls", "Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set. "+
+		"See also -mtls")
+	tlsCertFile = flagutil.NewArrayString("tlsCertFile", "Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. "+
+		"Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated")
+	tlsKeyFile = flagutil.NewArrayString("tlsKeyFile", "Path to file with TLS key for the corresponding -httpListenAddr if -tls is set. "+
+		"The provided key file is automatically re-read every second, so it can be dynamically updated")
 	tlsCipherSuites = flagutil.NewArrayString("tlsCipherSuites", "Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants")
-	tlsMinVersion   = flag.String("tlsMinVersion", "", "Optional minimum TLS version to use for incoming requests over HTTPS if -tls is set. "+
+	tlsMinVersion   = flagutil.NewArrayString("tlsMinVersion", "Optional minimum TLS version to use for the corresponding -httpListenAddr if -tls is set. "+
 		"Supported values: TLS10, TLS11, TLS12, TLS13")
 
 	pathPrefix = flag.String("http.pathPrefix", "", "An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, "+
 		"then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. "+
 		"See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus")
 	httpAuthUsername = flag.String("httpAuth.username", "", "Username for HTTP server's Basic Auth. The authentication is disabled if empty. See also -httpAuth.password")
-	httpAuthPassword = flag.String("httpAuth.password", "", "Password for HTTP server's Basic Auth. The authentication is disabled if -httpAuth.username is empty")
-	metricsAuthKey   = flag.String("metricsAuthKey", "", "Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
-	flagsAuthKey     = flag.String("flagsAuthKey", "", "Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
-	pprofAuthKey     = flag.String("pprofAuthKey", "", "Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	httpAuthPassword = flagutil.NewPassword("httpAuth.password", "Password for HTTP server's Basic Auth. The authentication is disabled if -httpAuth.username is empty")
+	metricsAuthKey   = flagutil.NewPassword("metricsAuthKey", "Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	flagsAuthKey     = flagutil.NewPassword("flagsAuthKey", "Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	pprofAuthKey     = flagutil.NewPassword("pprofAuthKey", "Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings")
 
 	disableResponseCompression  = flag.Bool("http.disableResponseCompression", false, "Disable compression of HTTP responses to save CPU resources. By default, compression is enabled to save network bandwidth")
 	maxGracefulShutdownDuration = flag.Duration("http.maxGracefulShutdownDuration", 7*time.Second, `The maximum duration for a graceful shutdown of the HTTP server. A highly loaded server may require increased value for a graceful shutdown`)
 	shutdownDelay               = flag.Duration("http.shutdownDelay", 0, `Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers`)
 	idleConnTimeout             = flag.Duration("http.idleConnTimeout", time.Minute, "Timeout for incoming idle http connections")
-	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, `Incoming http connections are closed after the configured timeout. This may help to spread the incoming load among a cluster of services behind a load balancer. Please note that the real timeout may be bigger by up to 10% as a protection against the thundering herd problem`)
+	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, "Incoming connections to -httpListenAddr are closed after the configured timeout. "+
+		"This may help evenly spreading load among a cluster of services behind TCP-level load balancer. Zero value disables closing of incoming connections")
 
-	headerHSTS         = flag.String("http.header.hsts", "", "Value for 'Strict-Transport-Security' header")
+	headerHSTS         = flag.String("http.header.hsts", "", "Value for 'Strict-Transport-Security' header, recommended: 'max-age=31536000; includeSubDomains'")
 	headerFrameOptions = flag.String("http.header.frameOptions", "", "Value for 'X-Frame-Options' header")
-	headerCSP          = flag.String("http.header.csp", "", "Value for 'Content-Security-Policy' header")
+	headerCSP          = flag.String("http.header.csp", "", `Value for 'Content-Security-Policy' header, recommended: "default-src 'self'"`)
 )
 
 var (
@@ -64,7 +68,7 @@ var (
 )
 
 type server struct {
-	shutdownDelayDeadline int64
+	shutdownDelayDeadline atomic.Int64
 	s                     *http.Server
 }
 
@@ -76,35 +80,51 @@ type server struct {
 // In such cases the caller must serve the request.
 type RequestHandler func(w http.ResponseWriter, r *http.Request) bool
 
-// Serve starts an http server on the given addr with the given optional rh.
+// Serve starts an http server on the given addrs with the given optional rh.
 //
 // By default all the responses are transparently compressed, since egress traffic is usually expensive.
 //
-// The compression is also disabled if -http.disableResponseCompression flag is set.
+// The compression can be disabled by specifying -http.disableResponseCompression command-line flag.
 //
-// If useProxyProtocol is set to true, then the incoming connections are accepted via proxy protocol.
+// If useProxyProtocol is set to true for the corresponding addr, then the incoming connections are accepted via proxy protocol.
 // See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
-func Serve(addr string, useProxyProtocol bool, rh RequestHandler) {
+func Serve(addrs []string, useProxyProtocol *flagutil.ArrayBool, rh RequestHandler) {
 	if rh == nil {
 		rh = func(w http.ResponseWriter, r *http.Request) bool {
 			return false
 		}
 	}
+	for idx, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		useProxyProto := false
+		if useProxyProtocol != nil {
+			useProxyProto = useProxyProtocol.GetOptionalArg(idx)
+		}
+		go serve(addr, useProxyProto, rh, idx)
+	}
+}
+
+func serve(addr string, useProxyProtocol bool, rh RequestHandler, idx int) {
 	scheme := "http"
-	if *tlsEnable {
+	if tlsEnable.GetOptionalArg(idx) {
 		scheme = "https"
 	}
 	hostAddr := addr
 	if strings.HasPrefix(hostAddr, ":") {
 		hostAddr = "127.0.0.1" + hostAddr
 	}
-	logger.Infof("starting http server at %s://%s/", scheme, hostAddr)
+	logger.Infof("starting server at %s://%s/", scheme, hostAddr)
 	logger.Infof("pprof handlers are exposed at %s://%s/debug/pprof/", scheme, hostAddr)
 	var tlsConfig *tls.Config
-	if *tlsEnable {
-		tc, err := netutil.GetServerTLSConfig(*tlsCertFile, *tlsKeyFile, *tlsMinVersion, *tlsCipherSuites)
+	if tlsEnable.GetOptionalArg(idx) {
+		certFile := tlsCertFile.GetOptionalArg(idx)
+		keyFile := tlsKeyFile.GetOptionalArg(idx)
+		minVersion := tlsMinVersion.GetOptionalArg(idx)
+		tc, err := netutil.GetServerTLSConfig(certFile, keyFile, minVersion, *tlsCipherSuites)
 		if err != nil {
-			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q: %s", *tlsCertFile, *tlsKeyFile, *tlsMinVersion, err)
+			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q, -tlsCipherSuites=%q: %s", certFile, keyFile, minVersion, *tlsCipherSuites, err)
 		}
 		tlsConfig = tc
 	}
@@ -130,8 +150,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 		// since these timeouts must be controlled by request handlers.
 
 		ErrorLog: logger.StdErrorLogger(),
-
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+	}
+	if *connTimeout > 0 {
+		s.s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
 			timeoutSec := connTimeout.Seconds()
 			// Add a jitter for connection timeout in order to prevent Thundering herd problem
 			// when all the connections are established at the same time.
@@ -139,8 +160,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 			jitterSec := fastrand.Uint32n(uint32(timeoutSec / 10))
 			deadline := fasttime.UnixTimestamp() + uint64(timeoutSec) + uint64(jitterSec)
 			return context.WithValue(ctx, connDeadlineTimeKey, &deadline)
-		},
+		}
 	}
+
 	serversLock.Lock()
 	servers[addr] = &s
 	serversLock.Unlock()
@@ -154,6 +176,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 }
 
 func whetherToCloseConn(r *http.Request) bool {
+	if *connTimeout <= 0 {
+		return false
+	}
 	ctx := r.Context()
 	v := ctx.Value(connDeadlineTimeKey)
 	deadline, ok := v.(*uint64)
@@ -162,22 +187,45 @@ func whetherToCloseConn(r *http.Request) bool {
 
 var connDeadlineTimeKey = interface{}("connDeadlineSecs")
 
-// Stop stops the http server on the given addr, which has been started
-// via Serve func.
-func Stop(addr string) error {
+// Stop stops the http server on the given addrs, which has been started via Serve func.
+func Stop(addrs []string) error {
+	var errGlobalLock sync.Mutex
+	var errGlobal error
+
+	var wg sync.WaitGroup
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string) {
+			if err := stop(addr); err != nil {
+				errGlobalLock.Lock()
+				errGlobal = err
+				errGlobalLock.Unlock()
+			}
+			wg.Done()
+		}(addr)
+	}
+	wg.Wait()
+
+	return errGlobal
+}
+
+func stop(addr string) error {
 	serversLock.Lock()
 	s := servers[addr]
 	delete(servers, addr)
 	serversLock.Unlock()
 	if s == nil {
-		err := fmt.Errorf("BUG: there is no http server at %q", addr)
+		err := fmt.Errorf("BUG: there is no server at %q", addr)
 		logger.Panicf("%s", err)
 		// The return is needed for golangci-lint: SA5011(related information): this check suggests that the pointer can be nil
 		return err
 	}
 
 	deadline := time.Now().Add(*shutdownDelay).UnixNano()
-	atomic.StoreInt64(&s.shutdownDelayDeadline, deadline)
+	s.shutdownDelayDeadline.Store(deadline)
 	if *shutdownDelay > 0 {
 		// Sleep for a while until load balancer in front of the server
 		// notifies that "/health" endpoint returns non-OK responses.
@@ -214,8 +262,10 @@ var gzipHandlerWrapper = func() func(http.Handler) http.HandlerFunc {
 	return hw
 }()
 
-var metricsHandlerDuration = metrics.NewHistogram(`vm_http_request_duration_seconds{path="/metrics"}`)
-var connTimeoutClosedConns = metrics.NewCounter(`vm_http_conn_timeout_closed_conns_total`)
+var (
+	metricsHandlerDuration = metrics.NewHistogram(`vm_http_request_duration_seconds{path="/metrics"}`)
+	connTimeoutClosedConns = metrics.NewCounter(`vm_http_conn_timeout_closed_conns_total`)
+)
 
 var hostname = func() string {
 	h, err := os.Hostname()
@@ -289,7 +339,7 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 	switch r.URL.Path {
 	case "/health":
 		h.Set("Content-Type", "text/plain; charset=utf-8")
-		deadline := atomic.LoadInt64(&s.shutdownDelayDeadline)
+		deadline := s.shutdownDelayDeadline.Load()
 		if deadline <= 0 {
 			w.Write([]byte("OK"))
 			return
@@ -315,7 +365,7 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		return
 	case "/metrics":
 		metricsRequests.Inc()
-		if !CheckAuthFlag(w, r, *metricsAuthKey, "metricsAuthKey") {
+		if !CheckAuthFlag(w, r, metricsAuthKey.Get(), "metricsAuthKey") {
 			return
 		}
 		startTime := time.Now()
@@ -324,7 +374,7 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		metricsHandlerDuration.UpdateDuration(startTime)
 		return
 	case "/flags":
-		if !CheckAuthFlag(w, r, *flagsAuthKey, "flagsAuthKey") {
+		if !CheckAuthFlag(w, r, flagsAuthKey.Get(), "flagsAuthKey") {
 			return
 		}
 		h.Set("Content-Type", "text/plain; charset=utf-8")
@@ -348,7 +398,7 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 	default:
 		if strings.HasPrefix(r.URL.Path, "/debug/pprof/") {
 			pprofRequests.Inc()
-			if !CheckAuthFlag(w, r, *pprofAuthKey, "pprofAuthKey") {
+			if !CheckAuthFlag(w, r, pprofAuthKey.Get(), "pprofAuthKey") {
 				return
 			}
 			pprofHandler(r.URL.Path[len("/debug/pprof/"):], w, r)
@@ -357,6 +407,10 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 
 		if !CheckBasicAuth(w, r) {
 			return
+		}
+
+		w = &responseWriterWithAbort{
+			ResponseWriter: w,
 		}
 		if rh(w, r) {
 			return
@@ -392,7 +446,7 @@ func CheckBasicAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	username, password, ok := r.BasicAuth()
 	if ok {
-		if username == *httpAuthUsername && password == *httpAuthPassword {
+		if username == *httpAuthUsername && password == httpAuthPassword.Get() {
 			return true
 		}
 		authBasicRequestErrors.Inc()
@@ -471,6 +525,69 @@ func GetQuotedRemoteAddr(r *http.Request) string {
 	return strconv.Quote(remoteAddr)
 }
 
+type responseWriterWithAbort struct {
+	http.ResponseWriter
+
+	sentHeaders bool
+	aborted     bool
+}
+
+func (rwa *responseWriterWithAbort) Write(data []byte) (int, error) {
+	if rwa.aborted {
+		return 0, fmt.Errorf("response connection is aborted")
+	}
+	if !rwa.sentHeaders {
+		rwa.sentHeaders = true
+	}
+	return rwa.ResponseWriter.Write(data)
+}
+
+func (rwa *responseWriterWithAbort) WriteHeader(statusCode int) {
+	if rwa.aborted {
+		logger.WarnfSkipframes(1, "cannot write response headers with statusCode=%d, since the response connection has been aborted", statusCode)
+		return
+	}
+	if rwa.sentHeaders {
+		logger.WarnfSkipframes(1, "cannot write response headers with statusCode=%d, since they were already sent", statusCode)
+		return
+	}
+	rwa.ResponseWriter.WriteHeader(statusCode)
+	rwa.sentHeaders = true
+}
+
+// abort aborts the client connection associated with rwa.
+//
+// The last http chunk in the response stream is intentionally written incorrectly,
+// so the client, which reads the response, could notice this error.
+func (rwa *responseWriterWithAbort) abort() {
+	if !rwa.sentHeaders {
+		logger.Panicf("BUG: abort can be called only after http response headers are sent")
+	}
+	if rwa.aborted {
+		logger.WarnfSkipframes(2, "cannot abort the connection, since it has been already aborted")
+		return
+	}
+	hj, ok := rwa.ResponseWriter.(http.Hijacker)
+	if !ok {
+		logger.Panicf("BUG: ResponseWriter must implement http.Hijacker interface")
+	}
+	conn, bw, err := hj.Hijack()
+	if err != nil {
+		logger.WarnfSkipframes(2, "cannot hijack response connection: %s", err)
+		return
+	}
+
+	// Just write an error message into the client connection as is without http chunked encoding.
+	// This is needed in order to notify the client about the aborted connection.
+	_, _ = bw.WriteString("\nthe connection has been aborted; see the last line in the response and/or in the server log for the reason\n")
+	_ = bw.Flush()
+
+	// Forcibly close the client connection in order to break http keep-alive at client side.
+	_ = conn.Close()
+
+	rwa.aborted = true
+}
+
 // Errorf writes formatted error message to w and to logger.
 func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...interface{}) {
 	errStr := fmt.Sprintf(format, args...)
@@ -487,6 +604,13 @@ func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...inter
 			statusCode = esc.StatusCode
 			break
 		}
+	}
+	if rwa, ok := w.(*responseWriterWithAbort); ok && rwa.sentHeaders {
+		// HTTP status code has been already sent to client, so it cannot be sent again.
+		// Just write errStr to the response and abort the client connection, so the client could notice the error.
+		fmt.Fprintf(w, "\n%s\n", errStr)
+		rwa.abort()
+		return
 	}
 	http.Error(w, errStr, statusCode)
 }
@@ -511,9 +635,9 @@ func (e *ErrorWithStatusCode) Error() string {
 	return e.Err.Error()
 }
 
-// IsTLS indicates is tls enabled or not
-func IsTLS() bool {
-	return *tlsEnable
+// IsTLS indicates is tls enabled or not for -httpListenAddr at the given idx.
+func IsTLS(idx int) bool {
+	return tlsEnable.GetOptionalArg(idx)
 }
 
 // GetPathPrefix - returns http server path prefix.

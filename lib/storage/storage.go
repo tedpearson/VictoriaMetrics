@@ -25,7 +25,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot/snapshotutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
@@ -39,27 +40,25 @@ const (
 
 // Storage represents TSDB storage.
 type Storage struct {
-	// Atomic counters must go at the top of the structure in order to properly align by 8 bytes on 32-bit archs.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212 .
-	tooSmallTimestampRows uint64
-	tooBigTimestampRows   uint64
+	tooSmallTimestampRows atomic.Uint64
+	tooBigTimestampRows   atomic.Uint64
 
-	timeseriesRepopulated  uint64
-	timeseriesPreCreated   uint64
-	newTimeseriesCreated   uint64
-	slowRowInserts         uint64
-	slowPerDayIndexInserts uint64
-	slowMetricNameLoads    uint64
+	timeseriesRepopulated  atomic.Uint64
+	timeseriesPreCreated   atomic.Uint64
+	newTimeseriesCreated   atomic.Uint64
+	slowRowInserts         atomic.Uint64
+	slowPerDayIndexInserts atomic.Uint64
+	slowMetricNameLoads    atomic.Uint64
 
-	hourlySeriesLimitRowsDropped uint64
-	dailySeriesLimitRowsDropped  uint64
+	hourlySeriesLimitRowsDropped atomic.Uint64
+	dailySeriesLimitRowsDropped  atomic.Uint64
 
 	// nextRotationTimestamp is a timestamp in seconds of the next indexdb rotation.
 	//
 	// It is used for gradual pre-population of the idbNext during the last hour before the indexdb rotation.
 	// in order to reduce spikes in CPU and disk IO usage just after the rotiation.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1401
-	nextRotationTimestamp int64
+	nextRotationTimestamp atomic.Int64
 
 	path           string
 	cachePath      string
@@ -119,13 +118,11 @@ type Storage struct {
 	pendingNextDayMetricIDs     *uint64set.Set
 
 	// prefetchedMetricIDs contains metricIDs for pre-fetched metricNames in the prefetchMetricNames function.
-	prefetchedMetricIDs atomic.Pointer[uint64set.Set]
+	prefetchedMetricIDsLock sync.Mutex
+	prefetchedMetricIDs     *uint64set.Set
 
 	// prefetchedMetricIDsDeadline is used for periodic reset of prefetchedMetricIDs in order to limit its size under high rate of creating new series.
-	prefetchedMetricIDsDeadline uint64
-
-	// prefetchedMetricIDsLock is used for serializing updates of prefetchedMetricIDs from concurrent goroutines.
-	prefetchedMetricIDsLock sync.Mutex
+	prefetchedMetricIDsDeadline atomic.Uint64
 
 	stop chan struct{}
 
@@ -150,7 +147,8 @@ type Storage struct {
 	deletedMetricIDs           atomic.Pointer[uint64set.Set]
 	deletedMetricIDsUpdateLock sync.Mutex
 
-	isReadOnly uint32
+	// isReadOnly is set to true when the storage is in read-only mode.
+	isReadOnly atomic.Bool
 }
 
 // MustOpenStorage opens storage on the given path with the given retentionMsecs.
@@ -220,7 +218,7 @@ func MustOpenStorage(path string, retention time.Duration, maxHourlySeries, maxD
 
 	s.pendingNextDayMetricIDs = &uint64set.Set{}
 
-	s.prefetchedMetricIDs.Store(&uint64set.Set{})
+	s.prefetchedMetricIDs = &uint64set.Set{}
 
 	// Load metadata
 	metadataDir := filepath.Join(path, metadataDirname)
@@ -245,7 +243,7 @@ func MustOpenStorage(path string, retention time.Duration, maxHourlySeries, maxD
 	nowSecs := int64(fasttime.UnixTimestamp())
 	retentionSecs := retention.Milliseconds() / 1000 // not .Seconds() because unnecessary float64 conversion
 	nextRotationTimestamp := nextRetentionDeadlineSeconds(nowSecs, retentionSecs, retentionTimezoneOffsetSecs)
-	atomic.StoreInt64(&s.nextRotationTimestamp, nextRotationTimestamp)
+	s.nextRotationTimestamp.Store(nextRotationTimestamp)
 
 	// Load nextDayMetricIDs cache
 	date := fasttime.UnixDate()
@@ -329,7 +327,7 @@ func (s *Storage) DebugFlush() {
 }
 
 // CreateSnapshot creates snapshot for s and returns the snapshot name.
-func (s *Storage) CreateSnapshot(deadline uint64) (string, error) {
+func (s *Storage) CreateSnapshot() (string, error) {
 	logger.Infof("creating Storage snapshot for %q...", s.path)
 	startTime := time.Now()
 
@@ -343,16 +341,13 @@ func (s *Storage) CreateSnapshot(deadline uint64) (string, error) {
 		}
 	}()
 
-	snapshotName := snapshot.NewName()
+	snapshotName := snapshotutil.NewName()
 	srcDir := s.path
 	dstDir := filepath.Join(srcDir, snapshotsDirname, snapshotName)
 	fs.MustMkdirFailIfExist(dstDir)
 	dirsToRemoveOnError = append(dirsToRemoveOnError, dstDir)
 
-	smallDir, bigDir, err := s.tb.CreateSnapshot(snapshotName, deadline)
-	if err != nil {
-		return "", fmt.Errorf("cannot create table snapshot: %w", err)
-	}
+	smallDir, bigDir := s.tb.MustCreateSnapshot(snapshotName)
 	dirsToRemoveOnError = append(dirsToRemoveOnError, smallDir, bigDir)
 
 	dstDataDir := filepath.Join(dstDir, dataDirname)
@@ -373,14 +368,15 @@ func (s *Storage) CreateSnapshot(deadline uint64) (string, error) {
 	idbSnapshot := filepath.Join(srcDir, indexdbDirname, snapshotsDirname, snapshotName)
 	idb := s.idb()
 	currSnapshot := filepath.Join(idbSnapshot, idb.name)
-	if err := idb.tb.CreateSnapshotAt(currSnapshot, deadline); err != nil {
+	if err := idb.tb.CreateSnapshotAt(currSnapshot); err != nil {
 		return "", fmt.Errorf("cannot create curr indexDB snapshot: %w", err)
 	}
 	dirsToRemoveOnError = append(dirsToRemoveOnError, idbSnapshot)
 
+	var err error
 	ok := idb.doExtDB(func(extDB *indexDB) {
 		prevSnapshot := filepath.Join(idbSnapshot, extDB.name)
-		err = extDB.tb.CreateSnapshotAt(prevSnapshot, deadline)
+		err = extDB.tb.CreateSnapshotAt(prevSnapshot)
 	})
 	if ok && err != nil {
 		return "", fmt.Errorf("cannot create prev indexDB snapshot: %w", err)
@@ -393,6 +389,14 @@ func (s *Storage) CreateSnapshot(deadline uint64) (string, error) {
 	logger.Infof("created Storage snapshot for %q at %q in %.3f seconds", srcDir, dstDir, time.Since(startTime).Seconds())
 	dirsToRemoveOnError = nil
 	return snapshotName, nil
+}
+
+func (s *Storage) mustGetSnapshotsCount() int {
+	snapshotNames, err := s.ListSnapshots()
+	if err != nil {
+		logger.Panicf("FATAL: cannot list snapshots: %s", err)
+	}
+	return len(snapshotNames)
 }
 
 // ListSnapshots returns sorted list of existing snapshots for s.
@@ -410,7 +414,7 @@ func (s *Storage) ListSnapshots() ([]string, error) {
 	}
 	snapshotNames := make([]string, 0, len(fnames))
 	for _, fname := range fnames {
-		if err := snapshot.Validate(fname); err != nil {
+		if err := snapshotutil.Validate(fname); err != nil {
 			continue
 		}
 		snapshotNames = append(snapshotNames, fname)
@@ -421,7 +425,7 @@ func (s *Storage) ListSnapshots() ([]string, error) {
 
 // DeleteSnapshot deletes the given snapshot.
 func (s *Storage) DeleteSnapshot(snapshotName string) error {
-	if err := snapshot.Validate(snapshotName); err != nil {
+	if err := snapshotutil.Validate(snapshotName); err != nil {
 		return fmt.Errorf("invalid snapshotName %q: %w", snapshotName, err)
 	}
 	snapshotPath := filepath.Join(s.path, snapshotsDirname, snapshotName)
@@ -447,7 +451,7 @@ func (s *Storage) DeleteStaleSnapshots(maxAge time.Duration) error {
 	}
 	expireDeadline := time.Now().UTC().Add(-maxAge)
 	for _, snapshotName := range list {
-		t, err := snapshot.Time(snapshotName)
+		t, err := snapshotutil.Time(snapshotName)
 		if err != nil {
 			return fmt.Errorf("cannot parse snapshot date from %q: %w", snapshotName, err)
 		}
@@ -468,6 +472,7 @@ func (s *Storage) idb() *indexDB {
 type Metrics struct {
 	RowsAddedTotal    uint64
 	DedupsDuringMerge uint64
+	SnapshotsCount    uint64
 
 	TooSmallTimestampRows uint64
 	TooBigTimestampRows   uint64
@@ -538,33 +543,34 @@ func (m *Metrics) Reset() {
 
 // UpdateMetrics updates m with metrics from s.
 func (s *Storage) UpdateMetrics(m *Metrics) {
-	m.RowsAddedTotal = atomic.LoadUint64(&rowsAddedTotal)
-	m.DedupsDuringMerge = atomic.LoadUint64(&dedupsDuringMerge)
+	m.RowsAddedTotal = rowsAddedTotal.Load()
+	m.DedupsDuringMerge = dedupsDuringMerge.Load()
+	m.SnapshotsCount += uint64(s.mustGetSnapshotsCount())
 
-	m.TooSmallTimestampRows += atomic.LoadUint64(&s.tooSmallTimestampRows)
-	m.TooBigTimestampRows += atomic.LoadUint64(&s.tooBigTimestampRows)
+	m.TooSmallTimestampRows += s.tooSmallTimestampRows.Load()
+	m.TooBigTimestampRows += s.tooBigTimestampRows.Load()
 
-	m.TimeseriesRepopulated += atomic.LoadUint64(&s.timeseriesRepopulated)
-	m.TimeseriesPreCreated += atomic.LoadUint64(&s.timeseriesPreCreated)
-	m.NewTimeseriesCreated += atomic.LoadUint64(&s.newTimeseriesCreated)
-	m.SlowRowInserts += atomic.LoadUint64(&s.slowRowInserts)
-	m.SlowPerDayIndexInserts += atomic.LoadUint64(&s.slowPerDayIndexInserts)
-	m.SlowMetricNameLoads += atomic.LoadUint64(&s.slowMetricNameLoads)
+	m.TimeseriesRepopulated += s.timeseriesRepopulated.Load()
+	m.TimeseriesPreCreated += s.timeseriesPreCreated.Load()
+	m.NewTimeseriesCreated += s.newTimeseriesCreated.Load()
+	m.SlowRowInserts += s.slowRowInserts.Load()
+	m.SlowPerDayIndexInserts += s.slowPerDayIndexInserts.Load()
+	m.SlowMetricNameLoads += s.slowMetricNameLoads.Load()
 
 	if sl := s.hourlySeriesLimiter; sl != nil {
-		m.HourlySeriesLimitRowsDropped += atomic.LoadUint64(&s.hourlySeriesLimitRowsDropped)
+		m.HourlySeriesLimitRowsDropped += s.hourlySeriesLimitRowsDropped.Load()
 		m.HourlySeriesLimitMaxSeries += uint64(sl.MaxItems())
 		m.HourlySeriesLimitCurrentSeries += uint64(sl.CurrentItems())
 	}
 
 	if sl := s.dailySeriesLimiter; sl != nil {
-		m.DailySeriesLimitRowsDropped += atomic.LoadUint64(&s.dailySeriesLimitRowsDropped)
+		m.DailySeriesLimitRowsDropped += s.dailySeriesLimitRowsDropped.Load()
 		m.DailySeriesLimitMaxSeries += uint64(sl.MaxItems())
 		m.DailySeriesLimitCurrentSeries += uint64(sl.CurrentItems())
 	}
 
-	m.TimestampsBlocksMerged = atomic.LoadUint64(&timestampsBlocksMerged)
-	m.TimestampsBytesSaved = atomic.LoadUint64(&timestampsBytesSaved)
+	m.TimestampsBlocksMerged = timestampsBlocksMerged.Load()
+	m.TimestampsBytesSaved = timestampsBytesSaved.Load()
 
 	var cs fastcache.Stats
 	s.tsidCache.UpdateStats(&cs)
@@ -595,8 +601,8 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 
 	m.DateMetricIDCacheSize += uint64(s.dateMetricIDCache.EntriesCount())
 	m.DateMetricIDCacheSizeBytes += uint64(s.dateMetricIDCache.SizeBytes())
-	m.DateMetricIDCacheSyncsCount += atomic.LoadUint64(&s.dateMetricIDCache.syncsCount)
-	m.DateMetricIDCacheResetsCount += atomic.LoadUint64(&s.dateMetricIDCache.resetsCount)
+	m.DateMetricIDCacheSyncsCount += s.dateMetricIDCache.syncsCount.Load()
+	m.DateMetricIDCacheResetsCount += s.dateMetricIDCache.resetsCount.Load()
 
 	hmCurr := s.currHourMetricIDs.Load()
 	hmPrev := s.prevHourMetricIDs.Load()
@@ -612,9 +618,11 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.NextDayMetricIDCacheSize += uint64(nextDayMetricIDs.Len())
 	m.NextDayMetricIDCacheSizeBytes += nextDayMetricIDs.SizeBytes()
 
-	prefetchedMetricIDs := s.prefetchedMetricIDs.Load()
+	s.prefetchedMetricIDsLock.Lock()
+	prefetchedMetricIDs := s.prefetchedMetricIDs
 	m.PrefetchedMetricIDsSize += uint64(prefetchedMetricIDs.Len())
 	m.PrefetchedMetricIDsSizeBytes += uint64(prefetchedMetricIDs.SizeBytes())
+	s.prefetchedMetricIDsLock.Unlock()
 
 	d := s.nextRetentionSeconds()
 	if d < 0 {
@@ -627,7 +635,7 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 }
 
 func (s *Storage) nextRetentionSeconds() int64 {
-	return atomic.LoadInt64(&s.nextRotationTimestamp) - int64(fasttime.UnixTimestamp())
+	return s.nextRotationTimestamp.Load() - int64(fasttime.UnixTimestamp())
 }
 
 // SetFreeDiskSpaceLimit sets the minimum free disk space size of current storage path
@@ -641,7 +649,7 @@ var freeDiskSpaceLimitBytes uint64
 
 // IsReadOnly returns information is storage in read only mode
 func (s *Storage) IsReadOnly() bool {
-	return atomic.LoadUint32(&s.isReadOnly) == 1
+	return s.isReadOnly.Load()
 }
 
 func (s *Storage) startFreeDiskSpaceWatcher() {
@@ -649,15 +657,21 @@ func (s *Storage) startFreeDiskSpaceWatcher() {
 		freeSpaceBytes := fs.MustGetFreeSpace(s.path)
 		if freeSpaceBytes < freeDiskSpaceLimitBytes {
 			// Switch the storage to readonly mode if there is no enough free space left at s.path
-			if atomic.CompareAndSwapUint32(&s.isReadOnly, 0, 1) {
+			//
+			// Use Load in front of CompareAndSwap in order to avoid slow inter-CPU synchronization
+			// when the storage is already in read-only mode.
+			if !s.isReadOnly.Load() && s.isReadOnly.CompareAndSwap(false, true) {
 				// log notification only on state change
 				logger.Warnf("switching the storage at %s to read-only mode, since it has less than -storage.minFreeDiskSpaceBytes=%d of free space: %d bytes left",
 					s.path, freeDiskSpaceLimitBytes, freeSpaceBytes)
 			}
 			return
 		}
-		if atomic.CompareAndSwapUint32(&s.isReadOnly, 1, 0) {
-			logger.Warnf("enabling writing to the storage at %s, since it has more than -storage.minFreeDiskSpaceBytes=%d of free space: %d bytes left",
+		// Use Load in front of CompareAndSwap in order to avoid slow inter-CPU synchronization
+		// when the storage isn't in read-only mode.
+		if s.isReadOnly.Load() && s.isReadOnly.CompareAndSwap(true, false) {
+			s.notifyReadWriteMode()
+			logger.Warnf("switching the storage at %s to read-write mode, since it has more than -storage.minFreeDiskSpaceBytes=%d of free space: %d bytes left",
 				s.path, freeDiskSpaceLimitBytes, freeSpaceBytes)
 		}
 	}
@@ -665,7 +679,8 @@ func (s *Storage) startFreeDiskSpaceWatcher() {
 	s.freeDiskSpaceWatcherWG.Add(1)
 	go func() {
 		defer s.freeDiskSpaceWatcherWG.Done()
-		ticker := time.NewTicker(time.Second)
+		d := timeutil.AddJitterToDuration(time.Second)
+		ticker := time.NewTicker(d)
 		defer ticker.Stop()
 		for {
 			select {
@@ -676,6 +691,16 @@ func (s *Storage) startFreeDiskSpaceWatcher() {
 			}
 		}
 	}()
+}
+
+func (s *Storage) notifyReadWriteMode() {
+	s.tb.NotifyReadWriteMode()
+
+	idb := s.idb()
+	idb.tb.NotifyReadWriteMode()
+	idb.doExtDB(func(extDB *indexDB) {
+		extDB.tb.NotifyReadWriteMode()
+	})
 }
 
 func (s *Storage) startRetentionWatcher() {
@@ -714,10 +739,9 @@ func (s *Storage) startNextDayMetricIDsUpdater() {
 	}()
 }
 
-var currHourMetricIDsUpdateInterval = time.Second * 10
-
 func (s *Storage) currHourMetricIDsUpdater() {
-	ticker := time.NewTicker(currHourMetricIDsUpdateInterval)
+	d := timeutil.AddJitterToDuration(time.Second * 10)
+	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	for {
 		select {
@@ -732,10 +756,9 @@ func (s *Storage) currHourMetricIDsUpdater() {
 	}
 }
 
-var nextDayMetricIDsUpdateInterval = time.Second * 11
-
 func (s *Storage) nextDayMetricIDsUpdater() {
-	ticker := time.NewTicker(nextDayMetricIDsUpdateInterval)
+	d := timeutil.AddJitterToDuration(time.Second * 11)
+	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	for {
 		select {
@@ -758,7 +781,7 @@ func (s *Storage) mustRotateIndexDB(currentTime time.Time) {
 
 	// Update nextRotationTimestamp
 	nextRotationTimestamp := currentTime.Unix() + s.retentionMsecs/1000
-	atomic.StoreInt64(&s.nextRotationTimestamp, nextRotationTimestamp)
+	s.nextRotationTimestamp.Store(nextRotationTimestamp)
 
 	// Set idbNext to idbNew
 	idbNext := s.idbNext.Load()
@@ -1096,6 +1119,7 @@ func nextRetentionDeadlineSeconds(atSecs, retentionSecs, offsetSecs int64) int64
 func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, tr TimeRange, maxMetrics int, deadline uint64) ([]string, error) {
 	qt = qt.NewChild("search for matching metric names: filters=%s, timeRange=%s", tfss, &tr)
 	defer qt.Done()
+
 	metricIDs, err := s.idb().searchMetricIDs(qt, tfss, tr, maxMetrics, deadline)
 	if err != nil {
 		return nil, err
@@ -1134,34 +1158,40 @@ func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, 
 	return metricNames, nil
 }
 
-// prefetchMetricNames pre-fetches metric names for the given metricIDs into metricID->metricName cache.
+// prefetchMetricNames pre-fetches metric names for the given srcMetricIDs into metricID->metricName cache.
 //
 // This should speed-up further searchMetricNameWithCache calls for srcMetricIDs from tsids.
+//
+// It is expected that srcMetricIDs are already sorted by the caller. Otherwise the pre-fetching may be slow.
 func (s *Storage) prefetchMetricNames(qt *querytracer.Tracer, srcMetricIDs []uint64, deadline uint64) error {
 	qt = qt.NewChild("prefetch metric names for %d metricIDs", len(srcMetricIDs))
 	defer qt.Done()
-	if len(srcMetricIDs) == 0 {
-		qt.Printf("nothing to prefetch")
+
+	if len(srcMetricIDs) < 500 {
+		qt.Printf("skip pre-fetching metric names for low number of metric ids=%d", len(srcMetricIDs))
 		return nil
 	}
-	var metricIDs uint64Sorter
-	prefetchedMetricIDs := s.prefetchedMetricIDs.Load()
+
+	var metricIDs []uint64
+	s.prefetchedMetricIDsLock.Lock()
+	prefetchedMetricIDs := s.prefetchedMetricIDs
 	for _, metricID := range srcMetricIDs {
 		if prefetchedMetricIDs.Has(metricID) {
 			continue
 		}
 		metricIDs = append(metricIDs, metricID)
 	}
+	s.prefetchedMetricIDsLock.Unlock()
+
 	qt.Printf("%d out of %d metric names must be pre-fetched", len(metricIDs), len(srcMetricIDs))
 	if len(metricIDs) < 500 {
 		// It is cheaper to skip pre-fetching and obtain metricNames inline.
-		qt.Printf("skip pre-fetching metric names for low number of metric ids=%d", len(metricIDs))
+		qt.Printf("skip pre-fetching metric names for low number of missing metric ids=%d", len(metricIDs))
 		return nil
 	}
-	atomic.AddUint64(&s.slowMetricNameLoads, uint64(len(metricIDs)))
+	s.slowMetricNameLoads.Add(uint64(len(metricIDs)))
 
 	// Pre-fetch metricIDs.
-	sort.Sort(metricIDs)
 	var missingMetricIDs []uint64
 	var metricName []byte
 	var err error
@@ -1200,21 +1230,16 @@ func (s *Storage) prefetchMetricNames(qt *querytracer.Tracer, srcMetricIDs []uin
 
 	// Store the pre-fetched metricIDs, so they aren't pre-fetched next time.
 	s.prefetchedMetricIDsLock.Lock()
-	var prefetchedMetricIDsNew *uint64set.Set
-	if fasttime.UnixTimestamp() < atomic.LoadUint64(&s.prefetchedMetricIDsDeadline) {
+	if fasttime.UnixTimestamp() > s.prefetchedMetricIDsDeadline.Load() {
 		// Periodically reset the prefetchedMetricIDs in order to limit its size.
-		prefetchedMetricIDsNew = &uint64set.Set{}
-		atomic.StoreUint64(&s.prefetchedMetricIDsDeadline, fasttime.UnixTimestamp()+73*60)
-	} else {
-		prefetchedMetricIDsNew = prefetchedMetricIDs.Clone()
+		s.prefetchedMetricIDs = &uint64set.Set{}
+		d := timeutil.AddJitterToDuration(time.Second * 20 * 60)
+		metricIDsDeadline := fasttime.UnixTimestamp() + uint64(d.Seconds())
+		s.prefetchedMetricIDsDeadline.Store(metricIDsDeadline)
 	}
-	prefetchedMetricIDsNew.AddMulti(metricIDs)
-	if prefetchedMetricIDsNew.SizeBytes() > uint64(memory.Allowed())/32 {
-		// Reset prefetchedMetricIDsNew if it occupies too much space.
-		prefetchedMetricIDsNew = &uint64set.Set{}
-	}
-	s.prefetchedMetricIDs.Store(prefetchedMetricIDsNew)
+	s.prefetchedMetricIDs.AddMulti(metricIDs)
 	s.prefetchedMetricIDsLock.Unlock()
+
 	qt.Printf("cache metric ids for pre-fetched metric names")
 	return nil
 }
@@ -1520,7 +1545,7 @@ func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
 	return s.tb.ForceMergePartitions(partitionNamePrefix)
 }
 
-var rowsAddedTotal uint64
+var rowsAddedTotal atomic.Uint64
 
 // AddRows adds the given mrs to s.
 //
@@ -1549,7 +1574,7 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 			}
 			continue
 		}
-		atomic.AddUint64(&rowsAddedTotal, uint64(len(mrsBlock)))
+		rowsAddedTotal.Add(uint64(len(mrsBlock)))
 	}
 	putMetricRowsInsertCtx(ic)
 
@@ -1682,7 +1707,7 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 		s.putSeriesToCache(mr.MetricNameRaw, &genTSID, date)
 	}
 
-	atomic.AddUint64(&s.timeseriesRepopulated, seriesRepopulated)
+	s.timeseriesRepopulated.Add(seriesRepopulated)
 
 	// There is no need in pre-filling idbNext here, since RegisterMetricNames() is rarely called.
 	// So it is OK to register metric names in blocking manner after indexdb rotation.
@@ -1739,7 +1764,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 					"probably you need updating -retentionPeriod command-line flag; metricName: %s",
 					mr.Timestamp, minTimestamp, metricName)
 			}
-			atomic.AddUint64(&s.tooSmallTimestampRows, 1)
+			s.tooSmallTimestampRows.Add(1)
 			continue
 		}
 		if mr.Timestamp > maxTimestamp {
@@ -1749,7 +1774,7 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
 					mr.Timestamp, maxTimestamp, metricName)
 			}
-			atomic.AddUint64(&s.tooBigTimestampRows, 1)
+			s.tooBigTimestampRows.Add(1)
 			continue
 		}
 		dstMrs[j] = mr
@@ -1873,9 +1898,9 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		}
 	}
 
-	atomic.AddUint64(&s.slowRowInserts, slowInsertsCount)
-	atomic.AddUint64(&s.newTimeseriesCreated, newSeriesCount)
-	atomic.AddUint64(&s.timeseriesRepopulated, seriesRepopulated)
+	s.slowRowInserts.Add(slowInsertsCount)
+	s.newTimeseriesCreated.Add(newSeriesCount)
+	s.timeseriesRepopulated.Add(seriesRepopulated)
 
 	dstMrs = dstMrs[:j]
 	rows = rows[:j]
@@ -1929,12 +1954,12 @@ func (s *Storage) putSeriesToCache(metricNameRaw []byte, genTSID *generationTSID
 
 func (s *Storage) registerSeriesCardinality(metricID uint64, metricNameRaw []byte) bool {
 	if sl := s.hourlySeriesLimiter; sl != nil && !sl.Add(metricID) {
-		atomic.AddUint64(&s.hourlySeriesLimitRowsDropped, 1)
+		s.hourlySeriesLimitRowsDropped.Add(1)
 		logSkippedSeries(metricNameRaw, "-storage.maxHourlySeries", sl.MaxItems())
 		return false
 	}
 	if sl := s.dailySeriesLimiter; sl != nil && !sl.Add(metricID) {
-		atomic.AddUint64(&s.dailySeriesLimitRowsDropped, 1)
+		s.dailySeriesLimitRowsDropped.Add(1)
 		logSkippedSeries(metricNameRaw, "-storage.maxDailySeries", sl.MaxItems())
 		return false
 	}
@@ -2029,7 +2054,7 @@ func (s *Storage) prefillNextIndexDB(rows []rawRow, mrs []*MetricRow) error {
 		s.putSeriesToCache(metricNameRaw, &genTSID, date)
 		timeseriesPreCreated++
 	}
-	atomic.AddUint64(&s.timeseriesPreCreated, timeseriesPreCreated)
+	s.timeseriesPreCreated.Add(timeseriesPreCreated)
 
 	return firstError
 }
@@ -2136,7 +2161,7 @@ func (s *Storage) updatePerDateData(rows []rawRow, mrs []*MetricRow) error {
 
 	// Slow path - add new (date, metricID) entries to indexDB.
 
-	atomic.AddUint64(&s.slowPerDayIndexInserts, uint64(len(pendingDateMetricIDs)))
+	s.slowPerDayIndexInserts.Add(uint64(len(pendingDateMetricIDs)))
 	// Sort pendingDateMetricIDs by (date, metricID) in order to speed up `is` search in the loop below.
 	sort.Slice(pendingDateMetricIDs, func(i, j int) bool {
 		a := pendingDateMetricIDs[i]
@@ -2191,17 +2216,21 @@ func fastHashUint64(x uint64) uint64 {
 //
 // It should be faster than map[date]*uint64set.Set on multicore systems.
 type dateMetricIDCache struct {
-	// 64-bit counters must be at the top of the structure to be properly aligned on 32-bit arches.
-	syncsCount  uint64
-	resetsCount uint64
+	syncsCount  atomic.Uint64
+	resetsCount atomic.Uint64
 
 	// Contains immutable map
 	byDate atomic.Pointer[byDateMetricIDMap]
 
 	// Contains mutable map protected by mu
-	byDateMutable    *byDateMetricIDMap
-	nextSyncDeadline uint64
-	mu               sync.Mutex
+	byDateMutable *byDateMetricIDMap
+
+	// Contains the number of slow accesses to byDateMutable.
+	// Is used for deciding when to merge byDateMutable to byDate.
+	// Protected by mu.
+	slowHits int
+
+	mu sync.Mutex
 }
 
 func newDateMetricIDCache() *dateMetricIDCache {
@@ -2214,9 +2243,9 @@ func (dmc *dateMetricIDCache) resetLocked() {
 	// Do not reset syncsCount and resetsCount
 	dmc.byDate.Store(newByDateMetricIDMap())
 	dmc.byDateMutable = newByDateMetricIDMap()
-	dmc.nextSyncDeadline = 10 + fasttime.UnixTimestamp()
+	dmc.slowHits = 0
 
-	atomic.AddUint64(&dmc.resetsCount, 1)
+	dmc.resetsCount.Add(1)
 }
 
 func (dmc *dateMetricIDCache) EntriesCount() int {
@@ -2248,9 +2277,16 @@ func (dmc *dateMetricIDCache) Has(generation, date, metricID uint64) bool {
 
 	// Slow path. Check mutable map.
 	dmc.mu.Lock()
-	v = dmc.byDateMutable.get(generation, date)
-	ok := v.Has(metricID)
-	dmc.syncLockedIfNeeded()
+	vMutable := dmc.byDateMutable.get(generation, date)
+	ok := vMutable.Has(metricID)
+	if ok {
+		dmc.slowHits++
+		if dmc.slowHits > (v.Len()+vMutable.Len())/2 {
+			// It is cheaper to merge byDateMutable into byDate than to pay inter-cpu sync costs when accessing vMutable.
+			dmc.syncLocked()
+			dmc.slowHits = 0
+		}
+	}
 	dmc.mu.Unlock()
 
 	return ok
@@ -2291,14 +2327,6 @@ func (dmc *dateMetricIDCache) Set(generation, date, metricID uint64) {
 	dmc.mu.Unlock()
 }
 
-func (dmc *dateMetricIDCache) syncLockedIfNeeded() {
-	currentTime := fasttime.UnixTimestamp()
-	if currentTime >= dmc.nextSyncDeadline {
-		dmc.nextSyncDeadline = currentTime + 10
-		dmc.syncLocked()
-	}
-}
-
 func (dmc *dateMetricIDCache) syncLocked() {
 	if len(dmc.byDateMutable.m) == 0 {
 		// Nothing to sync.
@@ -2308,7 +2336,11 @@ func (dmc *dateMetricIDCache) syncLocked() {
 	// Merge data from byDate into byDateMutable and then atomically replace byDate with the merged data.
 	byDate := dmc.byDate.Load()
 	byDateMutable := dmc.byDateMutable
+	byDateMutable.hotEntry.Store(&byDateMetricIDEntry{})
+
+	keepDatesMap := make(map[uint64]struct{}, len(byDateMutable.m))
 	for k, e := range byDateMutable.m {
+		keepDatesMap[k.date] = struct{}{}
 		v := byDate.get(k.generation, k.date)
 		if v == nil {
 			// Nothing to merge
@@ -2321,13 +2353,12 @@ func (dmc *dateMetricIDCache) syncLocked() {
 			v: *v,
 		}
 		byDateMutable.m[k] = dme
-		he := byDateMutable.hotEntry.Load()
-		if he.k == k {
-			byDateMutable.hotEntry.Store(dme)
-		}
 	}
+
 	// Copy entries from byDate, which are missing in byDateMutable
+	allDatesMap := make(map[uint64]struct{}, len(byDate.m))
 	for k, e := range byDate.m {
+		allDatesMap[k.date] = struct{}{}
 		v := byDateMutable.get(k.generation, k.date)
 		if v != nil {
 			continue
@@ -2335,11 +2366,33 @@ func (dmc *dateMetricIDCache) syncLocked() {
 		byDateMutable.m[k] = e
 	}
 
+	if len(byDateMutable.m) > 2 {
+		// Keep only entries for the last two dates from allDatesMap plus all the entries for byDateMutable.
+		dates := make([]uint64, 0, len(allDatesMap))
+		for date := range allDatesMap {
+			dates = append(dates, date)
+		}
+		sort.Slice(dates, func(i, j int) bool {
+			return dates[i] < dates[j]
+		})
+		if len(dates) > 2 {
+			dates = dates[len(dates)-2:]
+		}
+		for _, date := range dates {
+			keepDatesMap[date] = struct{}{}
+		}
+		for k := range byDateMutable.m {
+			if _, ok := keepDatesMap[k.date]; !ok {
+				delete(byDateMutable.m, k)
+			}
+		}
+	}
+
 	// Atomically replace byDate with byDateMutable
 	dmc.byDate.Store(dmc.byDateMutable)
 	dmc.byDateMutable = newByDateMetricIDMap()
 
-	atomic.AddUint64(&dmc.syncsCount, 1)
+	dmc.syncsCount.Add(1)
 
 	if dmc.SizeBytes() > uint64(memory.Allowed())/256 {
 		dmc.resetLocked()
@@ -2558,8 +2611,12 @@ func (s *Storage) mustOpenIndexDBTables(path string) (next, curr, prev *indexDB)
 var indexDBTableNameRegexp = regexp.MustCompile("^[0-9A-F]{16}$")
 
 func nextIndexDBTableName() string {
-	n := atomic.AddUint64(&indexDBTableIdx, 1)
+	n := indexDBTableIdx.Add(1)
 	return fmt.Sprintf("%016X", n)
 }
 
-var indexDBTableIdx = uint64(time.Now().UnixNano())
+var indexDBTableIdx = func() *atomic.Uint64 {
+	var x atomic.Uint64
+	x.Store(uint64(time.Now().UnixNano()))
+	return &x
+}()

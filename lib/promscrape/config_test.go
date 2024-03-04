@@ -1147,6 +1147,7 @@ scrape_configs:
 	f(`
 scrape_configs:
 - job_name: path wo slash
+  enable_compression: false
   static_configs: 
   - targets: ["foo.bar:1234"]
   relabel_configs:
@@ -1161,7 +1162,8 @@ scrape_configs:
 				"instance": "foo.bar:1234",
 				"job":      "path wo slash",
 			}),
-			jobNameOriginal: "path wo slash",
+			DisableCompression: true,
+			jobNameOriginal:    "path wo slash",
 		},
 	})
 	f(`
@@ -1190,6 +1192,29 @@ scrape_configs:
 			jobNameOriginal: "foo",
 		},
 	})
+
+	defaultSeriesLimitPerTarget := *seriesLimitPerTarget
+	*seriesLimitPerTarget = 1e3
+	f(`
+scrape_configs:
+- job_name: foo
+  series_limit: 0
+  static_configs:
+  - targets: ["foo.bar:1234"]
+`, []*ScrapeWork{
+		{
+			ScrapeURL:       "http://foo.bar:1234/metrics",
+			ScrapeInterval:  defaultScrapeInterval,
+			ScrapeTimeout:   defaultScrapeTimeout,
+			jobNameOriginal: "foo",
+			Labels: promutils.NewLabelsFromMap(map[string]string{
+				"instance": "foo.bar:1234",
+				"job":      "foo",
+			}),
+			SeriesLimit: 0,
+		},
+	})
+	*seriesLimitPerTarget = defaultSeriesLimitPerTarget
 }
 
 func equalStaticConfigForScrapeWorks(a, b []*ScrapeWork) bool {

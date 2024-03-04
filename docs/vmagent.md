@@ -63,15 +63,16 @@ unpack it and pass the following flags to the `vmagent` binary in order to start
 and sending the data to the Prometheus-compatible remote storage:
 
 * `-promscrape.config` with the path to [Prometheus config file](https://docs.victoriametrics.com/sd_configs.html) (usually located at `/etc/prometheus/prometheus.yml`).
-  The path can point either to local file or to http url. `vmagent` doesn't support some sections of Prometheus config file,
-  so you may need either to delete these sections or to run `vmagent` with `-promscrape.config.strictParse=false` command-line flag.
+  The path can point either to local file or to http url. See [scrape config examples](https://docs.victoriametrics.com/scrape_config_examples/).
+  `vmagent` doesn't support some sections of Prometheus config file, so you may need either to delete these sections or
+  to run `vmagent` with `-promscrape.config.strictParse=false` command-line flag.
   In this case `vmagent` ignores unsupported sections. See [the list of unsupported sections](#unsupported-prometheus-config-sections).
 * `-remoteWrite.url` with Prometheus-compatible remote storage endpoint such as VictoriaMetrics, where to send the data to.
 
 Example command for writing the data received via [supported push-based protocols](#how-to-push-data-to-vmagent)
 to [single-node VictoriaMetrics](https://docs.victoriametrics.com/) located at `victoria-metrics-host:8428`:
 
-```bash
+```sh
 /path/to/vmagent -remoteWrite.url=https://victoria-metrics-host:8428/api/v1/write
 ```
 
@@ -80,7 +81,7 @@ the data to [VictoriaMetrics cluster](https://docs.victoriametrics.com/Cluster-V
 
 Example command for scraping Prometheus targets and writing the data to single-node VictoriaMetrics:
 
-```bash
+```sh
 /path/to/vmagent -promscrape.config=/path/to/prometheus.yml -remoteWrite.url=https://victoria-metrics-host:8428/api/v1/write
 ```
 
@@ -122,11 +123,11 @@ additionally to pull-based Prometheus-compatible targets' scraping:
 
 * Sending `SIGHUP` signal to `vmagent` process:
 
-  ```bash
+  ```sh
   kill -SIGHUP `pidof vmagent`
   ```
 
-* Sending HTTP request to `http://vmagent:8429/-/reload` endpoint.
+* Sending HTTP request to `http://vmagent:8429/-/reload` endpoint. This endpoint can be protected with `-reloadAuthKey` command-line flag.
 
 There is also `-promscrape.configCheckInterval` command-line option, which can be used for automatic reloading configs from updated `-promscrape.config` file.
 
@@ -207,6 +208,34 @@ which is applied independently for each configured `-remoteWrite.url` destinatio
 data among long-term remote storage, short-term remote storage and a real-time analytical system [built on top of Kafka](https://github.com/Telefonica/prometheus-kafka-adapter).
 Note that each destination can receive its own subset of the collected data due to per-destination relabeling via `-remoteWrite.urlRelabelConfig`.
 
+For example, let's assume all the scraped or received metrics by `vmagent` have label `env` with values `dev` or `prod`.
+To route metrics `env=dev` to destination `dev` and metrics with `env=prod` to destination `prod` apply the following config:
+1. Create relabeling config file `relabelDev.yml` to drop all metrics that don't have label `env=dev`:
+```yaml
+- action: keep
+  source_labels: [env]
+  regex: "dev"
+```
+1. Create relabeling config file `relabelProd.yml` to drop all metrics that don't have label `env=prod`:
+```yaml
+- action: keep
+  source_labels: [env]
+  regex: "prod"
+```
+1. Configure `vmagent` with 2 `-remoteWrite.url` flags pointing to destinations `dev` and `prod` with corresponding
+`-remoteWrite.urlRelabelConfig` configs:
+```sh
+./vmagent \
+  -remoteWrite.url=http://<dev-url> -remoteWrite.urlRelabelConfig=relabelDev.yml \
+  -remoteWrite.url=http://<prod-url> -remoteWrite.urlRelabelConfig=relabelProd.yml 
+```
+With this configuration `vmagent` will forward to `http://<dev-url>` only metrics that have `env=dev` label.
+And to `http://<prod-url>` it will forward only metrics that have `env=prod` label.
+
+Please note, order of flags is important: 1st mentioned `-remoteWrite.urlRelabelConfig` will be applied to the
+1st mentioned `-remoteWrite.url`, and so on.
+
+
 ### Prometheus remote_write proxy
 
 `vmagent` can be used as a proxy for Prometheus data sent via Prometheus `remote_write` protocol. It can accept data via the `remote_write` API
@@ -243,6 +272,8 @@ It is possible to force switch to VictoriaMetrics remote write protocol by speci
 command-line flag for the corresponding `-remoteWrite.url`.
 It is possible to tune the compression level for VictoriaMetrics remote write protocol with `-remoteWrite.vmProtoCompressLevel` command-line flag.
 Bigger values reduce network usage at the cost of higher CPU usage. Negative values reduce CPU usage at the cost of higher network usage.
+The default value for the compression level is `0`, the minimum value is `-22` and the maximum value is `22`. The default value works optimally
+in most cases, so it isn't recommended changing it.
 
 `vmagent` automatically switches to Prometheus remote write protocol when it sends data to old versions of VictoriaMetrics components
 or to other Prometheus-compatible remote storage systems. It is possible to force switch to Prometheus remote write protocol
@@ -289,7 +320,10 @@ Use `-remoteWrite.*` command-line flag instead for configuring remote write sett
 
 The file pointed by `-promscrape.config` may contain `%{ENV_VAR}` placeholders which are substituted by the corresponding `ENV_VAR` environment variable values.
 
-See [the list of supported service discovery types for Prometheus scrape targets](https://docs.victoriametrics.com/sd_configs.html).
+See also:
+
+- [scrape config examples](https://docs.victoriametrics.com/scrape_config_examples/)
+- [the list of supported service discovery types for Prometheus scrape targets](https://docs.victoriametrics.com/sd_configs.html).
 
 
 ## scrape_config enhancements
@@ -377,7 +411,7 @@ Extra labels can be added to metrics collected by `vmagent` via the following me
   For example, the following command starts `vmagent`, which adds `{datacenter="foobar"}` label to all the metrics pushed
   to all the configured remote storage systems (all the `-remoteWrite.url` flag values):
 
-  ```bash
+  ```sh
   /path/to/vmagent -remoteWrite.label=datacenter=foobar ...
   ```
 
@@ -529,16 +563,14 @@ The following articles contain useful information about Prometheus relabeling:
 
 `vmagent` provides the following enhancements on top of Prometheus-compatible relabeling:
 
-* The `replacement` option can refer arbitrary labels via {% raw %}`{{label_name}}`{% endraw %} placeholders.
+* The `replacement` option can refer arbitrary labels via `{{label_name}}` placeholders.
   Such placeholders are substituted with the corresponding label value. For example, the following relabeling rule
   sets `instance-job` label value to `host123-foo` when applied to the metric with `{instance="host123",job="foo"}` labels:
 
-  {% raw %}
   ```yaml
   - target_label: "instance-job"
     replacement: "{{instance}}-{{job}}"
   ```
-  {% endraw %}
 
 * An optional `if` filter can be used for conditional relabeling. The `if` filter may contain
   arbitrary [time series selector](https://docs.victoriametrics.com/keyConcepts.html#filtering).
@@ -701,7 +733,7 @@ Additionally, the `action: graphite` relabeling rules usually work much faster t
 
 ## Relabel debug
 
-`vmagent` and [single-node VictoriaMetrics](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html)
+`vmagent` and [single-node VictoriaMetrics](https://docs.victoriametrics.com/#how-to-scrape-prometheus-exporters-such-as-node-exporter)
 provide the following tools for debugging target-level and metric-level relabeling:
 
 - Target-level debugging (e.g. `relabel_configs` section at [scrape_configs](https://docs.victoriametrics.com/sd_configs.html#scrape_configs))
@@ -723,6 +755,45 @@ provide the following tools for debugging target-level and metric-level relabeli
   The link is unavailable if `vmagent` runs with `-promscrape.dropOriginalLabels` command-line flag.
   The opened page shows step-by-step results for the actual metric relabeling rules applied to the given target labels.
 
+See also [debugging scrape targets](#debugging-scrape-targets).
+
+## Debugging scrape targets
+
+`vmagent` and [single-node VictoriaMetrics](https://docs.victoriametrics.com/#how-to-scrape-prometheus-exporters-such-as-node-exporter)
+provide the following tools for debugging scrape targets:
+
+- `http://vmagent:8429/targets` page, which contains information about all the targets, which are scraped at the moment.
+  This page helps answering the following questions:
+  - **Why some targets cannot be scraped?** The `last error` column contains the reason why the given target cannot be scraped.
+    You can also click the `endpoint` link in order open the target url in your browser.
+    You can also click the `response` link in order to open the target url on behalf of `vmagent`. This may be helpful when `vmagent`
+    is located in some isolated network.
+  - **Which labels the particular target has?** The `labels` column shows per-target labels. These labels are attached to all the metrics
+    scraped from the given target. You can also click on the target labels in order to see the original labels of the target
+    before applying the [relabeling](#relabeling). The original labels are unavailable if `vmagent` runs with `-promscrape.dropOriginalLabels` command-line flag.
+  - **Why the given target has the given set of labels?** Click the `target` link at `debug relabeling` column for the particular target in order to see step-by-step
+    execution of [target relabeling rules](#relabeling) applied to the original labels. This link is unavailable if `vmagent` runs
+    with `-promscrape.dropOriginalLabels` command-line flag.
+  - **How the given metrics relabeling rules are applied to scraped metrics?** Click the `metrics` link at `debug relabeling` column
+    for the particular target in order to see step-by-step execution of [metric relabeling rules](#relabeling) applied to the scraped metrics.
+  - **How many failed scrapes were for the particular target?** The `errors` column shows this value.
+  - **How many metrics the given target exposes?** The `samples` column shows the number of metrics scraped per each target during the last scrape.
+  - **How long does it take to scrape the given target?** The `duration` column shows last scrape duration per each target.
+  - **When was the last scrape for the given target?** The `last scrape` column shows the last time the given target was scraped.
+  - **How many times the given target was scraped?** The `scrapes` column shows this infromation.
+  - **What is the current state of the particular target?** The `state` column shows the current state of the particular target.
+
+- `http://vmagent:8429/service-discovery` page, which contains infromation about all the [discovered targets](https://docs.victoriametrics.com/sd_configs/).
+  This page doesn't work if `vmagent` runs with `-promscrape.dropOriginalLabels` command-line flag.
+  This pages helps answering the following questions:
+  - **Why some targets are dropped during service discovery?** Click `debug` link at `debug relabeling` on the dropped target in order to see step-by-step
+    execution of [target relabeling rules](#relabeling) applied to the original labels of discovered target.
+  - **Why some targets contain unexpected labels?** Click `debug` link at `debug relabeling` on the dropped target in order to see step-by-step
+    execution of [target relabeling rules](#relabeling) applied to the original labels of discovered target.
+  - **What were the original labels before relabeling for a particular target?** The `discovered labels` column contains the original labels per each discovered target.
+
+See also [relabel debug](#relabel-debug).
+
 ## Prometheus staleness markers
 
 `vmagent` sends [Prometheus staleness markers](https://www.robustperception.io/staleness-and-promql) to `-remoteWrite.url` in the following cases:
@@ -743,12 +814,13 @@ e.g. it sets `scrape_series_added` metric to zero. See [these docs](#automatical
 
 ## Stream parsing mode
 
-By default, `vmagent` reads the full response body from scrape target into memory, then parses it, applies [relabeling](#relabeling)
-and then pushes the resulting metrics to the configured `-remoteWrite.url`. This mode works good for the majority of cases
-when the scrape target exposes small number of metrics (e.g. less than 10 thousand). But this mode may take big amounts of memory
-when the scrape target exposes big number of metrics. In this case it is recommended enabling stream parsing mode.
-When this mode is enabled, then `vmagent` reads response from scrape target in chunks, then immediately processes every chunk
-and pushes the processed metrics to remote storage. This allows saving memory when scraping targets that expose millions of metrics.
+By default, `vmagent` parses the full response from the scrape target, applies [relabeling](#relabeling)
+and then pushes the resulting metrics to the configured `-remoteWrite.url` in one go. This mode works good for the majority of cases
+when the scrape target exposes small number of metrics (e.g. less than 10K). But this mode may take big amounts of memory
+when the scrape target exposes big number of metrics (for example, when `vmagent` scrapes [`kube-state-metrics`](https://github.com/kubernetes/kube-state-metrics)
+in large Kubernetes cluster). It is recommended enabling stream parsing mode for such targets.
+When this mode is enabled, `vmagent` processes the response from the scrape target in chunks.
+This allows saving memory when scraping targets that expose millions of metrics.
 
 Stream parsing mode is automatically enabled for scrape targets returning response bodies with sizes bigger than
 the `-promscrape.minResponseSizeForStreamParse` command-line flag value. Additionally,
@@ -792,7 +864,7 @@ Each `vmagent` instance in the cluster must use identical `-promscrape.config` f
 in the range `0 ... N-1`, where `N` is the number of `vmagent` instances in the cluster specified via `-promscrape.cluster.membersCount`.
 For example, the following commands spread scrape targets among a cluster of two `vmagent` instances:
 
-```text
+```sh
 /path/to/vmagent -promscrape.cluster.membersCount=2 -promscrape.cluster.memberNum=0 -promscrape.config=/path/to/config.yml ...
 /path/to/vmagent -promscrape.cluster.membersCount=2 -promscrape.cluster.memberNum=1 -promscrape.config=/path/to/config.yml ...
 ```
@@ -804,7 +876,7 @@ By default, each scrape target is scraped only by a single `vmagent` instance in
 then `-promscrape.cluster.replicationFactor` command-line flag must be set to the desired number of replicas. For example, the following commands
 start a cluster of three `vmagent` instances, where each target is scraped by two `vmagent` instances:
 
-```text
+```sh
 /path/to/vmagent -promscrape.cluster.membersCount=3 -promscrape.cluster.replicationFactor=2 -promscrape.cluster.memberNum=0 -promscrape.config=/path/to/config.yml ...
 /path/to/vmagent -promscrape.cluster.membersCount=3 -promscrape.cluster.replicationFactor=2 -promscrape.cluster.memberNum=1 -promscrape.config=/path/to/config.yml ...
 /path/to/vmagent -promscrape.cluster.membersCount=3 -promscrape.cluster.replicationFactor=2 -promscrape.cluster.memberNum=2 -promscrape.config=/path/to/config.yml ...
@@ -831,7 +903,7 @@ The `-promscrape.cluster.memberLabel` command-line flag allows specifying a name
 The value of the `member num` label is set to `-promscrape.cluster.memberNum`. For example, the following config instructs adding `vmagent_instance="0"` label
 to all the metrics scraped by the given `vmagent` instance:
 
-```text
+```sh
 /path/to/vmagent -promscrape.cluster.membersCount=2 -promscrape.cluster.memberNum=0 -promscrape.cluster.memberLabel=vmagent_instance
 ```
 
@@ -912,7 +984,7 @@ When this flag is specified, `vmagent` works in the following way if the configu
 
 - It returns `429 Too Many Requests` HTTP error to clients, which send data to `vmagent` via [supported HTTP endpoints](#how-to-push-data-to-vmagent).
   You can specify `-remoteWrite.dropSamplesOnOverload` command-line flag in order to drop the ingested samples instead of returning the error to clients in this case.
-- It suspends consuming data from [Kafka side](#reading-metrics-from-kafka) or [Google PubSub side](#pubsub-integration) until the remote storage becomes available.
+- It suspends consuming data from [Kafka side](#reading-metrics-from-kafka) or [Google PubSub side](#google-pubsub-integration) until the remote storage becomes available.
   You can specify `-remoteWrite.dropSamplesOnOverload` command-line flag in order to drop the fetched samples instead of suspending data consumption from Kafka or Google PubSub.
 - It drops samples pushed to `vmagent` via non-HTTP protocols and logs the error. Pass `-remoteWrite.dropSamplesOnOverload` on order to suppress error messages in this case.
 - It drops samples [scraped from Prometheus-compatible targets](#how-to-collect-metrics-in-prometheus-format), because it is better to drop samples
@@ -939,14 +1011,17 @@ must be enabled on all the configured remote storage systems.
 By default, `vmagent` doesn't limit the number of time series each scrape target can expose.
 The limit can be enforced in the following places:
 
-* Via `-promscrape.seriesLimitPerTarget` command-line option. This limit is applied individually
+* Via `-promscrape.seriesLimitPerTarget` command-line flag. This limit is applied individually
   to all the scrape targets defined in the file pointed by `-promscrape.config`.
 * Via `series_limit` config option at [scrape_config](https://docs.victoriametrics.com/sd_configs.html#scrape_configs) section.
-  This limit is applied individually to all the scrape targets defined in the given `scrape_config`.
+  The `series_limit` allows overriding the `-promscrape.seriesLimitPerTarget` on a per-`scrape_config` basis.
+  If `series_limit` is set to `0` or to negative value, then it isn't applied to the given `scrape_config`,
+  even if `-promscrape.seriesLimitPerTarget` command-line flag is set.
 * Via `__series_limit__` label, which can be set with [relabeling](#relabeling) at `relabel_configs` section.
-  This limit is applied to the corresponding scrape targets. Typical use case: to set the limit
-  via [Kubernetes annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/) for targets,
-  which may expose too high number of time series.
+  The `__series_limit__` allows overriding the `series_limit` on a per-target basis.
+  If `__series_limit__` is set to `0` or to negative value, then it isn't applied to the given target.
+  Typical use case: to set the limit via [Kubernetes annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+  for targets, which may expose too high number of time series.
 
 Scraped metrics are dropped for time series exceeding the given limit on the time window of 24h.
 `vmagent` creates the following additional per-target metrics for targets with non-zero series limit:
@@ -991,10 +1066,14 @@ See also [cardinality explorer docs](https://docs.victoriametrics.com/#cardinali
 ## Monitoring
 
 `vmagent` exports various metrics in Prometheus exposition format at `http://vmagent-host:8429/metrics` page.
-We recommend setting up regular scraping of this page either through `vmagent` itself or by Prometheus
+We recommend setting up regular scraping of this page either through `vmagent` itself or by Prometheus-compatible scraper,
 so that the exported metrics may be analyzed later.
 
-Use official [Grafana dashboard](https://grafana.com/grafana/dashboards/12683-victoriametrics-vmagent/) for `vmagent` state overview.
+If you use Google Cloud Managed Prometheus for scraping metrics from VictoriaMetrics components, then pass `-metrics.exposeMetadata`
+command-line to them, so they add `TYPE` and `HELP` comments per each exposed metric at `/metrics` page.
+See [these docs](https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type) for details.
+
+Use official [Grafana dashboard](https://grafana.com/grafana/dashboards/12683) for `vmagent` state overview.
 Graphs on this dashboard contain useful hints - hover the `i` icon at the top left corner of each graph in order to read it.
 If you have suggestions for improvements or have found a bug - please open an issue on github or add a review to the dashboard.
 
@@ -1108,7 +1187,11 @@ If you have suggestions for improvements or have found a bug - please open an is
     regex: true
   ```
 
-See also [general troubleshooting docs](https://docs.victoriametrics.com/Troubleshooting.html).
+See also:
+
+- [debugging scrape targets](#debugging-scrape-targets)
+- [relabel debug](#relabel-debug)
+- [general troubleshooting docs](https://docs.victoriametrics.com/Troubleshooting.html)
 
 ## Calculating disk space for persistence queue
 
@@ -1130,7 +1213,7 @@ take into account the following attributes:
    For example, if `vmagent` should be able to buffer the data for at least 6 hours, then the following query
    can be used for estimating the needed amounts of disk space in gigabytes:
 
-   ```
+   ```metricsql
    sum(rate(vmagent_remotewrite_bytes_sent_total[1h])) by(instance,url) * 6h / 1Gi
    ```
 
@@ -1173,7 +1256,7 @@ Multiple topics can be specified by passing multiple `-gcp.pubsub.subscribe.topi
 For example, the following command starts `vmagent`, which reads metrics in [InfluxDB line protocol format](https://docs.influxdata.com/influxdb/cloud/reference/syntax/line-protocol/)
 from PubSub `projects/victoriametrics-vmagent-pub-sub-test/subscriptions/telegraf-testing` and sends them to remote storage at `http://localhost:8428/api/v1/write`:
 
-```bash
+```sh
 ./bin/vmagent -remoteWrite.url=http://localhost:8428/api/v1/write \
        -gcp.pubsub.subscribe.topicSubscription=projects/victoriametrics-vmagent-pub-sub-test/subscriptions/telegraf-testing \
        -gcp.pubsub.subscribe.topicSubscription.messageFormat=influx
@@ -1201,7 +1284,7 @@ See also [how to write metrics to multiple distinct tenants](https://docs.victor
 [Influx](https://docs.influxdata.com/influxdb/cloud/reference/syntax/line-protocol/) messages from `telegraf-testing` topic
 and gzipp'ed [JSON line](https://docs.victoriametrics.com/#json-line-format) messages from `json-line-testing` topic:
 
-```bash
+```sh
 ./bin/vmagent -remoteWrite.url=http://localhost:8428/api/v1/write \
        -gcp.pubsub.subscribe.topicSubscription=projects/victoriametrics-vmagent-pub-sub-test/subscriptions/telegraf-testing \
        -gcp.pubsub.subscribe.topicSubscription.messageFormat=influx \
@@ -1217,7 +1300,7 @@ These command-line flags are available only in [enterprise](https://docs.victori
 which can be downloaded for evaluation from [releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest) page
 (see `vmutils-...-enterprise.tar.gz` archives) and from [docker images](https://hub.docker.com/r/victoriametrics/vmagent/tags) with tags containing `enterprise` suffix.
 
-```text
+```sh
   -gcp.pubsub.subscribe.credentialsFile string
         Path to file with GCP credentials to use for PubSub client. If not set, default credentials are used (see Workload Identity for K8S or https://cloud.google.com/docs/authentication/application-default-credentials ). See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
   -gcp.pubsub.subscribe.defaultMessageFormat string
@@ -1251,7 +1334,7 @@ These command-line flags are available only in [enterprise](https://docs.victori
 which can be downloaded for evaluation from [releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest) page
 (see `vmutils-...-enterprise.tar.gz` archives) and from [docker images](https://hub.docker.com/r/victoriametrics/vmagent/tags) with tags containing `enterprise` suffix.
 
-```text
+```sh
   -gcp.pubsub.publish.byteThreshold int
         Publish a batch when its size in bytes reaches this value. See https://docs.victoriametrics.com/vmagent.html#writing-metrics-to-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html (default 1000000)
   -gcp.pubsub.publish.countThreshold int
@@ -1306,7 +1389,7 @@ For example, `-kafka.consumer.topic.brokers='host1:9092;host2:9092'`.
 The following command starts `vmagent`, which reads metrics in InfluxDB line protocol format from Kafka broker at `localhost:9092`
 from the topic `metrics-by-telegraf` and sends them to remote storage at `http://localhost:8428/api/v1/write`:
 
-```bash
+```sh
 ./bin/vmagent -remoteWrite.url=http://localhost:8428/api/v1/write \
        -kafka.consumer.topic.brokers=localhost:9092 \
        -kafka.consumer.topic.format=influx \
@@ -1335,7 +1418,7 @@ These command-line flags are available only in [enterprise](https://docs.victori
 which can be downloaded for evaluation from [releases](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest) page
 (see `vmutils-...-enterprise.tar.gz` archives) and from [docker images](https://hub.docker.com/r/victoriametrics/vmagent/tags) with tags containing `enterprise` suffix.
 
-```text
+```sh
   -kafka.consumer.topic array
         Kafka topic names for data consumption. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
         Supports an array of values separated by comma or specified via multiple flags.
@@ -1383,7 +1466,7 @@ Two types of auth are supported:
 
 * sasl with username and password:
 
-```bash
+```sh
 ./bin/vmagent -remoteWrite.url='kafka://localhost:9092/?topic=prom-rw&security.protocol=SASL_SSL&sasl.mechanisms=PLAIN' \
     -remoteWrite.basicAuth.username=user \
     -remoteWrite.basicAuth.password=password
@@ -1391,12 +1474,32 @@ Two types of auth are supported:
 
 * tls certificates:
 
-```bash
+```sh
 ./bin/vmagent -remoteWrite.url='kafka://localhost:9092/?topic=prom-rw&security.protocol=SSL' \
     -remoteWrite.tlsCAFile=/opt/ca.pem \
     -remoteWrite.tlsCertFile=/opt/cert.pem \
     -remoteWrite.tlsKeyFile=/opt/key.pem
 ```
+
+## mTLS protection
+
+By default `vmagent` accepts http requests at `8429` port (this port can be changed via `-httpListenAddr` command-line flags),
+since it is expected it runs in an isolated trusted network.
+[Enterprise version of vmagent](https://docs.victoriametrics.com/enterprise.html) supports the ability to accept [mTLS](https://en.wikipedia.org/wiki/Mutual_authentication)
+requests at this port, by specifying `-tls` and `-mtls` command-line flags. For example, the following command runs `vmagent`, which accepts only mTLS requests at port `8429`:
+
+```
+./vmagent -tls -mtls -remoteWrite.url=...
+```
+
+By default system-wide [TLS Root CA](https://en.wikipedia.org/wiki/Root_certificate) is used for verifying client certificates if `-mtls` command-line flag is specified.
+It is possible to specify custom TLS Root CA via `-mtlsCAFile` command-line flag.
+
+## Security
+
+See general recommendations regarding security [here](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#security).
+
+See also [mTLS protection docs](#mtls-protection).
 
 ## How to build from sources
 
@@ -1406,7 +1509,7 @@ It may be needed to build `vmagent` from source code when developing or testing 
 
 ### Development build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.20.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.22.
 1. Run `make vmagent` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics).
    It builds the `vmagent` binary and puts it into the `bin` folder.
 
@@ -1425,7 +1528,7 @@ The `<PKG_TAG>` may be manually set via `PKG_TAG=foobar make package-vmagent`.
 The base docker image is [alpine](https://hub.docker.com/_/alpine) but it is possible to use any other base image
 by setting it via `<ROOT_IMAGE>` environment variable. For example, the following command builds the image on top of [scratch](https://hub.docker.com/_/scratch) image:
 
-```bash
+```sh
 ROOT_IMAGE=scratch make package-vmagent
 ```
 
@@ -1435,7 +1538,7 @@ ARM build may run on Raspberry Pi or on [energy-efficient ARM servers](https://b
 
 ### Development ARM build
 
-1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.20.
+1. [Install Go](https://golang.org/doc/install). The minimum supported version is Go 1.22.
 1. Run `make vmagent-linux-arm` or `make vmagent-linux-arm64` from the root folder of [the repository](https://github.com/VictoriaMetrics/VictoriaMetrics)
    It builds `vmagent-linux-arm` or `vmagent-linux-arm64` binary respectively and puts it into the `bin` folder.
 
@@ -1451,23 +1554,19 @@ ARM build may run on Raspberry Pi or on [energy-efficient ARM servers](https://b
 
 * Memory profile can be collected with the following command (replace `0.0.0.0` with hostname if needed):
 
-<div class="with-copy" markdown="1">
 
-```bash
+```sh
 curl http://0.0.0.0:8429/debug/pprof/heap > mem.pprof
 ```
 
-</div>
 
 * CPU profile can be collected with the following command (replace `0.0.0.0` with hostname if needed):
 
-<div class="with-copy" markdown="1">
 
-```bash
+```sh
 curl http://0.0.0.0:8429/debug/pprof/profile > cpu.pprof
 ```
 
-</div>
 
 The command for collecting CPU profile waits for 30 seconds before returning.
 
@@ -1479,7 +1578,7 @@ It is safe sharing the collected profiles from security point of view, since the
 
 `vmagent` can be fine-tuned with various command-line flags. Run `./vmagent -help` in order to see the full list of these flags with their descriptions and default values:
 
-```text
+```sh
 ./vmagent -help
 
 vmagent collects metrics data via popular data ingestion protocols and routes them to VictoriaMetrics.
@@ -1490,12 +1589,13 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      The number of cache misses before putting the block into cache. Higher values may reduce indexdb/dataBlocks cache size at the cost of higher CPU and disk read usage (default 2)
   -cacheExpireDuration duration
      Items are removed from in-memory caches after they aren't accessed for this duration. Lower values may reduce memory usage at the cost of higher CPU usage. See also -prevCacheRemovalPercent (default 30m0s)
-  -configAuthKey string
+  -configAuthKey value
      Authorization key for accessing /config page. It must be passed via authKey query arg
+     Flag value can be read from the given file when using -configAuthKey=file:///abs/path/to/file or -configAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -configAuthKey=http://host/path or -configAuthKey=https://host/path
   -csvTrimTimestamp duration
      Trim timestamps when importing csv data to this duration. Minimum practical duration is 1ms. Higher duration (i.e. 1s) may be used for reducing disk space usage for timestamp data (default 1ms)
   -datadog.maxInsertRequestSize size
-     The maximum size in bytes of a single DataDog POST request to /api/v1/series
+     The maximum size in bytes of a single DataDog POST request to /datadog/api/v2/series
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 67108864)
   -datadog.sanitizeMetricName
      Sanitize metric names for the ingested DataDog data to comply with DataDog behaviour described at https://docs.datadoghq.com/metrics/custom_metrics/#naming-custom-metrics (default true)
@@ -1515,8 +1615,9 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Deprecated, please use -license or -licenseFile flags instead. By specifying this flag, you confirm that you have an enterprise license and accept the ESA https://victoriametrics.com/legal/esa/ . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
   -filestream.disableFadvise
      Whether to disable fadvise() syscall when reading large data files. The fadvise() syscall prevents from eviction of recently accessed data from OS page cache during background merges and backups. In some rare cases it is better to disable the syscall if it uses too much CPU
-  -flagsAuthKey string
+  -flagsAuthKey value
      Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Flag value can be read from the given file when using -flagsAuthKey=file:///abs/path/to/file or -flagsAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -flagsAuthKey=http://host/path or -flagsAuthKey=https://host/path
   -fs.disableMmap
      Whether to use pread() instead of mmap() for reading data files. By default, mmap() is used for 64-bit arches and pread() is used for 32-bit arches, since they cannot read data files bigger than 2^32 bytes in memory. mmap() is usually faster for reading small data chunks than pread()
   -gcp.pubsub.publish.byteThreshold int
@@ -1542,15 +1643,19 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -gcp.pubsub.subscribe.topicSubscription array
      GCP PubSub topic subscription in the format: projects/<project-id>/subscriptions/<subscription-name>. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -gcp.pubsub.subscribe.topicSubscription.concurrency array
      The number of concurrently processed messages for topic subscription specified via -gcp.pubsub.subscribe.topicSubscription flag. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html (default 0)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -gcp.pubsub.subscribe.topicSubscription.isGzipped array
      Enables gzip decompression for messages payload at the corresponding -gcp.pubsub.subscribe.topicSubscription. Only prometheus, jsonline, graphite and influx formats accept gzipped messages. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -gcp.pubsub.subscribe.topicSubscription.messageFormat array
      Message format for the corresponding -gcp.pbusub.subcribe.topicSubscription. Valid formats: influx, prometheus, promremotewrite, graphite, jsonline . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-pubsub . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -graphiteListenAddr string
      TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty. See also -graphiteListenAddr.useProxyProtocol
   -graphiteListenAddr.useProxyProtocol
@@ -1558,15 +1663,15 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -graphiteTrimTimestamp duration
      Trim timestamps for Graphite data to this duration. Minimum practical duration is 1s. Higher duration (i.e. 1m) may be used for reducing disk space usage for timestamp data (default 1s)
   -http.connTimeout duration
-     Incoming http connections are closed after the configured timeout. This may help to spread the incoming load among a cluster of services behind a load balancer. Please note that the real timeout may be bigger by up to 10% as a protection against the thundering herd problem (default 2m0s)
+     Incoming connections to -httpListenAddr are closed after the configured timeout. This may help evenly spreading load among a cluster of services behind TCP-level load balancer. Zero value disables closing of incoming connections (default 2m0s)
   -http.disableResponseCompression
      Disable compression of HTTP responses to save CPU resources. By default, compression is enabled to save network bandwidth
-  -http.header.csp string
-     Value for 'Content-Security-Policy' header
+  -http.header.csp default-src 'self'
+     Value for 'Content-Security-Policy' header, recommended: default-src 'self'
   -http.header.frameOptions string
      Value for 'X-Frame-Options' header
-  -http.header.hsts string
-     Value for 'Strict-Transport-Security' header
+  -http.header.hsts max-age=31536000; includeSubDomains
+     Value for 'Strict-Transport-Security' header, recommended: max-age=31536000; includeSubDomains
   -http.idleConnTimeout duration
      Timeout for incoming idle http connections (default 1m0s)
   -http.maxGracefulShutdownDuration duration
@@ -1575,20 +1680,26 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus
   -http.shutdownDelay duration
      Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers
-  -httpAuth.password string
+  -httpAuth.password value
      Password for HTTP server's Basic Auth. The authentication is disabled if -httpAuth.username is empty
+     Flag value can be read from the given file when using -httpAuth.password=file:///abs/path/to/file or -httpAuth.password=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -httpAuth.password=http://host/path or -httpAuth.password=https://host/path
   -httpAuth.username string
      Username for HTTP server's Basic Auth. The authentication is disabled if empty. See also -httpAuth.password
-  -httpListenAddr string
-     TCP address to listen for http connections. Set this flag to empty value in order to disable listening on any port. This mode may be useful for running multiple vmagent instances on the same server. Note that /targets and /metrics pages aren't available if -httpListenAddr=''. See also -tls and -httpListenAddr.useProxyProtocol (default ":8429")
-  -httpListenAddr.useProxyProtocol
-     Whether to use proxy protocol for connections accepted at -httpListenAddr . See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt . With enabled proxy protocol http server cannot serve regular /metrics endpoint. Use -pushmetrics.url for metrics pushing
+  -httpListenAddr array
+     TCP address to listen for incoming http requests. Set this flag to empty value in order to disable listening on any port. This mode may be useful for running multiple vmagent instances on the same server. Note that /targets and /metrics pages aren't available if -httpListenAddr=''. See also -tls and -httpListenAddr.useProxyProtocol
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -httpListenAddr.useProxyProtocol array
+     Whether to use proxy protocol for connections accepted at the corresponding -httpListenAddr . See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt . With enabled proxy protocol http server cannot serve regular /metrics endpoint. Use -pushmetrics.url for metrics pushing
+     Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -import.maxLineLen size
      The maximum length in bytes of a single line accepted by /api/v1/import; the line length can be limited with 'max_rows_per_line' query arg passed to /api/v1/export
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 10485760)
   -influx.databaseNames array
      Comma-separated list of database names to return from /query and /influx/query API. This can be needed for accepting data from Telegraf plugins such as https://github.com/fangli/fluent-plugin-influxdb
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -influx.maxLineSize size
      The maximum size in bytes for a single InfluxDB line during parsing
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 262144)
@@ -1617,32 +1728,41 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -kafka.consumer.topic array
      Kafka topic names for data consumption. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.basicAuth.password array
      Optional basic auth password for -kafka.consumer.topic.  Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.basicAuth.username array
      Optional basic auth username for -kafka.consumer.topic. Must be used in conjunction with any supported auth methods for kafka client, specified by flag -kafka.consumer.topic.options='security.protocol=SASL_SSL;sasl.mechanisms=PLAIN' . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.brokers array
      List of brokers to connect for given topic, e.g. -kafka.consumer.topic.broker=host-1:9092;host-2:9092 . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.concurrency array
      Configures consumer concurrency for topic specified via -kafka.consumer.topic flag. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html (default 1)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -kafka.consumer.topic.defaultFormat string
      Expected data format in the topic if -kafka.consumer.topic.format is skipped. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html (default "promremotewrite")
   -kafka.consumer.topic.format array
      data format for corresponding kafka topic. Valid formats: influx, prometheus, promremotewrite, graphite, jsonline . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.groupID array
      Defines group.id for topic. See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -kafka.consumer.topic.isGzipped array
      Enables gzip setting for topic messages payload. Only prometheus, jsonline, graphite and influx formats accept gzipped messages.See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -kafka.consumer.topic.options array
      Optional key=value;key1=value2 settings for topic consumer. See full configuration options at https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md . See https://docs.victoriametrics.com/vmagent.html#reading-metrics-from-kafka . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -license string
      Lisense key for VictoriaMetrics Enterprise. See https://victoriametrics.com/products/enterprise/ . Trial Enterprise license can be obtained from https://victoriametrics.com/products/enterprise/trial/ . This flag is available only in Enterprise binaries. The license key can be also passed via file specified by -licenseFile command-line flag
   -license.forceOffline
@@ -1677,8 +1797,19 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 0)
   -memory.allowedPercent float
      Allowed percent of system memory VictoriaMetrics caches may occupy. See also -memory.allowedBytes. Too low a value may increase cache miss rate usually resulting in higher CPU and disk IO usage. Too high a value may evict too much data from the OS page cache which will result in higher disk IO usage (default 60)
-  -metricsAuthKey string
+  -metrics.exposeMetadata
+     Whether to expose TYPE and HELP metadata at the /metrics page, which is exposed at -httpListenAddr . The metadata may be needed when the /metrics page is consumed by systems, which require this information. For example, Managed Prometheus in Google Cloud - https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type
+  -metricsAuthKey value
      Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Flag value can be read from the given file when using -metricsAuthKey=file:///abs/path/to/file or -metricsAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -metricsAuthKey=http://host/path or -metricsAuthKey=https://host/path
+  -mtls array
+     Whether to require valid client certificate for https requests to the corresponding -httpListenAddr . This flag works only if -tls flag is set. See also -mtlsCAFile . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
+     Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
+  -mtlsCAFile array
+     Optional path to TLS Root CA for verifying client certificates at the corresponding -httpListenAddr when -mtls is enabled. By default the host system TLS Root CA is used for client certificate verification. This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise.html
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -newrelic.maxInsertRequestSize size
      The maximum size in bytes of a single NewRelic request to /newrelic/infra/v2/metrics/events/bulk
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 67108864)
@@ -1697,8 +1828,9 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 33554432)
   -opentsdbhttpTrimTimestamp duration
      Trim timestamps for OpenTSDB HTTP data to this duration. Minimum practical duration is 1ms. Higher duration (i.e. 1s) may be used for reducing disk space usage for timestamp data (default 1ms)
-  -pprofAuthKey string
+  -pprofAuthKey value
      Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Flag value can be read from the given file when using -pprofAuthKey=file:///abs/path/to/file or -pprofAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -pprofAuthKey=http://host/path or -pprofAuthKey=https://host/path
   -prevCacheRemovalPercent float
      Items in the previous caches are removed when the percent of requests it serves becomes lower than this value. Higher values reduce memory usage at the cost of higher CPU usage. See also -cacheExpireDuration (default 0.1)
   -promscrape.azureSDCheckInterval duration
@@ -1755,10 +1887,14 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      Interval for checking for changes in 'file_sd_config'. See https://docs.victoriametrics.com/sd_configs.html#file_sd_configs for details (default 1m0s)
   -promscrape.gceSDCheckInterval duration
      Interval for checking for changes in gce. This works only if gce_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#gce_sd_configs for details (default 1m0s)
+  -promscrape.hetznerSDCheckInterval duration
+     Interval for checking for changes in Hetzner API. This works only if hetzner_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#hetzner_sd_configs for details (default 1m0s)
   -promscrape.httpSDCheckInterval duration
      Interval for checking for changes in http endpoint service discovery. This works only if http_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#http_sd_configs for details (default 1m0s)
   -promscrape.kubernetes.apiServerTimeout duration
      How frequently to reload the full state from Kubernetes API server (default 30m0s)
+  -promscrape.kubernetes.attachNodeMetadataAll
+     Whether to set attach_metadata.node=true for all the kubernetes_sd_configs at -promscrape.config . It is possible to set attach_metadata.node=false individually per each kubernetes_sd_configs . See https://docs.victoriametrics.com/sd_configs.html#kubernetes_sd_configs
   -promscrape.kubernetesSDCheckInterval duration
      Interval for checking for changes in Kubernetes API server. This works only if kubernetes_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#kubernetes_sd_configs for details (default 30s)
   -promscrape.kumaSDCheckInterval duration
@@ -1794,53 +1930,77 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      The delay for suppressing repeated scrape errors logging per each scrape targets. This may be used for reducing the number of log lines related to scrape errors. See also -promscrape.suppressScrapeErrors
   -promscrape.yandexcloudSDCheckInterval duration
      Interval for checking for changes in Yandex Cloud API. This works only if yandexcloud_sd_configs is configured in '-promscrape.config' file. See https://docs.victoriametrics.com/sd_configs.html#yandexcloud_sd_configs for details (default 30s)
+  -pushmetrics.disableCompression
+     Whether to disable request body compression when pushing metrics to every -pushmetrics.url
   -pushmetrics.extraLabel array
-     Optional labels to add to metrics pushed to -pushmetrics.url . For example, -pushmetrics.extraLabel='instance="foo"' adds instance="foo" label to all the metrics pushed to -pushmetrics.url
+     Optional labels to add to metrics pushed to every -pushmetrics.url . For example, -pushmetrics.extraLabel='instance="foo"' adds instance="foo" label to all the metrics pushed to every -pushmetrics.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -pushmetrics.header array
+     Optional HTTP request header to send to every -pushmetrics.url . For example, -pushmetrics.header='Authorization: Basic foobar' adds 'Authorization: Basic foobar' header to every request to every -pushmetrics.url
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -pushmetrics.interval duration
-     Interval for pushing metrics to -pushmetrics.url (default 10s)
+     Interval for pushing metrics to every -pushmetrics.url (default 10s)
   -pushmetrics.url array
      Optional URL to push metrics exposed at /metrics page. See https://docs.victoriametrics.com/#push-metrics . By default, metrics exposed at /metrics page aren't pushed to any remote storage
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -reloadAuthKey value
+     Auth key for /-/reload http endpoint. It must be passed as authKey=...
+     Flag value can be read from the given file when using -reloadAuthKey=file:///abs/path/to/file or -reloadAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -reloadAuthKey=http://host/path or -reloadAuthKey=https://host/path
   -remoteWrite.aws.accessKey array
      Optional AWS AccessKey to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.ec2Endpoint array
      Optional AWS EC2 API endpoint to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.region array
      Optional AWS region to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.roleARN array
      Optional AWS roleARN to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.secretKey array
      Optional AWS SecretKey to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.service array
      Optional AWS Service to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set. Defaults to "aps"
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.stsEndpoint array
      Optional AWS STS API endpoint to use for the corresponding -remoteWrite.url if -remoteWrite.aws.useSigv4 is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.aws.useSigv4 array
      Enables SigV4 request signing for the corresponding -remoteWrite.url. It is expected that other -remoteWrite.aws.* command-line flags are set if sigv4 request signing is enabled
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.basicAuth.password array
      Optional basic auth password to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.basicAuth.passwordFile array
      Optional path to basic auth password to use for the corresponding -remoteWrite.url. The file is re-read every second
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.basicAuth.username array
      Optional basic auth username to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.bearerToken array
      Optional bearer auth token to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.bearerTokenFile array
      Optional path to bearer token file to use for the corresponding -remoteWrite.url. The token is re-read from the file every second
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.disableOnDiskQueue
      Whether to disable storing pending data to -remoteWrite.tmpDataPath when the configured remote storage systems cannot keep up with the data ingestion rate. See https://docs.victoriametrics.com/vmagent.html#disabling-on-disk-persistence .See also -remoteWrite.dropSamplesOnOverload
   -remoteWrite.dropSamplesOnOverload
@@ -1850,17 +2010,21 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -remoteWrite.forcePromProto array
      Whether to force Prometheus remote write protocol for sending data to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.forceVMProto array
      Whether to force VictoriaMetrics remote write protocol for sending data to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.headers array
      Optional HTTP headers to send with each request to the corresponding -remoteWrite.url. For example, -remoteWrite.headers='My-Auth:foobar' would send 'My-Auth: foobar' HTTP header with every request to the corresponding -remoteWrite.url. Multiple headers must be delimited by '^^': -remoteWrite.headers='header1:value1^^header2:value2'
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.keepDanglingQueues
      Keep persistent queues contents at -remoteWrite.tmpDataPath in case there are no matching -remoteWrite.url. Useful when -remoteWrite.url is changed temporarily and persistent queue files will be needed later on.
   -remoteWrite.label array
      Optional label in the form 'name=value' to add to all the metrics before sending them to -remoteWrite.url. Pass multiple -remoteWrite.label flags in order to add multiple labels to metrics before sending them to remote storage
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.maxBlockSize size
      The maximum block size to send to remote storage. Bigger blocks may improve performance at the cost of the increased memory usage. See also -remoteWrite.maxRowsPerBlock
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 8388608)
@@ -1870,6 +2034,7 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
      The maximum file-based buffer size in bytes at -remoteWrite.tmpDataPath for each -remoteWrite.url. When buffer size reaches the configured maximum, then old data is dropped when adding new data to the buffer. Buffered data is stored in ~500MB chunks. It is recommended to set the value for this flag to a multiple of the block size 500MB. Disk usage is unlimited if the value is set to 0
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB. (default 0)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.maxHourlySeries int
      The maximum number of unique series vmagent can send to remote storage systems during the last hour. Excess series are logged and dropped. This can be useful for limiting series cardinality. See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter
   -remoteWrite.maxRowsPerBlock int
@@ -1877,97 +2042,137 @@ See the docs at https://docs.victoriametrics.com/vmagent.html .
   -remoteWrite.multitenantURL array
      Base path for multitenant remote storage URL to write data to. See https://docs.victoriametrics.com/vmagent.html#multitenancy for details. Example url: http://<vminsert>:8480 . Pass multiple -remoteWrite.multitenantURL flags in order to replicate data to multiple remote storage systems. This flag is deprecated in favor of -enableMultitenantHandlers . See https://docs.victoriametrics.com/vmagent.html#multitenancy
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.oauth2.clientID array
      Optional OAuth2 clientID to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.oauth2.clientSecret array
      Optional OAuth2 clientSecret to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.oauth2.clientSecretFile array
      Optional OAuth2 clientSecretFile to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -remoteWrite.oauth2.endpointParams array
+     Optional OAuth2 endpoint parameters to use for the corresponding -remoteWrite.url . The endpoint parameters must be set in JSON format: {"param1":"value1",...,"paramN":"valueN"}
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.oauth2.scopes array
      Optional OAuth2 scopes to use for the corresponding -remoteWrite.url. Scopes must be delimited by ';'
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.oauth2.tokenUrl array
      Optional OAuth2 tokenURL to use for the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.proxyURL array
      Optional proxy URL for writing data to the corresponding -remoteWrite.url. Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.queues int
      The number of concurrent queues to each -remoteWrite.url. Set more queues if default number of queues isn't enough for sending high volume of collected data to remote storage. Default value is 2 * numberOfAvailableCPUs (default 32)
   -remoteWrite.rateLimit array
      Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. By default, the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data is sent after temporary unavailability of the remote storage (default 0)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.relabelConfig string
      Optional path to file with relabeling configs, which are applied to all the metrics before sending them to -remoteWrite.url. See also -remoteWrite.urlRelabelConfig. The path can point either to local file or to http url. See https://docs.victoriametrics.com/vmagent.html#relabeling
   -remoteWrite.roundDigits array
      Round metric values to this number of decimal digits after the point before writing them to remote storage. Examples: -remoteWrite.roundDigits=2 would round 1.236 to 1.24, while -remoteWrite.roundDigits=-1 would round 126.78 to 130. By default, digits rounding is disabled. Set it to 100 for disabling it for a particular remote storage. This option may be used for improving data compression for the stored metrics (default 100)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.sendTimeout array
      Timeout for sending a single block of data to the corresponding -remoteWrite.url (default 1m0s)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.shardByURL
      Whether to shard outgoing series across all the remote storage systems enumerated via -remoteWrite.url . By default the data is replicated across all the -remoteWrite.url . See https://docs.victoriametrics.com/vmagent.html#sharding-among-remote-storages
   -remoteWrite.shardByURL.labels array
      Optional list of labels, which must be used for sharding outgoing samples among remote storage systems if -remoteWrite.shardByURL command-line flag is set. By default all the labels are used for sharding in order to gain even distribution of series over the specified -remoteWrite.url systems
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.showURL
      Whether to show -remoteWrite.url in the exported metrics. It is hidden by default, since it can contain sensitive info such as auth key
   -remoteWrite.significantFigures array
      The number of significant figures to leave in metric values before writing them to remote storage. See https://en.wikipedia.org/wiki/Significant_figures . Zero value saves all the significant figures. This option may be used for improving data compression for the stored metrics. See also -remoteWrite.roundDigits (default 0)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.streamAggr.config array
      Optional path to file with stream aggregation config. See https://docs.victoriametrics.com/stream-aggregation.html . See also -remoteWrite.streamAggr.keepInput, -remoteWrite.streamAggr.dropInput and -remoteWrite.streamAggr.dedupInterval
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.streamAggr.dedupInterval array
      Input samples are de-duplicated with this interval before being aggregated. Only the last sample per each time series per each interval is aggregated if the interval is greater than zero (default 0s)
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.streamAggr.dropInput array
      Whether to drop all the input samples after the aggregation with -remoteWrite.streamAggr.config. By default, only aggregates samples are dropped, while the remaining samples are written to the corresponding -remoteWrite.url . See also -remoteWrite.streamAggr.keepInput and https://docs.victoriametrics.com/stream-aggregation.html
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.streamAggr.keepInput array
      Whether to keep all the input samples after the aggregation with -remoteWrite.streamAggr.config. By default, only aggregates samples are dropped, while the remaining samples are written to the corresponding -remoteWrite.url . See also -remoteWrite.streamAggr.dropInput and https://docs.victoriametrics.com/stream-aggregation.html
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.tlsCAFile array
      Optional path to TLS CA file to use for verifying connections to the corresponding -remoteWrite.url. By default, system CA is used
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.tlsCertFile array
      Optional path to client-side TLS certificate file to use when connecting to the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -remoteWrite.tlsHandshakeTimeout array
+     The timeout for estabilishing tls connections to the corresponding -remoteWrite.url (default 20s)
+     Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to default value.
   -remoteWrite.tlsInsecureSkipVerify array
      Whether to skip tls verification when connecting to the corresponding -remoteWrite.url
      Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
   -remoteWrite.tlsKeyFile array
      Optional path to client-side TLS certificate key to use when connecting to the corresponding -remoteWrite.url
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.tlsServerName array
      Optional TLS server name to use for connections to the corresponding -remoteWrite.url. By default, the server name from -remoteWrite.url is used
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.tmpDataPath string
      Path to directory for storing pending data, which isn't sent to the configured -remoteWrite.url . See also -remoteWrite.maxDiskUsagePerURL and -remoteWrite.disableOnDiskQueue (default "vmagent-remotewrite-data")
   -remoteWrite.url array
      Remote storage URL to write data to. It must support either VictoriaMetrics remote write protocol or Prometheus remote_write protocol. Example url: http://<victoriametrics-host>:8428/api/v1/write . Pass multiple -remoteWrite.url options in order to replicate the collected data to multiple remote storage systems. The data can be sharded among the configured remote storage systems if -remoteWrite.shardByURL flag is set
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.urlRelabelConfig array
      Optional path to relabel configs for the corresponding -remoteWrite.url. See also -remoteWrite.relabelConfig. The path can point either to local file or to http url. See https://docs.victoriametrics.com/vmagent.html#relabeling
      Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -remoteWrite.vmProtoCompressLevel int
      The compression level for VictoriaMetrics remote write protocol. Higher values reduce network traffic at the cost of higher CPU usage. Negative values reduce CPU usage at the cost of increased network traffic. See https://docs.victoriametrics.com/vmagent.html#victoriametrics-remote-write-protocol
   -sortLabels
      Whether to sort labels for incoming samples before writing them to all the configured remote storage systems. This may be needed for reducing memory usage at remote storage when the order of labels in incoming samples is random. For example, if m{k1="v1",k2="v2"} may be sent as m{k2="v2",k1="v1"}Enabled sorting for labels can slow down ingestion performance a bit
-  -tls
-     Whether to enable TLS for incoming HTTP requests at -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set
-  -tlsCertFile string
-     Path to file with TLS certificate if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated
+  -tls array
+     Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set. See also -mtls
+     Supports array of values separated by comma or specified via multiple flags.
+     Empty values are set to false.
+  -tlsCertFile array
+     Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -tlsCipherSuites array
      Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants
      Supports an array of values separated by comma or specified via multiple flags.
-  -tlsKeyFile string
-     Path to file with TLS key if -tls is set. The provided key file is automatically re-read every second, so it can be dynamically updated
-  -tlsMinVersion string
-     Optional minimum TLS version to use for incoming requests over HTTPS if -tls is set. Supported values: TLS10, TLS11, TLS12, TLS13
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -tlsKeyFile array
+     Path to file with TLS key for the corresponding -httpListenAddr if -tls is set. The provided key file is automatically re-read every second, so it can be dynamically updated
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
+  -tlsMinVersion array
+     Optional minimum TLS version to use for the corresponding -httpListenAddr if -tls is set. Supported values: TLS10, TLS11, TLS12, TLS13
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -usePromCompatibleNaming
      Whether to replace characters unsupported by Prometheus with underscores in the ingested metric names and label names. For example, foo.bar{a.b='c'} is transformed into foo_bar{a_b='c'} during data ingestion if this flag is set. See https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels
   -version

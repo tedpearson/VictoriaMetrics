@@ -69,7 +69,7 @@ func Parse(r io.Reader, isVMRemoteWrite bool, callback func(tss []prompb.TimeSer
 	}
 	wr := getWriteRequest()
 	defer putWriteRequest(wr)
-	if err := wr.Unmarshal(bb.B); err != nil {
+	if err := wr.UnmarshalProtobuf(bb.B); err != nil {
 		unmarshalErrors.Inc()
 		return fmt.Errorf("cannot unmarshal prompb.WriteRequest with size %d bytes: %w", len(bb.B), err)
 	}
@@ -110,7 +110,7 @@ func (ctx *pushCtx) Read() error {
 	}
 	if reqLen > int64(maxInsertRequestSize.N) {
 		readErrors.Inc()
-		return fmt.Errorf("too big packed request; mustn't exceed -maxInsertRequestSize=%d bytes", maxInsertRequestSize.N)
+		return fmt.Errorf("too big packed request; mustn't exceed -maxInsertRequestSize=%d bytes; got %d bytes", maxInsertRequestSize.N, reqLen)
 	}
 	return nil
 }

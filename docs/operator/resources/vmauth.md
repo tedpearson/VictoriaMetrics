@@ -54,11 +54,11 @@ Here's a more visual and more detailed view:
 |-------------------------|----------------|----------------------|-------------------|------------------------------------------------------------------------------------------------------|
 | undefined               | undefined      | false                | undefined         | nothing                                                                                              |
 | undefined               | undefined      | **true**             | undefined         | all vmusers in the cluster                                                                           |
-| **defined**             | undefined      | any                  | undefined         | all vmusers are matching at namespaces for given `userNamespaceSelector`                             |
-| undefined               | **defined**    | any                  | undefined         | all vmusers only at `VMAuth`'s namespace are matching for given `userSelector`                       |
-| **defined**             | **defined**    | any                  | undefined         | all vmusers only at namespaces matched `userNamespaceSelector` for given `userSelector` are matching |
-| any                     | undefined      | any                  | **defined**       | all vmusers only at `VMAuth`'s namespace                                                             |
-| any                     | **defined**    | any                  | **defined**       | all vmusers only at `VMAuth`'s namespace for given `userSelector` are matching                       |
+| **defined**             | undefined      | *any*                | undefined         | all vmusers are matching at namespaces for given `userNamespaceSelector`                             |
+| undefined               | **defined**    | *any*                | undefined         | all vmusers only at `VMAuth`'s namespace are matching for given `userSelector`                       |
+| **defined**             | **defined**    | *any*                | undefined         | all vmusers only at namespaces matched `userNamespaceSelector` for given `userSelector` are matching |
+| *any*                   | undefined      | *any*                | **defined**       | all vmusers only at `VMAuth`'s namespace                                                             |
+| *any*                   | **defined**    | *any*                | **defined**       | all vmusers only at `VMAuth`'s namespace for given `userSelector` are matching                       |
 
 More details about `WATCH_NAMESPACE` variable you can read in [this doc](../configuration.md#namespaced-mode).
 
@@ -158,6 +158,47 @@ spec:
     - name: my-repo-secret
 # ...
 ```
+
+## Resource management
+
+You can specify resources for each `VMAuth` resource in the `spec` section of the `VMAuth` CRD.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAuth
+metadata:
+  name: vmauth-resources-example
+spec:
+    # ...
+    resources:
+        requests:
+          memory: "64Mi"
+          cpu: "250m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+    # ...
+```
+
+If these parameters are not specified, then,
+by default all `VMAuth` pods have resource requests and limits from the default values of the following [operator parameters](../configuration.md):
+
+- `VM_VMAUTHDEFAULT_RESOURCE_LIMIT_MEM` - default memory limit for `VMAuth` pods,
+- `VM_VMAUTHDEFAULT_RESOURCE_LIMIT_CPU` - default memory limit for `VMAuth` pods,
+- `VM_VMAUTHDEFAULT_RESOURCE_REQUEST_MEM` - default memory limit for `VMAuth` pods,
+- `VM_VMAUTHDEFAULT_RESOURCE_REQUEST_CPU` - default memory limit for `VMAuth` pods.
+
+These default parameters will be used if:
+
+- `VM_VMAUTHDEFAULT_USEDEFAULTRESOURCES` is set to `true` (default value),
+- `VMAuth` CR doesn't have `resources` field in `spec` section.
+
+Field `resources` in `VMAuth` spec have higher priority than operator parameters.
+
+If you set `VM_VMAUTHDEFAULT_USEDEFAULTRESOURCES` to `false` and don't specify `resources` in `VMAuth` CRD,
+then `VMAuth` pods will be created without resource requests and limits.
+
+Also, you can specify requests without limits - in this case default values for limits will not be used.
 
 ## Enterprise features
 

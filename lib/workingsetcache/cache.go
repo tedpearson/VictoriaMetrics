@@ -8,6 +8,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"github.com/VictoriaMetrics/fastcache"
 )
 
@@ -42,7 +43,7 @@ type Cache struct {
 	// In this case using prev would result in RAM waste,
 	// it is better to use only curr cache with doubled size.
 	// After the process of switching, this flag will be set to whole.
-	mode uint32
+	mode atomic.Uint32
 
 	// The maxBytes value passed to New() or to Load().
 	maxBytes int
@@ -109,7 +110,7 @@ func newCacheInternal(curr, prev *fastcache.Cache, mode, maxBytes int) *Cache {
 	c.curr.Store(curr)
 	c.prev.Store(prev)
 	c.stopCh = make(chan struct{})
-	c.setMode(mode)
+	c.mode.Store(uint32(mode))
 	return &c
 }
 
@@ -132,7 +133,7 @@ func (c *Cache) runWatchers(expireDuration time.Duration) {
 }
 
 func (c *Cache) expirationWatcher(expireDuration time.Duration) {
-	expireDuration += timeJitter(expireDuration / 10)
+	expireDuration = timeutil.AddJitterToDuration(expireDuration)
 	t := time.NewTicker(expireDuration)
 	defer t.Stop()
 	for {
@@ -142,7 +143,7 @@ func (c *Cache) expirationWatcher(expireDuration time.Duration) {
 		case <-t.C:
 		}
 		c.mu.Lock()
-		if atomic.LoadUint32(&c.mode) != split {
+		if c.mode.Load() != split {
 			// Stop the expirationWatcher on non-split mode.
 			c.mu.Unlock()
 			return
@@ -170,8 +171,7 @@ func (c *Cache) prevCacheWatcher() {
 
 	// Watch for the usage of the prev cache and drop it whenever it receives
 	// less than prevCacheRemovalPercent requests comparing to the curr cache during the last 60 seconds.
-	checkInterval := 60 * time.Second
-	checkInterval += timeJitter(checkInterval / 10)
+	checkInterval := timeutil.AddJitterToDuration(time.Second * 60)
 	t := time.NewTicker(checkInterval)
 	defer t.Stop()
 	prevGetCalls := uint64(0)
@@ -183,7 +183,7 @@ func (c *Cache) prevCacheWatcher() {
 		case <-t.C:
 		}
 		c.mu.Lock()
-		if atomic.LoadUint32(&c.mode) != split {
+		if c.mode.Load() != split {
 			// Do nothing in non-split mode.
 			c.mu.Unlock()
 			return
@@ -216,8 +216,7 @@ func (c *Cache) prevCacheWatcher() {
 }
 
 func (c *Cache) cacheSizeWatcher() {
-	checkInterval := 1500 * time.Millisecond
-	checkInterval += timeJitter(checkInterval / 10)
+	checkInterval := timeutil.AddJitterToDuration(time.Millisecond * 1500)
 	t := time.NewTicker(checkInterval)
 	defer t.Stop()
 
@@ -228,7 +227,7 @@ func (c *Cache) cacheSizeWatcher() {
 			return
 		case <-t.C:
 		}
-		if c.loadMode() != split {
+		if c.mode.Load() != split {
 			continue
 		}
 		var cs fastcache.Stats
@@ -253,7 +252,7 @@ func (c *Cache) cacheSizeWatcher() {
 	// 6) drop prev cache
 
 	c.mu.Lock()
-	c.setMode(switching)
+	c.mode.Store(switching)
 	prev := c.prev.Load()
 	curr := c.curr.Load()
 	c.prev.Store(curr)
@@ -281,7 +280,7 @@ func (c *Cache) cacheSizeWatcher() {
 	}
 
 	c.mu.Lock()
-	c.setMode(whole)
+	c.mode.Store(whole)
 	prev = c.prev.Load()
 	c.prev.Store(fastcache.New(1024))
 	cs.Reset()
@@ -319,15 +318,7 @@ func (c *Cache) Reset() {
 	updateCacheStatsHistory(&c.csHistory, &cs)
 	curr.Reset()
 	// Reset the mode to `split` in the hope the working set size becomes smaller after the reset.
-	c.setMode(split)
-}
-
-func (c *Cache) setMode(mode int) {
-	atomic.StoreUint32(&c.mode, uint32(mode))
-}
-
-func (c *Cache) loadMode() int {
-	return int(atomic.LoadUint32(&c.mode))
+	c.mode.Store(split)
 }
 
 // UpdateStats updates fcs with cache stats.
@@ -375,7 +366,7 @@ func (c *Cache) Get(dst, key []byte) []byte {
 		// Fast path - the entry is found in the current cache.
 		return result
 	}
-	if c.loadMode() == whole {
+	if c.mode.Load() == whole {
 		// Nothing found.
 		return result
 	}
@@ -398,7 +389,7 @@ func (c *Cache) Has(key []byte) bool {
 	if curr.Has(key) {
 		return true
 	}
-	if c.loadMode() == whole {
+	if c.mode.Load() == whole {
 		return false
 	}
 	prev := c.prev.Load()
@@ -429,7 +420,7 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 		// Fast path - the entry is found in the current cache.
 		return result
 	}
-	if c.loadMode() == whole {
+	if c.mode.Load() == whole {
 		// Nothing found.
 		return result
 	}
@@ -450,9 +441,4 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 func (c *Cache) SetBig(key, value []byte) {
 	curr := c.curr.Load()
 	curr.SetBig(key, value)
-}
-
-func timeJitter(d time.Duration) time.Duration {
-	n := float64(time.Now().UnixNano()%1e9) / 1e9
-	return time.Duration(float64(d) * n)
 }

@@ -5,14 +5,15 @@ import uPlot, {
   Series as uPlotSeries,
 } from "uplot";
 import {
-  getDefaultOptions,
   addSeries,
   delSeries,
+  getAxes,
+  getDefaultOptions,
   getRangeX,
   getRangeY,
   getScales,
   handleDestroy,
-  getAxes,
+  setBand,
   setSelect
 } from "../../../../utils/uplot";
 import { MetricResult } from "../../../../api/types";
@@ -39,6 +40,8 @@ export interface LineChartProps {
   setPeriod: ({ from, to }: { from: Date, to: Date }) => void;
   layoutSize: ElementSize;
   height?: number;
+  anomalyView?: boolean;
+  spanGaps?: boolean;
 }
 
 const LineChart: FC<LineChartProps> = ({
@@ -50,7 +53,9 @@ const LineChart: FC<LineChartProps> = ({
   unit,
   setPeriod,
   layoutSize,
-  height
+  height,
+  anomalyView,
+  spanGaps = false
 }) => {
   const { isDarkTheme } = useAppState();
 
@@ -68,7 +73,7 @@ const LineChart: FC<LineChartProps> = ({
     seriesFocus,
     setCursor,
     resetTooltips
-  } = useLineTooltip({ u: uPlotInst, metrics, series, unit });
+  } = useLineTooltip({ u: uPlotInst, metrics, series, unit, anomalyView });
 
   const options: uPlotOptions = {
     ...getDefaultOptions({ width: layoutSize.width, height }),
@@ -82,6 +87,7 @@ const LineChart: FC<LineChartProps> = ({
       setSelect: [setSelect(setPlotScale)],
       destroy: [handleDestroy],
     },
+    bands: []
   };
 
   useEffect(() => {
@@ -102,9 +108,10 @@ const LineChart: FC<LineChartProps> = ({
   useEffect(() => {
     if (!uPlotInst) return;
     delSeries(uPlotInst);
-    addSeries(uPlotInst, series);
+    addSeries(uPlotInst, series, spanGaps);
+    setBand(uPlotInst, series);
     uPlotInst.redraw();
-  }, [series]);
+  }, [series, spanGaps]);
 
   useEffect(() => {
     if (!uPlotInst) return;

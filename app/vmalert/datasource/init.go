@@ -10,6 +10,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
@@ -37,11 +38,13 @@ var (
 	tlsCAFile             = flag.String("datasource.tlsCAFile", "", `Optional path to TLS CA file to use for verifying connections to -datasource.url. By default, system CA is used`)
 	tlsServerName         = flag.String("datasource.tlsServerName", "", `Optional TLS server name to use for connections to -datasource.url. By default, the server name from -datasource.url is used`)
 
-	oauth2ClientID         = flag.String("datasource.oauth2.clientID", "", "Optional OAuth2 clientID to use for -datasource.url. ")
-	oauth2ClientSecret     = flag.String("datasource.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -datasource.url.")
-	oauth2ClientSecretFile = flag.String("datasource.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -datasource.url. ")
-	oauth2TokenURL         = flag.String("datasource.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -datasource.url.")
-	oauth2Scopes           = flag.String("datasource.oauth2.scopes", "", "Optional OAuth2 scopes to use for -datasource.url. Scopes must be delimited by ';'")
+	oauth2ClientID         = flag.String("datasource.oauth2.clientID", "", "Optional OAuth2 clientID to use for -datasource.url")
+	oauth2ClientSecret     = flag.String("datasource.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -datasource.url")
+	oauth2ClientSecretFile = flag.String("datasource.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -datasource.url")
+	oauth2EndpointParams   = flag.String("datasource.oauth2.endpointParams", "", "Optional OAuth2 endpoint parameters to use for -datasource.url . "+
+		`The endpoint parameters must be set in JSON format: {"param1":"value1",...,"paramN":"valueN"}`)
+	oauth2TokenURL = flag.String("datasource.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -datasource.url")
+	oauth2Scopes   = flag.String("datasource.oauth2.scopes", "", "Optional OAuth2 scopes to use for -datasource.url. Scopes must be delimited by ';'")
 
 	lookBack = flag.Duration("datasource.lookback", 0, `Will be deprecated soon, please adjust "-search.latencyOffset"  at datasource side `+
 		`or specify "latency_offset" in rule group's params. Lookback defines how far into the past to look when evaluating queries. `+
@@ -91,7 +94,7 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 		logger.Warnf("flag `-datasource.lookback` will be deprecated soon. Please use `-rule.evalDelay` command-line flag instead. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5155 for details.")
 	}
 
-	tr, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
+	tr, err := httputils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
@@ -108,10 +111,14 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 		extraParams.Set("round_digits", fmt.Sprintf("%d", *roundDigits))
 	}
 
+	endpointParams, err := flagutil.ParseJSONMap(*oauth2EndpointParams)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse JSON for -datasource.oauth2.endpointParams=%s: %w", *oauth2EndpointParams, err)
+	}
 	authCfg, err := utils.AuthConfig(
 		utils.WithBasicAuth(*basicAuthUsername, *basicAuthPassword, *basicAuthPasswordFile),
 		utils.WithBearer(*bearerToken, *bearerTokenFile),
-		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes),
+		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes, endpointParams),
 		utils.WithHeaders(*headers))
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure auth: %w", err)

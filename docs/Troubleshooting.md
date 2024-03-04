@@ -20,6 +20,7 @@ This document contains troubleshooting guides for most common issues when workin
 - [Slow queries](#slow-queries)
 - [Out of memory errors](#out-of-memory-errors)
 - [Cluster instability](#cluster-instability)
+- [Too much disk space used](#too-much-disk-space-used)
 - [Monitoring](#monitoring)
 
 ## General troubleshooting checklist
@@ -131,7 +132,7 @@ If you see unexpected or unreliable query results from VictoriaMetrics, then try
    of raw unprocessed samples for this query via [/api/v1/export](https://docs.victoriametrics.com/#how-to-export-data-in-json-line-format)
    on the given `[start..end]` time range and check whether they are expected:
 
-   ```console
+   ```sh
    single-node: curl http://victoriametrics:8428/api/v1/export -d 'match[]=http_requests_total' -d 'start=...' -d 'end=...'
    
    cluster: curl http://<vmselect>:8481/select/<tenantID>/prometheus/api/v1/export -d 'match[]=http_requests_total' -d 'start=...' -d 'end=...'
@@ -178,6 +179,9 @@ If you see unexpected or unreliable query results from VictoriaMetrics, then try
    This might work incorrect for irregular data as median will be skewed. In this case it is recommended to switch
    to the static interval for gaps filling by setting `-search.minStalenessInterval=5m` cmd-line flag (`5m` is
    the static interval used by Prometheus).
+
+1. If you observe recently written data is not immediately visible/queryable, then read more about 
+   [query latency](https://docs.victoriametrics.com/keyConcepts.html#query-latency) behavior.
 
 1. Try upgrading to the [latest available version of VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest)
    and verifying whether the issue is fixed there.
@@ -292,6 +296,12 @@ There are the following most commons reasons for slow data ingestion in Victoria
    free CPU and RAM, then increase `-cacheExpireDuration` command-line flag at single-node VictoriaMetrics or at `vmstorage` to the value,
    which exceeds the interval between ingested samples for the same time series (aka `scrape_interval`).
    See [this comment](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3976#issuecomment-1476883183) for more details.
+
+1. If you see constant and abnormally high CPU usage of VictoriaMetrics component, check `CPU spent on GC` panel
+   on the corresponding [Grafana dasbhoard](https://grafana.com/orgs/victoriametrics) in `Resource usage` section. If percentage of CPU time spent on garbage collection
+   is high, then CPU usage of the component can be reduced at the cost of higher memory usage by changing [GOGC](https://tip.golang.org/doc/gc-guide#GOGC) environment variable
+   to higher values. By default VictoriaMetrics components use `GOGC=30`. Try running VictoriaMetrics components with `GOGC=100` and see whether this helps reducing CPU usage.
+   Note that higher `GOGC` values may increase memory usage.
 
 ## Slow queries
 
@@ -430,6 +440,26 @@ have enough free resources for graceful processing of the increased workload.
 See [capacity planning docs](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#capacity-planning)
 and [cluster resizing and scalability docs](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#cluster-resizing-and-scalability)
 for details.
+
+
+## Too much disk space used
+
+If too much disk space is used by a [single-node VictoriaMetrics](https://docs.victoriametrics.com/) or by `vmstorage` component
+at [VictoriaMetrics cluster](https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html), then please check the following:
+
+- Make sure that there are no old snapsots, since they can occupy disk space. See [how to work with snapshots](https://docs.victoriametrics.com/#how-to-work-with-snapshots)
+  and [snapshot troubleshooting](https://docs.victoriametrics.com/#snapshot-troubleshooting).
+
+- Under normal conditions the size of `<-storageDataPath>/indexdb` folder must be smaller than the size of `<-storageDataPath>/data` folder, where `-storageDataPath`
+  is the corresponding command-line flag value. This can be checked by the following query if [VictoriaMetrics monitoring](#monitoring) is properly set up:
+  ```metricsql
+  sum(vm_data_size_bytes{type=~"indexdb/.+"}) without(type)
+    /
+  sum(vm_data_size_bytes{type=~"(storage|indexdb)/.+"}) without(type)
+  ```
+  If this query returns values bigger than 0.5, then it is likely there is a [high churn rate](https://docs.victoriametrics.com/faq/#what-is-high-churn-rate) issue,
+  which results in excess disk space usage for both `indexdb` and `data` folders under `-storageDataPath` folder.
+  The solution is to identify and fix the source of high churn rate with [cardinality explorer](https://docs.victoriametrics.com/#cardinality-explorer).
 
 
 ## Monitoring

@@ -8,6 +8,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 )
 
 var (
@@ -41,11 +42,13 @@ var (
 	tlsServerName = flag.String("remoteWrite.tlsServerName", "", "Optional TLS server name to use for connections to -remoteWrite.url. "+
 		"By default, the server name from -remoteWrite.url is used")
 
-	oauth2ClientID         = flag.String("remoteWrite.oauth2.clientID", "", "Optional OAuth2 clientID to use for -remoteWrite.url.")
-	oauth2ClientSecret     = flag.String("remoteWrite.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -remoteWrite.url.")
-	oauth2ClientSecretFile = flag.String("remoteWrite.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url.")
-	oauth2TokenURL         = flag.String("remoteWrite.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -notifier.url.")
-	oauth2Scopes           = flag.String("remoteWrite.oauth2.scopes", "", "Optional OAuth2 scopes to use for -notifier.url. Scopes must be delimited by ';'.")
+	oauth2ClientID         = flag.String("remoteWrite.oauth2.clientID", "", "Optional OAuth2 clientID to use for -remoteWrite.url")
+	oauth2ClientSecret     = flag.String("remoteWrite.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -remoteWrite.url")
+	oauth2ClientSecretFile = flag.String("remoteWrite.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url")
+	oauth2EndpointParams   = flag.String("remoteWrite.oauth2.endpointParams", "", "Optional OAuth2 endpoint parameters to use for -remoteWrite.url . "+
+		`The endpoint parameters must be set in JSON format: {"param1":"value1",...,"paramN":"valueN"}`)
+	oauth2TokenURL = flag.String("remoteWrite.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -notifier.url.")
+	oauth2Scopes   = flag.String("remoteWrite.oauth2.scopes", "", "Optional OAuth2 scopes to use for -notifier.url. Scopes must be delimited by ';'.")
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -62,15 +65,19 @@ func Init(ctx context.Context) (*Client, error) {
 		return nil, nil
 	}
 
-	t, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
+	t, err := httputils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
+	endpointParams, err := flagutil.ParseJSONMap(*oauth2EndpointParams)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse JSON for -remoteWrite.oauth2.endpointParams=%s: %w", *oauth2EndpointParams, err)
+	}
 	authCfg, err := utils.AuthConfig(
 		utils.WithBasicAuth(*basicAuthUsername, *basicAuthPassword, *basicAuthPasswordFile),
 		utils.WithBearer(*bearerToken, *bearerTokenFile),
-		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes),
+		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes, endpointParams),
 		utils.WithHeaders(*headers))
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure auth: %w", err)

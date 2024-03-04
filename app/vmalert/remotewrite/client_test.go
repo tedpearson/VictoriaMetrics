@@ -91,14 +91,12 @@ func newRWServer() *rwServer {
 }
 
 type rwServer struct {
-	// WARN: ordering of fields is important for alignment!
-	// see https://golang.org/pkg/sync/atomic/#pkg-note-BUG
-	acceptedRows uint64
+	acceptedRows atomic.Uint64
 	*httptest.Server
 }
 
 func (rw *rwServer) accepted() int {
-	return int(atomic.LoadUint64(&rw.acceptedRows))
+	return int(rw.acceptedRows.Load())
 }
 
 func (rw *rwServer) err(w http.ResponseWriter, err error) {
@@ -140,11 +138,11 @@ func (rw *rwServer) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wr := &prompb.WriteRequest{}
-	if err := wr.Unmarshal(b); err != nil {
+	if err := wr.UnmarshalProtobuf(b); err != nil {
 		rw.err(w, fmt.Errorf("unmarhsal err: %w", err))
 		return
 	}
-	atomic.AddUint64(&rw.acceptedRows, uint64(len(wr.Timeseries)))
+	rw.acceptedRows.Add(uint64(len(wr.Timeseries)))
 	w.WriteHeader(http.StatusNoContent)
 }
 

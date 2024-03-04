@@ -2,7 +2,7 @@ import React, { FC, Ref, useCallback, useEffect, useMemo, useRef, useState, JSX 
 import classNames from "classnames";
 import Popper from "../Popper/Popper";
 import "./style.scss";
-import { DoneIcon } from "../Icons";
+import { DoneIcon, RefreshIcon } from "../Icons";
 import useDeviceDetect from "../../../hooks/useDeviceDetect";
 import useBoolean from "../../../hooks/useBoolean";
 import useEventListener from "../../../hooks/useEventListener";
@@ -27,9 +27,11 @@ interface AutocompleteProps {
   disabledFullScreen?: boolean
   offset?: {top: number, left: number}
   maxDisplayResults?: {limit: number, message?: string}
+  loading?: boolean;
   onSelect: (val: string) => void
   onOpenAutocomplete?: (val: boolean) => void
   onFoundOptions?: (val: AutocompleteOptions[]) => void
+  onChangeWrapperRef?: (elementRef: Ref<HTMLDivElement>) => void
 }
 
 enum FocusType {
@@ -50,9 +52,11 @@ const Autocomplete: FC<AutocompleteProps> = ({
   disabledFullScreen,
   offset,
   maxDisplayResults,
+  loading,
   onSelect,
   onOpenAutocomplete,
-  onFoundOptions
+  onFoundOptions,
+  onChangeWrapperRef
 }) => {
   const { isMobile } = useDeviceDetect();
   const wrapperEl = useRef<HTMLDivElement>(null);
@@ -84,6 +88,10 @@ const Autocomplete: FC<AutocompleteProps> = ({
       return [];
     }
   }, [openAutocomplete, options, value]);
+
+  const hideFoundedOptions = useMemo(() => {
+    return foundOptions.length === 1 && foundOptions[0]?.value === value;
+  }, [foundOptions]);
 
   const displayNoOptionsText = useMemo(() => {
     return noOptionsText && !foundOptions.length;
@@ -159,8 +167,12 @@ const Autocomplete: FC<AutocompleteProps> = ({
   }, [openAutocomplete]);
 
   useEffect(() => {
-    onFoundOptions && onFoundOptions(foundOptions);
-  }, [foundOptions]);
+    onFoundOptions && onFoundOptions(hideFoundedOptions ? [] : foundOptions);
+  }, [foundOptions, hideFoundedOptions]);
+
+  useEffect(() => {
+    onChangeWrapperRef && onChangeWrapperRef(wrapperEl);
+  }, [wrapperEl]);
 
   return (
     <Popper
@@ -180,8 +192,9 @@ const Autocomplete: FC<AutocompleteProps> = ({
         })}
         ref={wrapperEl}
       >
+        {loading && <div className="vm-autocomplete__loader"><RefreshIcon/><span>Loading...</span></div>}
         {displayNoOptionsText && <div className="vm-autocomplete__no-options">{noOptionsText}</div>}
-        {!(foundOptions.length === 1 && foundOptions[0]?.value === value) && foundOptions.map((option, i) =>
+        {!hideFoundedOptions && foundOptions.map((option, i) =>
           <div
             className={classNames({
               "vm-list-item": true,

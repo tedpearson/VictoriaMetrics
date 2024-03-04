@@ -20,7 +20,7 @@ func TestTableOpenClose(t *testing.T) {
 	}()
 
 	// Create a new table
-	var isReadOnly uint32
+	var isReadOnly atomic.Bool
 	tb := MustOpenTable(path, nil, nil, &isReadOnly)
 
 	// Close it
@@ -33,6 +33,19 @@ func TestTableOpenClose(t *testing.T) {
 	}
 }
 
+func TestTableAddItemsTooLongItem(t *testing.T) {
+	const path = "TestTableAddItemsTooLongItem"
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+
+	var isReadOnly atomic.Bool
+	tb := MustOpenTable(path, nil, nil, &isReadOnly)
+	tb.AddItems([][]byte{make([]byte, maxInmemoryBlockSize+1)})
+	tb.MustClose()
+	_ = os.RemoveAll(path)
+}
+
 func TestTableAddItemsSerial(t *testing.T) {
 	r := rand.New(rand.NewSource(1))
 	const path = "TestTableAddItemsSerial"
@@ -43,11 +56,11 @@ func TestTableAddItemsSerial(t *testing.T) {
 		_ = os.RemoveAll(path)
 	}()
 
-	var flushes uint64
+	var flushes atomic.Uint64
 	flushCallback := func() {
-		atomic.AddUint64(&flushes, 1)
+		flushes.Add(1)
 	}
-	var isReadOnly uint32
+	var isReadOnly atomic.Bool
 	tb := MustOpenTable(path, flushCallback, nil, &isReadOnly)
 
 	const itemsCount = 10e3
@@ -55,7 +68,7 @@ func TestTableAddItemsSerial(t *testing.T) {
 
 	// Verify items count after pending items flush.
 	tb.DebugFlush()
-	if atomic.LoadUint64(&flushes) == 0 {
+	if flushes.Load() == 0 {
 		t.Fatalf("unexpected zero flushes")
 	}
 
@@ -96,7 +109,7 @@ func TestTableCreateSnapshotAt(t *testing.T) {
 		t.Fatalf("cannot remove %q: %s", path, err)
 	}
 
-	var isReadOnly uint32
+	var isReadOnly atomic.Bool
 	tb := MustOpenTable(path, nil, nil, &isReadOnly)
 
 	// Write a lot of items into the table, so background merges would start.
@@ -113,11 +126,11 @@ func TestTableCreateSnapshotAt(t *testing.T) {
 
 	// Create multiple snapshots.
 	snapshot1 := path + "-test-snapshot1"
-	if err := tb.CreateSnapshotAt(snapshot1, 0); err != nil {
+	if err := tb.CreateSnapshotAt(snapshot1); err != nil {
 		t.Fatalf("cannot create snapshot1: %s", err)
 	}
 	snapshot2 := path + "-test-snapshot2"
-	if err := tb.CreateSnapshotAt(snapshot2, 0); err != nil {
+	if err := tb.CreateSnapshotAt(snapshot2); err != nil {
 		t.Fatalf("cannot create snapshot2: %s", err)
 	}
 
@@ -172,14 +185,14 @@ func TestTableAddItemsConcurrent(t *testing.T) {
 		_ = os.RemoveAll(path)
 	}()
 
-	var flushes uint64
+	var flushes atomic.Uint64
 	flushCallback := func() {
-		atomic.AddUint64(&flushes, 1)
+		flushes.Add(1)
 	}
 	prepareBlock := func(data []byte, items []Item) ([]byte, []Item) {
 		return data, items
 	}
-	var isReadOnly uint32
+	var isReadOnly atomic.Bool
 	tb := MustOpenTable(path, flushCallback, prepareBlock, &isReadOnly)
 
 	const itemsCount = 10e3
@@ -187,7 +200,7 @@ func TestTableAddItemsConcurrent(t *testing.T) {
 
 	// Verify items count after pending items flush.
 	tb.DebugFlush()
-	if atomic.LoadUint64(&flushes) == 0 {
+	if flushes.Load() == 0 {
 		t.Fatalf("unexpected zero flushes")
 	}
 
@@ -241,7 +254,7 @@ func testReopenTable(t *testing.T, path string, itemsCount int) {
 	t.Helper()
 
 	for i := 0; i < 10; i++ {
-		var isReadOnly uint32
+		var isReadOnly atomic.Bool
 		tb := MustOpenTable(path, nil, nil, &isReadOnly)
 		var m TableMetrics
 		tb.UpdateMetrics(&m)

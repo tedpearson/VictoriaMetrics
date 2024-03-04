@@ -11,7 +11,7 @@ import (
 
 	"github.com/golang/snappy"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
 
@@ -30,7 +30,7 @@ func NewDebugClient() (*DebugClient, error) {
 		return nil, nil
 	}
 
-	t, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
+	t, err := httputils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
@@ -49,10 +49,7 @@ func (c *DebugClient) Push(s prompbmarshal.TimeSeries) error {
 	c.wg.Add(1)
 	defer c.wg.Done()
 	wr := &prompbmarshal.WriteRequest{Timeseries: []prompbmarshal.TimeSeries{s}}
-	data, err := wr.Marshal()
-	if err != nil {
-		return fmt.Errorf("failed to marshal the given time series: %w", err)
-	}
+	data := wr.MarshalProtobuf(nil)
 
 	return c.send(data)
 }

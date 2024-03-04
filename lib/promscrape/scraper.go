@@ -24,6 +24,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/ec2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/eureka"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/hetzner"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kuma"
@@ -78,9 +79,9 @@ func Stop() {
 var (
 	globalStopChan chan struct{}
 	scraperWG      sync.WaitGroup
-	// PendingScrapeConfigs - zero value means, that
-	// all scrapeConfigs are inited and ready for work.
-	PendingScrapeConfigs int32
+
+	// PendingScrapeConfigs - zero value means, that all scrapeConfigs are inited and ready for work.
+	PendingScrapeConfigs atomic.Int32
 
 	// configData contains -promscrape.config data
 	configData atomic.Pointer[[]byte]
@@ -133,6 +134,7 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	scs.add("eureka_sd_configs", *eureka.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEurekaSDScrapeWork(swsPrev) })
 	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
 	scs.add("gce_sd_configs", *gce.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
+	scs.add("hetzner_sd_configs", *hetzner.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getHetznerSDScrapeWork(swsPrev) })
 	scs.add("http_sd_configs", *http.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getHTTPDScrapeWork(swsPrev) })
 	scs.add("kubernetes_sd_configs", *kubernetes.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
 	scs.add("kuma_sd_configs", *kuma.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKumaSDScrapeWork(swsPrev) })
@@ -202,7 +204,7 @@ var (
 	configMetricsSet   = metrics.NewSet()
 	configReloads      = configMetricsSet.NewCounter(`vm_promscrape_config_reloads_total`)
 	configReloadErrors = configMetricsSet.NewCounter(`vm_promscrape_config_reloads_errors_total`)
-	configSuccess      = configMetricsSet.NewCounter(`vm_promscrape_config_last_reload_successful`)
+	configSuccess      = configMetricsSet.NewGauge(`vm_promscrape_config_last_reload_successful`, nil)
 	configTimestamp    = configMetricsSet.NewCounter(`vm_promscrape_config_last_reload_success_timestamp_seconds`)
 )
 
@@ -223,7 +225,7 @@ func newScrapeConfigs(pushData func(at *auth.Token, wr *prompbmarshal.WriteReque
 }
 
 func (scs *scrapeConfigs) add(name string, checkInterval time.Duration, getScrapeWork func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork) {
-	atomic.AddInt32(&PendingScrapeConfigs, 1)
+	PendingScrapeConfigs.Add(1)
 	scfg := &scrapeConfig{
 		name:          name,
 		pushData:      scs.pushData,
@@ -290,7 +292,7 @@ func (scfg *scrapeConfig) run(globalStopCh <-chan struct{}) {
 		}
 	}
 	updateScrapeWork(cfg)
-	atomic.AddInt32(&PendingScrapeConfigs, -1)
+	PendingScrapeConfigs.Add(-1)
 
 	for {
 
@@ -408,7 +410,7 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 		sg.scrapersStarted.Inc()
 		sg.wg.Add(1)
 		tsmGlobal.Register(&sc.sw)
-		go func(sw *ScrapeWork) {
+		go func() {
 			defer func() {
 				sg.wg.Done()
 				close(sc.stoppedCh)
@@ -417,7 +419,7 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 			tsmGlobal.Unregister(&sc.sw)
 			sg.activeScrapers.Dec()
 			sg.scrapersStopped.Inc()
-		}(sw)
+		}()
 		key := sw.key()
 		sg.m[key] = sc
 		additionsCount++
@@ -453,7 +455,6 @@ func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *
 	sc.sw.Config = sw
 	sc.sw.ScrapeGroup = group
 	sc.sw.ReadData = c.ReadData
-	sc.sw.GetStreamReader = c.GetStreamReader
 	sc.sw.PushData = pushData
 	return sc, nil
 }

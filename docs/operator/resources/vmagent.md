@@ -73,22 +73,22 @@ In addition to the above selectors, the filtering of objects in a cluster is aff
 
 Following rules are applied:
 
-- If `*NamespaceSelector` and `*Selector` both undefined, then by default select nothing. With option set - `spec.selectAllByDefault: true`, select all objects of given type.
-- If `*NamespaceSelector` defined, `*Selector` undefined, then all objects are matching at namespaces for given `*NamespaceSelector`.
-- If `*NamespaceSelector` undefined, `*Selector` defined, then all objects at `VMAgent`'s namespaces are matching for given `*Selector`.
-- If `*NamespaceSelector` and `*Selector` both defined, then only objects at namespaces matched `*NamespaceSelector` for given `*Selector` are matching.
+- If `...NamespaceSelector` and `...Selector` both undefined, then by default select nothing. With option set - `spec.selectAllByDefault: true`, select all objects of given type.
+- If `...NamespaceSelector` defined, `...Selector` undefined, then all objects are matching at namespaces for given `...NamespaceSelector`.
+- If `...NamespaceSelector` undefined, `...Selector` defined, then all objects at `VMAgent`'s namespaces are matching for given `...Selector`.
+- If `...NamespaceSelector` and `...Selector` both defined, then only objects at namespaces matched `...NamespaceSelector` for given `...Selector` are matching.
 
 Here's a more visual and more detailed view:
 
-| `*NamespaceSelector` | `*Selector` | `selectAllByDefault` | `WATCH_NAMESPACE` | Selected objects                                                                                      |
-|----------------------|-------------|----------------------|-------------------|-------------------------------------------------------------------------------------------------------|
-| undefined            | undefined   | false                | undefined         | nothing                                                                                               |
-| undefined            | undefined   | **true**             | undefined         | all objects of given type (`*`) in the cluster                                                        |
-| **defined**          | undefined   | any                  | undefined         | all objects of given type (`*`) at namespaces for given `*NamespaceSelector`                          |
-| undefined            | **defined** | any                  | undefined         | all objects of given type (`*`) only at `VMAgent`'s namespace are matching for given `Selector        |
-| **defined**          | **defined** | any                  | undefined         | all objects of given type (`*`) only at namespaces matched `*NamespaceSelector` for given `*Selector` |
-| any                  | undefined   | any                  | **defined**       | all objects of given type (`*`) only at `VMAgent`'s namespace                                         |
-| any                  | **defined** | any                  | **defined**       | all objects of given type (`*`) only at `VMAgent`'s namespace for given `*Selector`                   |
+| `...NamespaceSelector` | `...Selector` | `selectAllByDefault` | `WATCH_NAMESPACE` | Selected objects                                                                                            |
+|------------------------|---------------|----------------------|-------------------|-------------------------------------------------------------------------------------------------------------|
+| undefined              | undefined     | false                | undefined         | nothing                                                                                                     |
+| undefined              | undefined     | **true**             | undefined         | all objects of given type (`...`) in the cluster                                                            |
+| **defined**            | undefined     | *any*                | undefined         | all objects of given type (`...`) at namespaces for given `...NamespaceSelector`                            |
+| undefined              | **defined**   | *any*                | undefined         | all objects of given type (`...`) only at `VMAgent`'s namespace are matching for given `Selector            |
+| **defined**            | **defined**   | *any*                | undefined         | all objects of given type (`...`) only at namespaces matched `...NamespaceSelector` for given `...Selector` |
+| *any*                  | undefined     | *any*                | **defined**       | all objects of given type (`...`) only at `VMAgent`'s namespace                                             |
+| *any*                  | **defined**   | *any*                | **defined**       | all objects of given type (`...`) only at `VMAgent`'s namespace for given `...Selector`                     |
 
 More details about `WATCH_NAMESPACE` variable you can read in [this doc](../configuration.md#namespaced-mode).
 
@@ -612,6 +612,47 @@ spec:
 # ...
 ```
 
+## Resource management
+
+You can specify resources for each `VMAgent` resource in the `spec` section of the `VMAgent` CRD.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: vmagent-resources-example
+spec:
+    # ...
+    resources:
+        requests:
+          memory: "64Mi"
+          cpu: "250m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+    # ...
+```
+
+If these parameters are not specified, then, 
+by default all `VMAgent` pods have resource requests and limits from the default values of the following [operator parameters](../configuration.md):
+
+- `VM_VMAGENTDEFAULT_RESOURCE_LIMIT_MEM` - default memory limit for `VMAgent` pods,
+- `VM_VMAGENTDEFAULT_RESOURCE_LIMIT_CPU` - default memory limit for `VMAgent` pods,
+- `VM_VMAGENTDEFAULT_RESOURCE_REQUEST_MEM` - default memory limit for `VMAgent` pods,
+- `VM_VMAGENTDEFAULT_RESOURCE_REQUEST_CPU` - default memory limit for `VMAgent` pods.
+
+These default parameters will be used if:
+
+- `VM_VMAGENTDEFAULT_USEDEFAULTRESOURCES` is set to `true` (default value), 
+- `VMAgent` CR doesn't have `resources` field in `spec` section.
+
+Field `resources` in vmagent spec have higher priority than operator parameters.
+
+If you set `VM_VMAGENTDEFAULT_USEDEFAULTRESOURCES` to `false` and don't specify `resources` in `VMAgent` CRD,
+then `VMAgent` pods will be created without resource requests and limits.
+
+Also, you can specify requests without limits - in this case default values for limits will not be used.
+
 ## Enterprise features
 
 VMAgent supports feature [Kafka integration](https://docs.victoriametrics.com/vmagent.html#kafka-integration)
@@ -713,6 +754,7 @@ spec:
 ## Examples
 
 ```yaml
+apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMAgent
 metadata:
   name: vmagent-example

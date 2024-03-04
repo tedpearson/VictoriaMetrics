@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
@@ -127,7 +128,7 @@ func NewAlertManager(alertManagerURL string, fn AlertURLGenerator, authCfg proma
 	if authCfg.TLSConfig != nil {
 		tls = authCfg.TLSConfig
 	}
-	tr, err := utils.Transport(alertManagerURL, tls.CertFile, tls.KeyFile, tls.CAFile, tls.ServerName, tls.InsecureSkipVerify)
+	tr, err := httputils.Transport(alertManagerURL, tls.CertFile, tls.KeyFile, tls.CAFile, tls.ServerName, tls.InsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
@@ -144,7 +145,7 @@ func NewAlertManager(alertManagerURL string, fn AlertURLGenerator, authCfg proma
 	aCfg, err := utils.AuthConfig(
 		utils.WithBasicAuth(ba.Username, ba.Password.String(), ba.PasswordFile),
 		utils.WithBearer(authCfg.BearerToken.String(), authCfg.BearerTokenFile),
-		utils.WithOAuth(oauth.ClientID, oauth.ClientSecretFile, oauth.ClientSecretFile, oauth.TokenURL, strings.Join(oauth.Scopes, ";")))
+		utils.WithOAuth(oauth.ClientID, oauth.ClientSecretFile, oauth.ClientSecretFile, oauth.TokenURL, strings.Join(oauth.Scopes, ";"), oauth.EndpointParams))
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure auth: %w", err)
 	}

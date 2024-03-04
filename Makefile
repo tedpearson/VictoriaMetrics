@@ -1,6 +1,6 @@
 PKG_PREFIX := github.com/VictoriaMetrics/VictoriaMetrics
 
-MAKE_CONCURRENCY ?= $(shell cat /proc/cpuinfo | grep -c processor)
+MAKE_CONCURRENCY ?= $(shell getconf _NPROCESSORS_ONLN)
 MAKE_PARALLEL := $(MAKE) -j $(MAKE_CONCURRENCY)
 DATEINFO_TAG ?= $(shell date -u +'%Y%m%d-%H%M%S')
 BUILDINFO_TAG ?= $(shell echo $$(git describe --long --all | tr '/' '-')$$( \
@@ -178,7 +178,8 @@ victoria-metrics-crossbuild: \
 	victoria-metrics-darwin-amd64 \
 	victoria-metrics-darwin-arm64 \
 	victoria-metrics-freebsd-amd64 \
-	victoria-metrics-openbsd-amd64
+	victoria-metrics-openbsd-amd64 \
+	victoria-metrics-windows-amd64
 
 vmutils-crossbuild: \
 	vmutils-linux-386 \
@@ -465,7 +466,7 @@ benchmark-pure:
 vendor-update:
 	go get -u -d ./lib/...
 	go get -u -d ./app/...
-	go mod tidy -compat=1.20
+	go mod tidy -compat=1.21
 	go mod vendor
 
 app-local:

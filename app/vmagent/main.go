@@ -8,11 +8,12 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/csvimport"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/datadog"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/datadogsketches"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/datadogv1"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/datadogv2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/native"
@@ -44,10 +45,10 @@ import (
 )
 
 var (
-	httpListenAddr = flag.String("httpListenAddr", ":8429", "TCP address to listen for http connections. "+
+	httpListenAddrs = flagutil.NewArrayString("httpListenAddr", "TCP address to listen for incoming http requests. "+
 		"Set this flag to empty value in order to disable listening on any port. This mode may be useful for running multiple vmagent instances on the same server. "+
 		"Note that /targets and /metrics pages aren't available if -httpListenAddr=''. See also -tls and -httpListenAddr.useProxyProtocol")
-	useProxyProtocol = flag.Bool("httpListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted at -httpListenAddr . "+
+	useProxyProtocol = flagutil.NewArrayBool("httpListenAddr.useProxyProtocol", "Whether to use proxy protocol for connections accepted at the corresponding -httpListenAddr . "+
 		"See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt . "+
 		"With enabled proxy protocol http server cannot serve regular /metrics endpoint. Use -pushmetrics.url for metrics pushing")
 	influxListenAddr = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8089 must be set. Doesn't work if empty. "+
@@ -68,7 +69,8 @@ var (
 		"See also -opentsdbHTTPListenAddr.useProxyProtocol")
 	opentsdbHTTPUseProxyProtocol = flag.Bool("opentsdbHTTPListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted "+
 		"at -opentsdbHTTPListenAddr . See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt")
-	configAuthKey = flag.String("configAuthKey", "", "Authorization key for accessing /config page. It must be passed via authKey query arg")
+	configAuthKey = flagutil.NewPassword("configAuthKey", "Authorization key for accessing /config page. It must be passed via authKey query arg")
+	reloadAuthKey = flagutil.NewPassword("reloadAuthKey", "Auth key for /-/reload http endpoint. It must be passed as authKey=...")
 	dryRun        = flag.Bool("dryRun", false, "Whether to check config files without running vmagent. The following files are checked: "+
 		"-promscrape.config, -remoteWrite.relabelConfig, -remoteWrite.urlRelabelConfig, -remoteWrite.streamAggr.config . "+
 		"Unknown config entries aren't allowed in -promscrape.config by default. This can be changed by passing -promscrape.config.strictParse=false command-line flag")
@@ -95,7 +97,6 @@ func main() {
 	remotewrite.InitSecretFlags()
 	buildinfo.Init()
 	logger.Init()
-	pushmetrics.Init()
 
 	if promscrape.IsDryRun() {
 		if err := promscrape.CheckConfig(); err != nil {
@@ -118,7 +119,11 @@ func main() {
 		return
 	}
 
-	logger.Infof("starting vmagent at %q...", *httpListenAddr)
+	listenAddrs := *httpListenAddrs
+	if len(listenAddrs) == 0 {
+		listenAddrs = []string{":8429"}
+	}
+	logger.Infof("starting vmagent at %q...", listenAddrs)
 	startTime := time.Now()
 	remotewrite.Init()
 	common.StartUnmarshalWorkers()
@@ -141,22 +146,20 @@ func main() {
 
 	promscrape.Init(remotewrite.PushDropSamplesOnFailure)
 
-	if len(*httpListenAddr) > 0 {
-		go httpserver.Serve(*httpListenAddr, *useProxyProtocol, requestHandler)
-	}
+	go httpserver.Serve(listenAddrs, useProxyProtocol, requestHandler)
 	logger.Infof("started vmagent in %.3f seconds", time.Since(startTime).Seconds())
 
+	pushmetrics.Init()
 	sig := procutil.WaitForSigterm()
 	logger.Infof("received signal %s", sig)
+	pushmetrics.Stop()
 
 	startTime = time.Now()
-	if len(*httpListenAddr) > 0 {
-		logger.Infof("gracefully shutting down webservice at %q", *httpListenAddr)
-		if err := httpserver.Stop(*httpListenAddr); err != nil {
-			logger.Fatalf("cannot stop the webservice: %s", err)
-		}
-		logger.Infof("successfully shut down the webservice in %.3f seconds", time.Since(startTime).Seconds())
+	logger.Infof("gracefully shutting down webservice at %q", listenAddrs)
+	if err := httpserver.Stop(listenAddrs); err != nil {
+		logger.Fatalf("cannot stop the webservice: %s", err)
 	}
+	logger.Infof("successfully shut down the webservice in %.3f seconds", time.Since(startTime).Seconds())
 
 	promscrape.Stop()
 
@@ -310,7 +313,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		influxQueryRequests.Inc()
 		influxutils.WriteDatabaseNames(w)
 		return true
-	case "/opentelemetry/api/v1/push":
+	case "/opentelemetry/api/v1/push", "/opentelemetry/v1/metrics":
 		opentelemetryPushRequests.Inc()
 		if err := opentelemetry.InsertHandler(nil, r); err != nil {
 			opentelemetryPushErrors.Inc()
@@ -343,9 +346,20 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
 	case "/datadog/api/v1/series":
-		datadogWriteRequests.Inc()
-		if err := datadog.InsertHandlerForHTTP(nil, r); err != nil {
-			datadogWriteErrors.Inc()
+		datadogv1WriteRequests.Inc()
+		if err := datadogv1.InsertHandlerForHTTP(nil, r); err != nil {
+			datadogv1WriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "/datadog/api/v2/series":
+		datadogv2WriteRequests.Inc()
+		if err := datadogv2.InsertHandlerForHTTP(nil, r); err != nil {
+			datadogv2WriteErrors.Inc()
 			httpserver.Errorf(w, r, "%s", err)
 			return true
 		}
@@ -353,6 +367,15 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "/datadog/api/beta/sketches":
+		datadogsketchesWriteRequests.Inc()
+		if err := datadogsketches.InsertHandlerForHTTP(nil, r); err != nil {
+			datadogsketchesWriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.WriteHeader(202)
 		return true
 	case "/datadog/api/v1/validate":
 		datadogValidateRequests.Inc()
@@ -408,7 +431,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/prometheus/config", "/config":
-		if !httpserver.CheckAuthFlag(w, r, *configAuthKey, "configAuthKey") {
+		if !httpserver.CheckAuthFlag(w, r, configAuthKey.Get(), "configAuthKey") {
 			return true
 		}
 		promscrapeConfigRequests.Inc()
@@ -417,7 +440,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/prometheus/api/v1/status/config", "/api/v1/status/config":
 		// See https://prometheus.io/docs/prometheus/latest/querying/api/#config
-		if !httpserver.CheckAuthFlag(w, r, *configAuthKey, "configAuthKey") {
+		if !httpserver.CheckAuthFlag(w, r, configAuthKey.Get(), "configAuthKey") {
 			return true
 		}
 		promscrapeStatusConfigRequests.Inc()
@@ -427,12 +450,15 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `{"status":"success","data":{"yaml":%q}}`, bb.B)
 		return true
 	case "/prometheus/-/reload", "/-/reload":
+		if !httpserver.CheckAuthFlag(w, r, reloadAuthKey.Get(), "reloadAuthKey") {
+			return true
+		}
 		promscrapeConfigReloadRequests.Inc()
 		procutil.SelfSIGHUP()
 		w.WriteHeader(http.StatusOK)
 		return true
 	case "/ready":
-		if rdy := atomic.LoadInt32(&promscrape.PendingScrapeConfigs); rdy > 0 {
+		if rdy := promscrape.PendingScrapeConfigs.Load(); rdy > 0 {
 			errMsg := fmt.Sprintf("waiting for scrapes to init, left: %d", rdy)
 			http.Error(w, errMsg, http.StatusTooEarly)
 		} else {
@@ -533,7 +559,7 @@ func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path stri
 		influxQueryRequests.Inc()
 		influxutils.WriteDatabaseNames(w)
 		return true
-	case "opentelemetry/api/v1/push":
+	case "opentelemetry/api/v1/push", "opentelemetry/v1/metrics":
 		opentelemetryPushRequests.Inc()
 		if err := opentelemetry.InsertHandler(at, r); err != nil {
 			opentelemetryPushErrors.Inc()
@@ -566,15 +592,34 @@ func processMultitenantRequest(w http.ResponseWriter, r *http.Request, path stri
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
 	case "datadog/api/v1/series":
-		datadogWriteRequests.Inc()
-		if err := datadog.InsertHandlerForHTTP(at, r); err != nil {
-			datadogWriteErrors.Inc()
+		datadogv1WriteRequests.Inc()
+		if err := datadogv1.InsertHandlerForHTTP(at, r); err != nil {
+			datadogv1WriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "datadog/api/v2/series":
+		datadogv2WriteRequests.Inc()
+		if err := datadogv2.InsertHandlerForHTTP(at, r); err != nil {
+			datadogv2WriteErrors.Inc()
 			httpserver.Errorf(w, r, "%s", err)
 			return true
 		}
 		// See https://docs.datadoghq.com/api/latest/metrics/#submit-metrics
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "datadog/api/beta/sketches":
+		datadogsketchesWriteRequests.Inc()
+		if err := datadogsketches.InsertHandlerForHTTP(at, r); err != nil {
+			datadogsketchesWriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.WriteHeader(202)
 		return true
 	case "datadog/api/v1/validate":
 		datadogValidateRequests.Inc()
@@ -626,16 +671,22 @@ var (
 
 	influxQueryRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/influx/query", protocol="influx"}`)
 
-	datadogWriteRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/series", protocol="datadog"}`)
-	datadogWriteErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+	datadogv1WriteRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+	datadogv1WriteErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+
+	datadogv2WriteRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v2/series", protocol="datadog"}`)
+	datadogv2WriteErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/datadog/api/v2/series", protocol="datadog"}`)
+
+	datadogsketchesWriteRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/beta/sketches", protocol="datadog"}`)
+	datadogsketchesWriteErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/datadog/api/beta/sketches", protocol="datadog"}`)
 
 	datadogValidateRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/validate", protocol="datadog"}`)
 	datadogCheckRunRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/check_run", protocol="datadog"}`)
 	datadogIntakeRequests   = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/intake", protocol="datadog"}`)
 	datadogMetadataRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/datadog/api/v1/metadata", protocol="datadog"}`)
 
-	opentelemetryPushRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/opentelemetry/api/v1/push", protocol="opentelemetry"}`)
-	opentelemetryPushErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/opentelemetry/api/v1/push", protocol="opentelemetry"}`)
+	opentelemetryPushRequests = metrics.NewCounter(`vmagent_http_requests_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
+	opentelemetryPushErrors   = metrics.NewCounter(`vmagent_http_request_errors_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
 
 	newrelicWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)
 	newrelicWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)

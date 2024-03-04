@@ -30,6 +30,8 @@ var (
 		"due to time synchronization issues between VictoriaMetrics and data sources. See also -search.disableAutoCacheReset")
 	disableAutoCacheReset = flag.Bool("search.disableAutoCacheReset", false, "Whether to disable automatic response cache reset if a sample with timestamp "+
 		"outside -search.cacheTimestampOffset is inserted into VictoriaMetrics")
+	resetRollupResultCacheOnStartup = flag.Bool("search.resetRollupResultCacheOnStartup", false, "Whether to reset rollup result cache on startup. "+
+		"See https://docs.victoriametrics.com/#rollup-result-cache . See also -search.disableCache")
 )
 
 // ResetRollupResultCacheIfNeeded resets rollup result cache if mrs contains timestamps outside `now - search.cacheTimestampOffset`.
@@ -43,6 +45,11 @@ func ResetRollupResultCacheIfNeeded(mrs []storage.MetricRow) {
 		rollupResultResetMetricRowSample.Store(&storage.MetricRow{})
 		go checkRollupResultCacheReset()
 	})
+	if needRollupResultCacheReset.Load() {
+		// The cache has been already instructed to reset.
+		return
+	}
+
 	minTimestamp := int64(fasttime.UnixTimestamp()*1000) - cacheTimestampOffset.Milliseconds() + checkRollupResultCacheResetInterval.Milliseconds()
 	needCacheReset := false
 	for i := range mrs {
@@ -56,14 +63,14 @@ func ResetRollupResultCacheIfNeeded(mrs []storage.MetricRow) {
 	}
 	if needCacheReset {
 		// Do not call ResetRollupResultCache() here, since it may be heavy when frequently called.
-		atomic.StoreUint32(&needRollupResultCacheReset, 1)
+		needRollupResultCacheReset.Store(true)
 	}
 }
 
 func checkRollupResultCacheReset() {
 	for {
 		time.Sleep(checkRollupResultCacheResetInterval)
-		if atomic.SwapUint32(&needRollupResultCacheReset, 0) > 0 {
+		if needRollupResultCacheReset.Swap(false) {
 			mr := rollupResultResetMetricRowSample.Load()
 			d := int64(fasttime.UnixTimestamp()*1000) - mr.Timestamp - cacheTimestampOffset.Milliseconds()
 			logger.Warnf("resetting rollup result cache because the metric %s has a timestamp older than -search.cacheTimestampOffset=%s by %.3fs",
@@ -75,7 +82,7 @@ func checkRollupResultCacheReset() {
 
 const checkRollupResultCacheResetInterval = 5 * time.Second
 
-var needRollupResultCacheReset uint32
+var needRollupResultCacheReset atomic.Bool
 var checkRollupResultCacheResetOnce sync.Once
 var rollupResultResetMetricRowSample atomic.Pointer[storage.MetricRow]
 
@@ -112,12 +119,17 @@ func InitRollupResultCache(cachePath string) {
 	cacheSize := getRollupResultCacheSize()
 	var c *workingsetcache.Cache
 	if len(rollupResultCachePath) > 0 {
-		logger.Infof("loading rollupResult cache from %q...", rollupResultCachePath)
+		if *resetRollupResultCacheOnStartup {
+			logger.Infof("removing rollupResult cache at %q becasue -search.resetRollupResultCacheOnStartup command-line flag is set", rollupResultCachePath)
+			fs.MustRemoveAll(rollupResultCachePath)
+		} else {
+			logger.Infof("loading rollupResult cache from %q...", rollupResultCachePath)
+		}
 		c = workingsetcache.Load(rollupResultCachePath, cacheSize)
 		mustLoadRollupResultCacheKeyPrefix(rollupResultCachePath)
 	} else {
 		c = workingsetcache.New(cacheSize)
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
+		rollupResultCacheKeyPrefix.Store(newRollupResultCacheKeyPrefix())
 	}
 	if *disableCache {
 		c.Reset()
@@ -199,7 +211,7 @@ var rollupResultCacheResets = metrics.NewCounter(`vm_cache_resets_total{type="pr
 // ResetRollupResultCache resets rollup result cache.
 func ResetRollupResultCache() {
 	rollupResultCacheResets.Inc()
-	atomic.AddUint64(&rollupResultCacheKeyPrefix, 1)
+	rollupResultCacheKeyPrefix.Add(1)
 	logger.Infof("rollupResult cache has been cleared")
 }
 
@@ -426,8 +438,8 @@ func (rrc *rollupResultCache) PutSeries(qt *querytracer.Tracer, ec *EvalConfig, 
 	}
 
 	var key rollupResultCacheKey
-	key.prefix = rollupResultCacheKeyPrefix
-	key.suffix = atomic.AddUint64(&rollupResultCacheKeySuffix, 1)
+	key.prefix = rollupResultCacheKeyPrefix.Load()
+	key.suffix = rollupResultCacheKeySuffix.Add(1)
 
 	bb := bbPool.Get()
 	bb.B = key.Marshal(bb.B[:0])
@@ -443,8 +455,12 @@ func (rrc *rollupResultCache) PutSeries(qt *querytracer.Tracer, ec *EvalConfig, 
 }
 
 var (
-	rollupResultCacheKeyPrefix uint64
-	rollupResultCacheKeySuffix = uint64(time.Now().UnixNano())
+	rollupResultCacheKeyPrefix atomic.Uint64
+	rollupResultCacheKeySuffix = func() *atomic.Uint64 {
+		var x atomic.Uint64
+		x.Store(uint64(time.Now().UnixNano()))
+		return &x
+	}()
 )
 
 func (rrc *rollupResultCache) getSeriesFromCache(qt *querytracer.Tracer, key []byte) ([]*timeseries, bool) {
@@ -505,26 +521,26 @@ func newRollupResultCacheKeyPrefix() uint64 {
 func mustLoadRollupResultCacheKeyPrefix(path string) {
 	path = path + ".key.prefix"
 	if !fs.IsPathExist(path) {
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
+		rollupResultCacheKeyPrefix.Store(newRollupResultCacheKeyPrefix())
 		return
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		logger.Errorf("cannot load %s: %s; reset rollupResult cache", path, err)
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
+		rollupResultCacheKeyPrefix.Store(newRollupResultCacheKeyPrefix())
 		return
 	}
 	if len(data) != 8 {
 		logger.Errorf("unexpected size of %s; want 8 bytes; got %d bytes; reset rollupResult cache", path, len(data))
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
+		rollupResultCacheKeyPrefix.Store(newRollupResultCacheKeyPrefix())
 		return
 	}
-	rollupResultCacheKeyPrefix = encoding.UnmarshalUint64(data)
+	rollupResultCacheKeyPrefix.Store(encoding.UnmarshalUint64(data))
 }
 
 func mustSaveRollupResultCacheKeyPrefix(path string) {
 	path = path + ".key.prefix"
-	data := encoding.MarshalUint64(nil, rollupResultCacheKeyPrefix)
+	data := encoding.MarshalUint64(nil, rollupResultCacheKeyPrefix.Load())
 	fs.MustWriteAtomic(path, data, true)
 }
 
@@ -540,7 +556,7 @@ const (
 
 func marshalRollupResultCacheKeyForSeries(dst []byte, expr metricsql.Expr, window, step int64, etfs [][]storage.TagFilter) []byte {
 	dst = append(dst, rollupResultCacheVersion)
-	dst = encoding.MarshalUint64(dst, rollupResultCacheKeyPrefix)
+	dst = encoding.MarshalUint64(dst, rollupResultCacheKeyPrefix.Load())
 	dst = append(dst, rollupResultCacheTypeSeries)
 	dst = encoding.MarshalInt64(dst, window)
 	dst = encoding.MarshalInt64(dst, step)
@@ -551,7 +567,7 @@ func marshalRollupResultCacheKeyForSeries(dst []byte, expr metricsql.Expr, windo
 
 func marshalRollupResultCacheKeyForInstantValues(dst []byte, expr metricsql.Expr, window, step int64, etfs [][]storage.TagFilter) []byte {
 	dst = append(dst, rollupResultCacheVersion)
-	dst = encoding.MarshalUint64(dst, rollupResultCacheKeyPrefix)
+	dst = encoding.MarshalUint64(dst, rollupResultCacheKeyPrefix.Load())
 	dst = append(dst, rollupResultCacheTypeInstantValues)
 	dst = encoding.MarshalInt64(dst, window)
 	dst = encoding.MarshalInt64(dst, step)

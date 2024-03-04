@@ -6,10 +6,10 @@ import {
   getDurationFromPeriod,
   getTimeperiodForDuration,
   getRelativeTime,
-  setTimezone
+  setTimezone,
+  getBrowserTimezone
 } from "../../utils/time";
 import { getQueryStringValue } from "../../utils/query-string";
-import dayjs from "dayjs";
 import { getFromStorage, saveToStorage } from "../../utils/storage";
 
 export interface TimeState {
@@ -17,6 +17,7 @@ export interface TimeState {
   period: TimeParams;
   relativeTime?: string;
   timezone: string;
+  defaultTimezone?: string;
 }
 
 export type TimeAction =
@@ -26,8 +27,9 @@ export type TimeAction =
   | { type: "RUN_QUERY"}
   | { type: "RUN_QUERY_TO_NOW"}
   | { type: "SET_TIMEZONE", payload: string }
+  | { type: "SET_DEFAULT_TIMEZONE", payload: string }
 
-const timezone = getFromStorage("TIMEZONE") as string || dayjs.tz.guess();
+const timezone = getFromStorage("TIMEZONE") as string || getBrowserTimezone().region;
 setTimezone(timezone);
 
 const defaultDuration = getQueryStringValue("g0.range_input") as string;
@@ -90,9 +92,15 @@ export function reducer(state: TimeState, action: TimeAction): TimeState {
     case "SET_TIMEZONE":
       setTimezone(action.payload);
       saveToStorage("TIMEZONE", action.payload);
+      if (state.defaultTimezone) saveToStorage("DISABLED_DEFAULT_TIMEZONE", action.payload !== state.defaultTimezone);
       return {
         ...state,
         timezone: action.payload
+      };
+    case "SET_DEFAULT_TIMEZONE":
+      return {
+        ...state,
+        defaultTimezone: action.payload
       };
     default:
       throw new Error();

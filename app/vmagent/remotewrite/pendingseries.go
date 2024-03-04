@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding/zstd"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -15,6 +16,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/golang/snappy"
 )
@@ -69,7 +71,8 @@ func (ps *pendingSeries) periodicFlusher() {
 	if flushSeconds <= 0 {
 		flushSeconds = 1
 	}
-	ticker := time.NewTicker(*flushInterval)
+	d := timeutil.AddJitterToDuration(*flushInterval)
+	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	for {
 		select {
@@ -79,7 +82,7 @@ func (ps *pendingSeries) periodicFlusher() {
 			ps.mu.Unlock()
 			return
 		case <-ticker.C:
-			if fasttime.UnixTimestamp()-atomic.LoadUint64(&ps.wr.lastFlushTime) < uint64(flushSeconds) {
+			if fasttime.UnixTimestamp()-ps.wr.lastFlushTime.Load() < uint64(flushSeconds) {
 				continue
 			}
 		}
@@ -90,8 +93,7 @@ func (ps *pendingSeries) periodicFlusher() {
 }
 
 type writeRequest struct {
-	// Move lastFlushTime to the top of the struct in order to guarantee atomic access on 32-bit architectures.
-	lastFlushTime uint64
+	lastFlushTime atomic.Uint64
 
 	// The queue to send blocks to.
 	fq *persistentqueue.FastQueue
@@ -107,11 +109,12 @@ type writeRequest struct {
 
 	wr prompbmarshal.WriteRequest
 
-	tss []prompbmarshal.TimeSeries
-
+	tss     []prompbmarshal.TimeSeries
 	labels  []prompbmarshal.Label
 	samples []prompbmarshal.Sample
-	buf     []byte
+
+	// buf holds labels data
+	buf []byte
 }
 
 func (wr *writeRequest) reset() {
@@ -151,7 +154,7 @@ func (wr *writeRequest) mustWriteBlock(block []byte) bool {
 
 func (wr *writeRequest) tryFlush() bool {
 	wr.wr.Timeseries = wr.tss
-	atomic.StoreUint64(&wr.lastFlushTime, fasttime.UnixTimestamp())
+	wr.lastFlushTime.Store(fasttime.UnixTimestamp())
 	if !tryPushWriteRequest(&wr.wr, wr.fq.TryWriteBlock, wr.isVMRemoteWrite) {
 		return false
 	}
@@ -222,33 +225,45 @@ func (wr *writeRequest) copyTimeSeries(dst, src *prompbmarshal.TimeSeries) {
 	wr.buf = buf
 }
 
+// marshalConcurrency limits the maximum number of concurrent workers, which marshal and compress WriteRequest.
+var marshalConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
+
 func tryPushWriteRequest(wr *prompbmarshal.WriteRequest, tryPushBlock func(block []byte) bool, isVMRemoteWrite bool) bool {
 	if len(wr.Timeseries) == 0 {
 		// Nothing to push
 		return true
 	}
+
+	marshalConcurrencyCh <- struct{}{}
+
 	bb := writeRequestBufPool.Get()
-	bb.B = prompbmarshal.MarshalWriteRequest(bb.B[:0], wr)
+	bb.B = wr.MarshalProtobuf(bb.B[:0])
 	if len(bb.B) <= maxUnpackedBlockSize.IntN() {
-		zb := snappyBufPool.Get()
+		zb := compressBufPool.Get()
 		if isVMRemoteWrite {
 			zb.B = zstd.CompressLevel(zb.B[:0], bb.B, *vmProtoCompressLevel)
 		} else {
 			zb.B = snappy.Encode(zb.B[:cap(zb.B)], bb.B)
 		}
 		writeRequestBufPool.Put(bb)
+
+		<-marshalConcurrencyCh
+
 		if len(zb.B) <= persistentqueue.MaxBlockSize {
-			if !tryPushBlock(zb.B) {
-				return false
+			zbLen := len(zb.B)
+			ok := tryPushBlock(zb.B)
+			compressBufPool.Put(zb)
+			if ok {
+				blockSizeRows.Update(float64(len(wr.Timeseries)))
+				blockSizeBytes.Update(float64(zbLen))
 			}
-			blockSizeRows.Update(float64(len(wr.Timeseries)))
-			blockSizeBytes.Update(float64(len(zb.B)))
-			snappyBufPool.Put(zb)
-			return true
+			return ok
 		}
-		snappyBufPool.Put(zb)
+		compressBufPool.Put(zb)
 	} else {
 		writeRequestBufPool.Put(bb)
+
+		<-marshalConcurrencyCh
 	}
 
 	// Too big block. Recursively split it into smaller parts if possible.
@@ -294,5 +309,7 @@ var (
 	blockSizeRows  = metrics.NewHistogram(`vmagent_remotewrite_block_size_rows`)
 )
 
-var writeRequestBufPool bytesutil.ByteBufferPool
-var snappyBufPool bytesutil.ByteBufferPool
+var (
+	writeRequestBufPool bytesutil.ByteBufferPool
+	compressBufPool     bytesutil.ByteBufferPool
+)

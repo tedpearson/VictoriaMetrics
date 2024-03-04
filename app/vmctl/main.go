@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native/stream"
 )
@@ -48,8 +50,20 @@ func main() {
 				Action: func(c *cli.Context) error {
 					fmt.Println("OpenTSDB import mode")
 
+					// create Transport with given TLS config
+					certFile := c.String(otsdbCertFile)
+					keyFile := c.String(otsdbKeyFile)
+					caFile := c.String(otsdbCAFile)
+					serverName := c.String(otsdbServerName)
+					insecureSkipVerify := c.Bool(otsdbInsecureSkipVerify)
+					addr := c.String(otsdbAddr)
+
+					tr, err := httputils.Transport(addr, certFile, caFile, keyFile, serverName, insecureSkipVerify)
+					if err != nil {
+						return fmt.Errorf("failed to create Transport: %s", err)
+					}
 					oCfg := opentsdb.Config{
-						Addr:       c.String(otsdbAddr),
+						Addr:       addr,
 						Limit:      c.Int(otsdbQueryLimit),
 						Offset:     c.Int64(otsdbOffsetDays),
 						HardTS:     c.Int64(otsdbHardTSStart),
@@ -57,6 +71,7 @@ func main() {
 						Filters:    c.StringSlice(otsdbFilters),
 						Normalize:  c.Bool(otsdbNormalize),
 						MsecsTime:  c.Bool(otsdbMsecsTime),
+						Transport:  tr,
 					}
 					otsdbClient, err := opentsdb.NewClient(oCfg)
 					if err != nil {
@@ -83,6 +98,18 @@ func main() {
 				Action: func(c *cli.Context) error {
 					fmt.Println("InfluxDB import mode")
 
+					// create TLS config
+					certFile := c.String(influxCertFile)
+					keyFile := c.String(influxKeyFile)
+					caFile := c.String(influxCAFile)
+					serverName := c.String(influxServerName)
+					insecureSkipVerify := c.Bool(influxInsecureSkipVerify)
+
+					tc, err := httputils.TLSConfig(certFile, caFile, keyFile, serverName, insecureSkipVerify)
+					if err != nil {
+						return fmt.Errorf("failed to create TLS Config: %s", err)
+					}
+
 					iCfg := influx.Config{
 						Addr:      c.String(influxAddr),
 						Username:  c.String(influxUser),
@@ -95,7 +122,9 @@ func main() {
 							TimeEnd:   c.String(influxFilterTimeEnd),
 						},
 						ChunkSize: c.Int(influxChunkSize),
+						TLSConfig: tc,
 					}
+
 					influxClient, err := influx.NewClient(iCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create influx client: %s", err)
@@ -133,6 +162,10 @@ func main() {
 						Headers:            c.String(remoteReadHeaders),
 						LabelName:          c.String(remoteReadFilterLabel),
 						LabelValue:         c.String(remoteReadFilterLabelValue),
+						CertFile:           c.String(remoteReadCertFile),
+						KeyFile:            c.String(remoteReadKeyFile),
+						CAFile:             c.String(remoteReadCAFile),
+						ServerName:         c.String(remoteReadServerName),
 						InsecureSkipVerify: c.Bool(remoteReadInsecureSkipVerify),
 						DisablePathAppend:  c.Bool(remoteReadDisablePathAppend),
 					})
@@ -212,6 +245,7 @@ func main() {
 
 					var srcExtraLabels []string
 					srcAddr := strings.Trim(c.String(vmNativeSrcAddr), "/")
+					srcInsecureSkipVerify := c.Bool(vmNativeSrcInsecureSkipVerify)
 					srcAuthConfig, err := auth.Generate(
 						auth.WithBasicAuth(c.String(vmNativeSrcUser), c.String(vmNativeSrcPassword)),
 						auth.WithBearer(c.String(vmNativeSrcBearerToken)),
@@ -219,10 +253,16 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("error initilize auth config for source: %s", srcAddr)
 					}
-					srcHTTPClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: disableKeepAlive}}
+					srcHTTPClient := &http.Client{Transport: &http.Transport{
+						DisableKeepAlives: disableKeepAlive,
+						TLSClientConfig: &tls.Config{
+							InsecureSkipVerify: srcInsecureSkipVerify,
+						},
+					}}
 
 					dstAddr := strings.Trim(c.String(vmNativeDstAddr), "/")
 					dstExtraLabels := c.StringSlice(vmExtraLabel)
+					dstInsecureSkipVerify := c.Bool(vmNativeDstInsecureSkipVerify)
 					dstAuthConfig, err := auth.Generate(
 						auth.WithBasicAuth(c.String(vmNativeDstUser), c.String(vmNativeDstPassword)),
 						auth.WithBearer(c.String(vmNativeDstBearerToken)),
@@ -230,7 +270,12 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("error initilize auth config for destination: %s", dstAddr)
 					}
-					dstHTTPClient := &http.Client{Transport: &http.Transport{DisableKeepAlives: disableKeepAlive}}
+					dstHTTPClient := &http.Client{Transport: &http.Transport{
+						DisableKeepAlives: disableKeepAlive,
+						TLSClientConfig: &tls.Config{
+							InsecureSkipVerify: dstInsecureSkipVerify,
+						},
+					}}
 
 					p := vmNativeProcessor{
 						rateLimit:    c.Int64(vmRateLimit),
@@ -254,11 +299,11 @@ func main() {
 							ExtraLabels: dstExtraLabels,
 							HTTPClient:  dstHTTPClient,
 						},
-						backoff:        backoff.New(),
-						cc:             c.Int(vmConcurrency),
-						disableRetries: c.Bool(vmNativeDisableRetries),
-						isSilent:       c.Bool(globalSilent),
-						isNative:       !c.Bool(vmNativeDisableBinaryProtocol),
+						backoff:                  backoff.New(),
+						cc:                       c.Int(vmConcurrency),
+						disablePerMetricRequests: c.Bool(vmNativeDisablePerMetricMigration),
+						isSilent:                 c.Bool(globalSilent),
+						isNative:                 !c.Bool(vmNativeDisableBinaryProtocol),
 					}
 					return p.run(ctx)
 				},
@@ -285,14 +330,14 @@ func main() {
 					if err != nil {
 						return cli.Exit(fmt.Errorf("cannot open exported block at path=%q err=%w", blockPath, err), 1)
 					}
-					var blocksCount uint64
+					var blocksCount atomic.Uint64
 					if err := stream.Parse(f, isBlockGzipped, func(block *stream.Block) error {
-						atomic.AddUint64(&blocksCount, 1)
+						blocksCount.Add(1)
 						return nil
 					}); err != nil {
-						return cli.Exit(fmt.Errorf("cannot parse block at path=%q, blocksCount=%d, err=%w", blockPath, blocksCount, err), 1)
+						return cli.Exit(fmt.Errorf("cannot parse block at path=%q, blocksCount=%d, err=%w", blockPath, blocksCount.Load(), err), 1)
 					}
-					log.Printf("successfully verified block at path=%q, blockCount=%d", blockPath, blocksCount)
+					log.Printf("successfully verified block at path=%q, blockCount=%d", blockPath, blocksCount.Load())
 					return nil
 				},
 			},

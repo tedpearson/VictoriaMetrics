@@ -11,9 +11,6 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
-	"github.com/VictoriaMetrics/fasthttp"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -52,30 +49,6 @@ var (
 	stdDialerOnce sync.Once
 )
 
-func newStatDialFunc(proxyURL *proxy.URL, ac *promauth.Config) (fasthttp.DialFunc, error) {
-	dialFunc, err := proxyURL.NewDialFunc(ac)
-	if err != nil {
-		return nil, err
-	}
-	statDialFunc := func(addr string) (net.Conn, error) {
-		conn, err := dialFunc(addr)
-		dialsTotal.Inc()
-		if err != nil {
-			dialErrors.Inc()
-			if !netutil.TCP6Enabled() && !isTCPv4Addr(addr) {
-				err = fmt.Errorf("%w; try -enableTCP6 command-line flag if you scrape ipv6 addresses", err)
-			}
-			return nil, err
-		}
-		conns.Inc()
-		sc := &statConn{
-			Conn: conn,
-		}
-		return sc, nil
-	}
-	return statDialFunc, nil
-}
-
 var (
 	dialsTotal = metrics.NewCounter(`vm_promscrape_dials_total`)
 	dialErrors = metrics.NewCounter(`vm_promscrape_dial_errors_total`)
@@ -83,7 +56,7 @@ var (
 )
 
 type statConn struct {
-	closed uint64
+	closed atomic.Int32
 	net.Conn
 }
 
@@ -109,7 +82,7 @@ func (sc *statConn) Write(p []byte) (int, error) {
 
 func (sc *statConn) Close() error {
 	err := sc.Conn.Close()
-	if atomic.AddUint64(&sc.closed, 1) == 1 {
+	if sc.closed.Add(1) == 1 {
 		conns.Dec()
 	}
 	return err

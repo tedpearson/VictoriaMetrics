@@ -59,8 +59,8 @@ absolute path to all .tpl files in root.
 	configCheckInterval = flag.Duration("configCheckInterval", 0, "Interval for checking for changes in '-rule' or '-notifier.config' files. "+
 		"By default, the checking is disabled. Send SIGHUP signal in order to force config check for changes.")
 
-	httpListenAddr   = flag.String("httpListenAddr", ":8880", "Address to listen for http connections. See also -tls and -httpListenAddr.useProxyProtocol")
-	useProxyProtocol = flag.Bool("httpListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted at -httpListenAddr . "+
+	httpListenAddrs  = flagutil.NewArrayString("httpListenAddr", "Address to listen for incoming http requests. See also -tls and -httpListenAddr.useProxyProtocol")
+	useProxyProtocol = flagutil.NewArrayBool("httpListenAddr.useProxyProtocol", "Whether to use proxy protocol for connections accepted at the corresponding -httpListenAddr . "+
 		"See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt . "+
 		"With enabled proxy protocol http server cannot serve regular /metrics endpoint. Use -pushmetrics.url for metrics pushing")
 	evaluationInterval = flag.Duration("evaluationInterval", time.Minute, "How often to evaluate the rules")
@@ -96,7 +96,6 @@ func main() {
 	notifier.InitSecretFlags()
 	buildinfo.Init()
 	logger.Init()
-	pushmetrics.Init()
 
 	if !*remoteReadIgnoreRestoreErrors {
 		logger.Warnf("flag `remoteRead.ignoreRestoreErrors` is deprecated and will be removed in next releases.")
@@ -118,9 +117,9 @@ func main() {
 		return
 	}
 
-	eu, err := getExternalURL(*externalURL, *httpListenAddr, httpserver.IsTLS())
+	eu, err := getExternalURL(*externalURL)
 	if err != nil {
-		logger.Fatalf("failed to init `external.url`: %s", err)
+		logger.Fatalf("failed to init `-external.url`: %s", err)
 	}
 
 	alertURLGeneratorFn, err = getAlertURLGenerator(eu, *externalAlertSource, *validateTemplates)
@@ -179,12 +178,19 @@ func main() {
 
 	go configReload(ctx, manager, groupsCfg, sighupCh)
 
+	listenAddrs := *httpListenAddrs
+	if len(listenAddrs) == 0 {
+		listenAddrs = []string{":8880"}
+	}
 	rh := &requestHandler{m: manager}
-	go httpserver.Serve(*httpListenAddr, *useProxyProtocol, rh.handler)
+	go httpserver.Serve(listenAddrs, useProxyProtocol, rh.handler)
 
+	pushmetrics.Init()
 	sig := procutil.WaitForSigterm()
 	logger.Infof("service received signal %s", sig)
-	if err := httpserver.Stop(*httpListenAddr); err != nil {
+	pushmetrics.Stop()
+
+	if err := httpserver.Stop(listenAddrs); err != nil {
 		logger.Fatalf("cannot stop the webservice: %s", err)
 	}
 	cancel()
@@ -194,7 +200,7 @@ func main() {
 var (
 	configReloads      = metrics.NewCounter(`vmalert_config_last_reload_total`)
 	configReloadErrors = metrics.NewCounter(`vmalert_config_last_reload_errors_total`)
-	configSuccess      = metrics.NewCounter(`vmalert_config_last_reload_successful`)
+	configSuccess      = metrics.NewGauge(`vmalert_config_last_reload_successful`, nil)
 	configTimestamp    = metrics.NewCounter(`vmalert_config_last_reload_success_timestamp_seconds`)
 )
 
@@ -243,16 +249,34 @@ func newManager(ctx context.Context) (*manager, error) {
 	return manager, nil
 }
 
-func getExternalURL(externalURL, httpListenAddr string, isSecure bool) (*url.URL, error) {
-	if externalURL != "" {
-		return url.Parse(externalURL)
+func getExternalURL(customURL string) (*url.URL, error) {
+	if customURL == "" {
+		// use local hostname as external URL
+		listenAddr := ":8880"
+		if len(*httpListenAddrs) > 0 {
+			listenAddr = (*httpListenAddrs)[0]
+		}
+		isTLS := httpserver.IsTLS(0)
+
+		return getHostnameAsExternalURL(listenAddr, isTLS)
 	}
-	hname, err := os.Hostname()
+	u, err := url.Parse(customURL)
 	if err != nil {
 		return nil, err
 	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("invalid scheme %q in url %q, only 'http' and 'https' are supported", u.Scheme, u.String())
+	}
+	return u, nil
+}
+
+func getHostnameAsExternalURL(addr string, isSecure bool) (*url.URL, error) {
+	hname, err := os.Hostname()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get hostname: %w", err)
+	}
 	port := ""
-	if ipport := strings.Split(httpListenAddr, ":"); len(ipport) > 1 {
+	if ipport := strings.Split(addr, ":"); len(ipport) > 1 {
 		port = ":" + ipport[1]
 	}
 	schema := "http://"

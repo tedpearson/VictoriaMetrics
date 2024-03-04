@@ -25,7 +25,7 @@ When there are two or more configured replicas the Operator runs the Alertmanage
 
 ## Specification
 
-You can see the full actual specification of the `VMAlertmanager` resource in the **[API docs -> VMAlert](../api.md#vmalertmanager)**.
+You can see the full actual specification of the `VMAlertmanager` resource in the **[API docs -> VMAlertManager](../api.md#vmalertmanager)**.
 
 If you can't find necessary field in the specification of the custom resource,
 see [Extra arguments section](./README.md#extra-arguments).
@@ -114,6 +114,7 @@ For selecting rules from all namespaces you must specify it to empty value:
 
 ```yaml
 spec:
+  configSelector: {}
   configNamespaceSelector: {}
 ```
 
@@ -131,7 +132,7 @@ Following rules are applied:
 
 - If `configNamespaceSelector` and `configSelector` both undefined, then by default select nothing. With option set - `spec.selectAllByDefault: true`, select all vmalertmanagerconfigs.
 - If `configNamespaceSelector` defined, `configSelector` undefined, then all vmalertmaangerconfigs are matching at namespaces for given `configNamespaceSelector`.
-- If `configNamespaceSelector` undefined, `configSelector` defined, then all vmalertmaangerconfigs at `VMAgent`'s namespaces are matching for given `configSelector`.
+- If `configNamespaceSelector` undefined, `configSelector` defined, then all vmalertmaangerconfigs at `VMAlertmanager`'s namespaces are matching for given `configSelector`.
 - If `configNamespaceSelector` and `configSelector` both defined, then only vmalertmaangerconfigs at namespaces matched `configNamespaceSelector` for given `configSelector` are matching.
 
 Here's a more visual and more detailed view:
@@ -140,11 +141,11 @@ Here's a more visual and more detailed view:
 |---------------------------|------------------|----------------------|-------------------|------------------------------------------------------------------------------------------------------------------------|
 | undefined                 | undefined        | false                | undefined         | nothing                                                                                                                |
 | undefined                 | undefined        | **true**             | undefined         | all vmalertmaangerconfigs in the cluster                                                                               |
-| **defined**               | undefined        | any                  | undefined         | all vmalertmaangerconfigs are matching at namespaces for given `configNamespaceSelector`                               |
-| undefined                 | **defined**      | any                  | undefined         | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace are matching for given `ruleSelector`                   |
-| **defined**               | **defined**      | any                  | undefined         | all vmalertmaangerconfigs only at namespaces matched `configNamespaceSelector` for given `configSelector` are matching |
-| any                       | undefined        | any                  | **defined**       | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace                                                         |
-| any                       | **defined**      | any                  | **defined**       | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace for given `configSelector` are matching                 |
+| **defined**               | undefined        | *any*                | undefined         | all vmalertmaangerconfigs are matching at namespaces for given `configNamespaceSelector`                               |
+| undefined                 | **defined**      | *any*                | undefined         | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace are matching for given `ruleSelector`                   |
+| **defined**               | **defined**      | *any*                | undefined         | all vmalertmaangerconfigs only at namespaces matched `configNamespaceSelector` for given `configSelector` are matching |
+| *any*                     | undefined        | *any*                | **defined**       | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace                                                         |
+| *any*                     | **defined**      | *any*                | **defined**       | all vmalertmaangerconfigs only at `VMAlertmanager`'s namespace for given `configSelector` are matching                 |
 
 More details about `WATCH_NAMESPACE` variable you can read in [this doc](../configuration.md#namespaced-mode).
 
@@ -180,7 +181,6 @@ spec:
 
 - `spec.templates` - list of keys in `ConfigMaps`, that contains template files for `alertmanager`, e.g.:
 
-  {% raw %}
   ```yaml
   apiVersion: operator.victoriametrics.com/v1beta1
   kind: VMAlertmanager
@@ -189,10 +189,10 @@ spec:
   spec:
     replicaCount: 2
     templates:
-      - Name: alertmanager-templates
-        Key: my-template-1.tmpl
-      - Name: alertmanager-templates
-        Key: my-template-2.tmpl
+      - name: alertmanager-templates
+        key: my-template-1.tmpl
+      - name: alertmanager-templates
+        key: my-template-2.tmpl
   ---
   apiVersion: v1
   kind: ConfigMap
@@ -205,7 +205,6 @@ spec:
           {{- end }}
       my-template-2.tmpl: """
   ```
-  {% endraw %}
 
 These templates will be automatically added to `VMAlertmanager` configuration and will be automatically reloaded on changes in source `ConfigMap`.
 - `spec.configMaps` - list of `ConfigMap` names (in the same namespace) that will be mounted at `VMAlertmanager`
@@ -259,6 +258,47 @@ spec:
     - name: my-repo-secret
 # ...
 ```
+
+## Resource management
+
+You can specify resources for each `VMAlertManager` resource in the `spec` section of the `VMAlertManager` CRD.
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertManager
+metadata:
+  name: vmalertmanager-resources-example
+spec:
+    # ...
+    resources:
+        requests:
+          memory: "64Mi"
+          cpu: "250m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+    # ...
+```
+
+If these parameters are not specified, then,
+by default all `VMAlertManager` pods have resource requests and limits from the default values of the following [operator parameters](../configuration.md):
+
+- `VM_VMALERTMANAGER_RESOURCE_LIMIT_MEM` - default memory limit for `VMAlertManager` pods,
+- `VM_VMALERTMANAGER_RESOURCE_LIMIT_CPU` - default memory limit for `VMAlertManager` pods,
+- `VM_VMALERTMANAGER_RESOURCE_REQUEST_MEM` - default memory limit for `VMAlertManager` pods,
+- `VM_VMALERTMANAGER_RESOURCE_REQUEST_CPU` - default memory limit for `VMAlertManager` pods.
+
+These default parameters will be used if:
+
+- `VM_VMALERTMANAGER_USEDEFAULTRESOURCES` is set to `true` (default value),
+- `VMAlertManager` CR doesn't have `resources` field in `spec` section.
+
+Field `resources` in `VMAlertManager` spec have higher priority than operator parameters.
+
+If you set `VM_VMALERTMANAGER_USEDEFAULTRESOURCES` to `false` and don't specify `resources` in `VMAlertManager` CRD,
+then `VMAlertManager` pods will be created without resource requests and limits.
+
+Also, you can specify requests without limits - in this case default values for limits will not be used.
 
 ## Examples
 

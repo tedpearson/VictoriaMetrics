@@ -32,14 +32,17 @@ where you can chat with VictoriaMetrics users to get additional references, revi
   - [Idealo.de](#idealode)
   - [MHI Vestas Offshore Wind](#mhi-vestas-offshore-wind)
   - [Naver](#naver)
+  - [NetEase Cloud Music](#netease-cloud-music)
   - [Percona](#percona)
   - [Razorpay](#razorpay)
+  - [RELEX Solutions](#relex-solutions)
   - [Roblox](#roblox)
   - [Sensedia](#sensedia)
   - [Smarkets](#smarkets)
   - [Synthesio](#synthesio)
   - [Wedos.com](#wedoscom)
   - [Wix.com](#wixcom)
+  - [Xiaohongshu](#xiaohongshu)
   - [Zerodha](#zerodha)
   - [zhihu](#zhihu)
 
@@ -407,6 +410,19 @@ fueling their greater growth around the world.
 
 See [this video](https://www.youtube.com/watch?v=OUyXPgVcdw4) and [these slides](https://deview.kr/data/deview/session/attach/%5B2B4%5DVictoriaMetrics_%E1%84%89%E1%85%B5%E1%84%80%E1%85%A8%E1%84%8B%E1%85%A7%E1%86%AF_%E1%84%83%E1%85%A6%E1%84%8B%E1%85%B5%E1%84%90%E1%85%A5_%E1%84%83%E1%85%A2%E1%84%92%E1%85%A9%E1%86%AB%E1%84%83%E1%85%A9%E1%86%AB%E1%84%8B%E1%85%B4_%E1%84%86%E1%85%A5%E1%86%AF%E1%84%90%E1%85%B5%E1%84%87%E1%85%A5%E1%84%89%E1%85%B3_Kor+Eng.pdf) on why and how Naver uses VictoriaMetrics.
 
+## NetEase Cloud Music
+
+[NetEase Cloud Music](https://music.163.com/) is a Chinese freemium music streaming service developed and owned by [NetEase, Inc](https://en.wikipedia.org/wiki/NetEase). It is one of the biggest competitors in the Chinese music streaming business, primarily competing with [Tencent](https://en.wikipedia.org/wiki/Tencent)'s QQ Music.
+
+The huge scale of services and the diverse monitoring requirements bring great challenges to timeseries database’s reliability, availability, and performance. With year’s evolution, we finally build a metrics system around VictoriaMetrics, aiming to solve following problems:
+* Weak observability on application layer: in the past, internal monitoring of the product mainly focused on machine level. Although it also provided monitoring plugins for common frameworks, there was still room for improvement in both performance and visualization effects.
+* Linking metrics to trace: metrics are the most intuitive way to discover problems, such as "getting 10 failed http requests in the past 30s", but sometimes traces are also needed to locate the root cause of the errors.
+* Performance and cost: storage cost of the old metric system is relatively high, since prometheus as a standalone application cannot support large scale of data.
+* aggregate queries: aggregate queries are often needed and could take several seconds or even tens of seconds, slowing down troubleshooting process seriously.
+* Weak visualization capabilities: monitoring data are often used in YoY comparison and multi-instance comparison to help locate problems. Neither Prometheus UI nor Grafana supports this feature.
+ 
+See [this article](https://juejin.cn/post/7322268449409744931) for details on how NetEase Cloud Music build a metrics system base on VictoriaMetrics and give solutions to above problems.
+
 ## Percona
 
 [Percona](https://www.percona.com/) is a leader in providing best-of-breed enterprise-class support, consulting, managed services, training and software for MySQL®, MariaDB®, MongoDB®, PostgreSQL® and other open source databases in on-premises and cloud environments.
@@ -433,6 +449,33 @@ Percona migrated from Prometheus to VictoriaMetrics in the [Percona Monitoring a
 > - Successfully ran some of the worst Grafana dashboards/queries that have historically failed to run.
 
 See [the full article](https://engineering.razorpay.com/scaling-to-trillions-of-metric-data-points-f569a5b654f2).
+
+## RELEX Solutions
+
+[RELEX Solutions](https://www.relexsolutions.com/), a global software company from Finland, is the market-leading supply chain and retail planning platform.
+
+VictoriaMetrics is used as the central metrics storage for timeseries about applications and machines hosted both in the public cloud and in the private cloud. Metrics are remote-written by Prometheus, the OpenTelemetry collector and sometimes directly by custom Prometheus exporters. 
+
+Alerts are evaluated on vmalert when necessary, either because metrics from multiple sources are needed or because the source is Prometheus in agent mode (mostly for kubernetes clusters). Prometheus Alertmanager and Grafana+Promxy combine all sources together so that the end users of dashboards (and ideally the recipients of alert notifications) don't have to worry where to look for some information.
+
+VictoriaMetrics has allowed us to extend data retention for our metrics effortlessly, while Prometheus tsdb would have required us to manage ever bigger disks or to plan aggregation and downsampling within a Prometheus hierarchical federation. It also allows for a separation of concerns: whereas alerting requires immediacy and precision in the metrics, visualizations of historical data can bear with delay and downsampling.
+
+Across our production VictoriaMetrics clusters, in a 12 months period we go beyond the following figures.
+
+- Active time series: 10M
+- Ingestion rate: 300k samples per second
+- Total number of datapoints: 4400G
+- Data size on disk: 3600 GiB
+- Available memory: 320 GiB as seen by kubernetes (160 GiB physical memory for the hosts)
+- CPU: 20 cores (AMD EPYC 7763), about 70 % idle
+- Retention period: ~1 year
+- Churn rate: 6M new time series per day (monthly average)
+- Query rate:
+  - `/api/v1/query_range`: 10 queries per second
+  - `/api/v1/query`: 10 queries per second
+- Query duration for `/api/v1/query_range` (weekly mean):
+  - 99th percentile: 700 ms
+  - median: 10 ms
 
 ## Roblox
 
@@ -570,6 +613,25 @@ Numbers:
 > Optimizing for those points and our specific workload, VictoriaMetrics proved to be the best option. As icing on the cake we’ve got [PromQL extensions](https://docs.victoriametrics.com/MetricsQL.html) - `default 0` and `histogram` are my favorite ones. We really like having a lot of tsdb params easily available via config options which makes tsdb easy to tune for each specific use case. We've also found a great community in [Slack channel](https://slack.victoriametrics.com/) and responsive and helpful maintainer support.
 
 Alex Ulstein, Head of Monitoring, Wix.com
+
+
+## xiaohongshu
+
+With a mission to “inspire lives”, [Xiaohongshu](https://www.xiaohongshu.com) is a lifestyle platform that inspires people to discover and connect with a range of diverse lifestyles from China.
+In the past year, we used VictoriaMetrics to replace Prometheus. After migrating to VictoriaMetrics, we had saved more than ten thousand cpu cores, and our metrics system is more stable. 
+Now more than thirty VictoriaMetrics storage clusters are running online, including all of our key business areas, such as recommendations, search, community, advertising, infrastructure, etc.
+See [this article](https://mp.weixin.qq.com/s/uJ1t0B8WBBryzvbLWDfl5A) on how Xiaohongshu build metrics system base on VictoriaMetrics and the competing solutions.
+
+Across our production VictoriaMetrics clusters, numbers as below:
+- Cpu cores in all VictoriaMetrics clusters: almost 50000
+- Data size on disk: 2400 TB
+- Retention period: 1 month
+- Largset VictoriaMetrics cluster: 450 million samples every scrape interval (15 seconds)
+- Total scrape sample every scrape interval: 2400 million samples
+- Query rate:
+  - /api/v1/query_range: 2300 queries per second
+  - /api/v1/query: 260 queries per second
+
 
 ## Zerodha
 

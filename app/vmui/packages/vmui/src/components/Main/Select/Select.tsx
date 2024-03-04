@@ -1,4 +1,4 @@
-import React, { FC, useEffect, useMemo, useRef, useState,  } from "preact/compat";
+import React, { FC, Ref, useEffect, useMemo, useRef, useState, } from "preact/compat";
 import classNames from "classnames";
 import { ArrowDropDownIcon, CloseIcon } from "../Icons";
 import { FormEvent, MouseEvent } from "react";
@@ -8,6 +8,7 @@ import "./style.scss";
 import useDeviceDetect from "../../../hooks/useDeviceDetect";
 import MultipleSelectedValue from "./MultipleSelectedValue/MultipleSelectedValue";
 import useEventListener from "../../../hooks/useEventListener";
+import useClickOutside from "../../../hooks/useClickOutside";
 
 interface SelectProps {
   value: string | string[]
@@ -18,6 +19,7 @@ interface SelectProps {
   clearable?: boolean
   searchable?: boolean
   autofocus?: boolean
+  disabled?: boolean
   onChange: (value: string) => void
 }
 
@@ -30,6 +32,7 @@ const Select: FC<SelectProps> = ({
   clearable = false,
   searchable = false,
   autofocus,
+  disabled,
   onChange
 }) => {
   const { isDarkTheme } = useAppState();
@@ -37,6 +40,7 @@ const Select: FC<SelectProps> = ({
 
   const [search, setSearch] = useState("");
   const autocompleteAnchorEl = useRef<HTMLDivElement>(null);
+  const [wrapperRef, setWrapperRef] = useState<Ref<HTMLDivElement> | null>(null);
   const [openList, setOpenList] = useState(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -64,15 +68,17 @@ const Select: FC<SelectProps> = ({
   };
 
   const handleFocus = () => {
+    if (disabled) return;
     setOpenList(true);
   };
 
   const handleToggleList = (e: MouseEvent<HTMLDivElement>) => {
-    if (e.target instanceof HTMLInputElement) return;
+    if (e.target instanceof HTMLInputElement || disabled) return;
     setOpenList(prev => !prev);
   };
 
   const handleSelected = (val: string) => {
+    setSearch("");
     onChange(val);
     if (!isMultiple) handleCloseList();
     if (isMultiple && inputRef.current) inputRef.current.focus();
@@ -107,12 +113,14 @@ const Select: FC<SelectProps> = ({
   }, [autofocus, inputRef]);
 
   useEventListener("keyup", handleKeyUp);
+  useClickOutside(autocompleteAnchorEl, handleCloseList, wrapperRef);
 
   return (
     <div
       className={classNames({
         "vm-select": true,
-        "vm-select_dark": isDarkTheme
+        "vm-select_dark": isDarkTheme,
+        "vm-select_disabled": disabled
       })}
     >
       <div
@@ -168,6 +176,7 @@ const Select: FC<SelectProps> = ({
         noOptionsText={noOptionsText}
         onSelect={handleSelected}
         onOpenAutocomplete={setOpenList}
+        onChangeWrapperRef={setWrapperRef}
       />
     </div>
   );

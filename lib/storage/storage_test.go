@@ -98,7 +98,7 @@ func testDateMetricIDCache(c *dateMetricIDCache, concurrent bool) error {
 	m := make(map[dmk]bool)
 	for i := 0; i < 1e5; i++ {
 		generation := uint64(i) % 2
-		date := uint64(i) % 3
+		date := uint64(i) % 2
 		metricID := uint64(i) % 1237
 		if !concurrent && c.Has(generation, date, metricID) {
 			if !m[dmk{generation, date, metricID}] {
@@ -127,7 +127,7 @@ func testDateMetricIDCache(c *dateMetricIDCache, concurrent bool) error {
 	// Verify fast path after sync.
 	for i := 0; i < 1e5; i++ {
 		generation := uint64(i) % 2
-		date := uint64(i) % 3
+		date := uint64(i) % 2
 		metricID := uint64(i) % 123
 		c.Set(generation, date, metricID)
 	}
@@ -136,7 +136,7 @@ func testDateMetricIDCache(c *dateMetricIDCache, concurrent bool) error {
 	c.mu.Unlock()
 	for i := 0; i < 1e5; i++ {
 		generation := uint64(i) % 2
-		date := uint64(i) % 3
+		date := uint64(i) % 2
 		metricID := uint64(i) % 123
 		if !concurrent && !c.Has(generation, date, metricID) {
 			return fmt.Errorf("c.Has(%d, %d, %d) must return true after sync", generation, date, metricID)
@@ -1020,7 +1020,7 @@ func testStorageAddRows(rng *rand.Rand, s *Storage) error {
 	}
 
 	// Try creating a snapshot from the storage.
-	snapshotName, err := s.CreateSnapshot(0)
+	snapshotName, err := s.CreateSnapshot()
 	if err != nil {
 		return fmt.Errorf("cannot create snapshot from the storage: %w", err)
 	}
@@ -1178,7 +1178,7 @@ func TestStorageDeleteStaleSnapshots(t *testing.T) {
 		}
 	}
 	// Try creating a snapshot from the storage.
-	snapshotName, err := s.CreateSnapshot(0)
+	snapshotName, err := s.CreateSnapshot()
 	if err != nil {
 		t.Fatalf("cannot create snapshot from the storage: %s", err)
 	}
