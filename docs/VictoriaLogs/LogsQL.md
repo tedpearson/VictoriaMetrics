@@ -246,7 +246,7 @@ The list of LogsQL filters:
 ### Time filter
 
 VictoriaLogs scans all the logs per each query if it doesn't contain the filter on [`_time` field](https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#time-field).
-It uses various optimizations in order to speed up full scan queries without the `_time` filter,
+It uses various optimizations in order to accelerate full scan queries without the `_time` filter,
 but such queries can be slow if the storage contains large number of logs over long time range. The easiest way to optimize queries
 is to narrow down the search with the filter on [`_time` field](https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#time-field).
 
@@ -305,7 +305,7 @@ See also:
 
 VictoriaLogs provides an optimized way to select log entries, which belong to particular [log streams](https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#stream-fields).
 This can be done via `_stream:{...}` filter. The `{...}` may contain arbitrary
-[Prometheus-compatible label selector](https://docs.victoriametrics.com/keyConcepts.html#filtering)
+[Prometheus-compatible label selector](https://docs.victoriametrics.com/keyconcepts/#filtering)
 over fields associated with [log streams](https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#stream-fields).
 For example, the following query selects [log entries](https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#data-model)
 with `app` field equal to `nginx`:

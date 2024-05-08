@@ -91,6 +91,8 @@ type partition struct {
 	smallRowsDeleted    atomic.Uint64
 	bigRowsDeleted      atomic.Uint64
 
+	isDedupScheduled atomic.Bool
+
 	mergeIdx atomic.Uint64
 
 	// the path to directory with smallParts.
@@ -244,13 +246,13 @@ func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partiti
 		logger.Panicf("FATAL: partition name in bigPartsPath %q doesn't match smallPartsPath %q; want %q", bigPartsPath, smallPartsPath, name)
 	}
 
-	partNamesSmall, partNamesBig := mustReadPartNames(smallPartsPath, bigPartsPath)
+	partsFile := filepath.Join(smallPartsPath, partsFilename)
+	partNamesSmall, partNamesBig := mustReadPartNames(partsFile, smallPartsPath, bigPartsPath)
 
-	smallParts := mustOpenParts(smallPartsPath, partNamesSmall)
-	bigParts := mustOpenParts(bigPartsPath, partNamesBig)
+	smallParts := mustOpenParts(partsFile, smallPartsPath, partNamesSmall)
+	bigParts := mustOpenParts(partsFile, bigPartsPath, partNamesBig)
 
-	partNamesPath := filepath.Join(smallPartsPath, partsFilename)
-	if !fs.IsPathExist(partNamesPath) {
+	if !fs.IsPathExist(partsFile) {
 		// Create parts.json file if it doesn't exist yet.
 		// This should protect from possible carshloops just after the migration from versions below v1.90.0
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4336
@@ -326,6 +328,9 @@ type partitionMetrics struct {
 	InmemoryPartsRefCount uint64
 	SmallPartsRefCount    uint64
 	BigPartsRefCount      uint64
+
+	ScheduledDownsamplingPartitions     uint64
+	ScheduledDownsamplingPartitionsSize uint64
 }
 
 // TotalRowsCount returns total number of rows in tm.
@@ -339,12 +344,20 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 
 	pt.partsLock.Lock()
 
+	isDedupScheduled := pt.isDedupScheduled.Load()
+	if isDedupScheduled {
+		m.ScheduledDownsamplingPartitions++
+	}
+
 	for _, pw := range pt.inmemoryParts {
 		p := pw.p
 		m.InmemoryRowsCount += p.ph.RowsCount
 		m.InmemoryBlocksCount += p.ph.BlocksCount
 		m.InmemorySizeBytes += p.size
 		m.InmemoryPartsRefCount += uint64(pw.refCount.Load())
+		if isDedupScheduled {
+			m.ScheduledDownsamplingPartitionsSize += p.size
+		}
 	}
 	for _, pw := range pt.smallParts {
 		p := pw.p
@@ -352,6 +365,9 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 		m.SmallBlocksCount += p.ph.BlocksCount
 		m.SmallSizeBytes += p.size
 		m.SmallPartsRefCount += uint64(pw.refCount.Load())
+		if isDedupScheduled {
+			m.ScheduledDownsamplingPartitionsSize += p.size
+		}
 	}
 	for _, pw := range pt.bigParts {
 		p := pw.p
@@ -359,6 +375,9 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 		m.BigBlocksCount += p.ph.BlocksCount
 		m.BigSizeBytes += p.size
 		m.BigPartsRefCount += uint64(pw.refCount.Load())
+		if isDedupScheduled {
+			m.ScheduledDownsamplingPartitionsSize += p.size
+		}
 	}
 
 	m.InmemoryPartsCount += uint64(len(pt.inmemoryParts))
@@ -1182,7 +1201,7 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 }
 
 // ForceMergeAllParts runs merge for all the parts in pt.
-func (pt *partition) ForceMergeAllParts() error {
+func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	pws := pt.getAllPartsForMerge()
 	if len(pws) == 0 {
 		// Nothing to merge.
@@ -1202,7 +1221,7 @@ func (pt *partition) ForceMergeAllParts() error {
 	// If len(pws) == 1, then the merge must run anyway.
 	// This allows applying the configured retention, removing the deleted series
 	// and performing de-duplication if needed.
-	if err := pt.mergePartsToFiles(pws, pt.stopCh, bigPartsConcurrencyCh); err != nil {
+	if err := pt.mergePartsToFiles(pws, stopCh, bigPartsConcurrencyCh); err != nil {
 		return fmt.Errorf("cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
 	}
 
@@ -1311,29 +1330,24 @@ func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
 	pt.partsLock.Unlock()
 }
 
-func (pt *partition) runFinalDedup() error {
-	requiredDedupInterval, actualDedupInterval := pt.getRequiredDedupInterval()
+func (pt *partition) runFinalDedup(stopCh <-chan struct{}) error {
 	t := time.Now()
-	logger.Infof("starting final dedup for partition %s using requiredDedupInterval=%d ms, since the partition has smaller actualDedupInterval=%d ms",
-		pt.bigPartsPath, requiredDedupInterval, actualDedupInterval)
-	if err := pt.ForceMergeAllParts(); err != nil {
-		return fmt.Errorf("cannot perform final dedup for partition %s: %w", pt.bigPartsPath, err)
+	logger.Infof("start removing duplicate samples from partition (%s, %s)", pt.bigPartsPath, pt.smallPartsPath)
+	if err := pt.ForceMergeAllParts(stopCh); err != nil {
+		return fmt.Errorf("cannot remove duplicate samples from partition (%s, %s): %w", pt.bigPartsPath, pt.smallPartsPath, err)
 	}
-	logger.Infof("final dedup for partition %s has been finished in %.3f seconds", pt.bigPartsPath, time.Since(t).Seconds())
+	logger.Infof("duplicate samples have been removed from partition (%s, %s) in %.3f seconds", pt.bigPartsPath, pt.smallPartsPath, time.Since(t).Seconds())
 	return nil
 }
 
 func (pt *partition) isFinalDedupNeeded() bool {
-	requiredDedupInterval, actualDedupInterval := pt.getRequiredDedupInterval()
-	return requiredDedupInterval > actualDedupInterval
-}
-
-func (pt *partition) getRequiredDedupInterval() (int64, int64) {
-	pws := pt.GetParts(nil, false)
-	defer pt.PutParts(pws)
 	dedupInterval := GetDedupInterval()
+
+	pws := pt.GetParts(nil, false)
 	minDedupInterval := getMinDedupInterval(pws)
-	return dedupInterval, minDedupInterval
+	pt.PutParts(pws)
+
+	return dedupInterval > minDedupInterval
 }
 
 func getMinDedupInterval(pws []*partWrapper) int64 {
@@ -1891,7 +1905,7 @@ func getPartsSize(pws []*partWrapper) uint64 {
 	return n
 }
 
-func mustOpenParts(path string, partNames []string) []*partWrapper {
+func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 	// The path can be missing after restoring from backup, so create it if needed.
 	fs.MustMkdirIfNotExist(path)
 	fs.MustRemoveTemporaryDirs(path)
@@ -1912,7 +1926,6 @@ func mustOpenParts(path string, partNames []string) []*partWrapper {
 		// including unclean shutdown.
 		partPath := filepath.Join(path, partName)
 		if !fs.IsPathExist(partPath) {
-			partsFile := filepath.Join(path, partsFilename)
 			logger.Panicf("FATAL: part %q is listed in %q, but is missing on disk; "+
 				"ensure %q contents is not corrupted; remove %q to rebuild its' content from the list of existing parts",
 				partPath, partsFile, partsFile, partsFile)
@@ -1928,6 +1941,7 @@ func mustOpenParts(path string, partNames []string) []*partWrapper {
 		fn := de.Name()
 		if _, ok := m[fn]; !ok {
 			deletePath := filepath.Join(path, fn)
+			logger.Infof("deleting %q because it isn't listed in %q; this is the expected case after unclean shutdown", deletePath, partsFile)
 			fs.MustRemoveAll(deletePath)
 		}
 	}
@@ -2023,8 +2037,8 @@ func mustWritePartNames(pwsSmall, pwsBig []*partWrapper, dstDir string) {
 	if err != nil {
 		logger.Panicf("BUG: cannot marshal partNames to JSON: %s", err)
 	}
-	partNamesPath := filepath.Join(dstDir, partsFilename)
-	fs.MustWriteAtomic(partNamesPath, data, true)
+	partsFile := filepath.Join(dstDir, partsFilename)
+	fs.MustWriteAtomic(partsFile, data, true)
 }
 
 func getPartNames(pws []*partWrapper) []string {
@@ -2041,20 +2055,19 @@ func getPartNames(pws []*partWrapper) []string {
 	return partNames
 }
 
-func mustReadPartNames(smallPartsPath, bigPartsPath string) ([]string, []string) {
-	partNamesPath := filepath.Join(smallPartsPath, partsFilename)
-	if fs.IsPathExist(partNamesPath) {
-		data, err := os.ReadFile(partNamesPath)
+func mustReadPartNames(partsFile, smallPartsPath, bigPartsPath string) ([]string, []string) {
+	if fs.IsPathExist(partsFile) {
+		data, err := os.ReadFile(partsFile)
 		if err != nil {
-			logger.Panicf("FATAL: cannot read %s file: %s", partsFilename, err)
+			logger.Panicf("FATAL: cannot read %q: %s", partsFile, err)
 		}
 		var partNames partNamesJSON
 		if err := json.Unmarshal(data, &partNames); err != nil {
-			logger.Panicf("FATAL: cannot parse %s: %s", partNamesPath, err)
+			logger.Panicf("FATAL: cannot parse %q: %s", partsFile, err)
 		}
 		return partNames.Small, partNames.Big
 	}
-	// The partsFilename is missing. This is the upgrade from versions previous to v1.90.0.
+	// The partsFile is missing. This is the upgrade from versions previous to v1.90.0.
 	// Read part names from smallPartsPath and bigPartsPath directories
 	partNamesSmall := mustReadPartNamesFromDir(smallPartsPath)
 	partNamesBig := mustReadPartNamesFromDir(bigPartsPath)

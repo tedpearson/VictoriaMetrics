@@ -124,7 +124,7 @@ type Storage struct {
 	// prefetchedMetricIDsDeadline is used for periodic reset of prefetchedMetricIDs in order to limit its size under high rate of creating new series.
 	prefetchedMetricIDsDeadline atomic.Uint64
 
-	stop chan struct{}
+	stopCh chan struct{}
 
 	currHourMetricIDsUpdaterWG sync.WaitGroup
 	nextDayMetricIDsUpdaterWG  sync.WaitGroup
@@ -147,6 +147,15 @@ type Storage struct {
 	deletedMetricIDs           atomic.Pointer[uint64set.Set]
 	deletedMetricIDsUpdateLock sync.Mutex
 
+	// missingMetricIDs maps metricID to the deadline in unix timestamp seconds
+	// after which all the indexdb entries for the given metricID
+	// must be deleted if metricName isn't found by the given metricID.
+	// This is used inside searchMetricNameWithCache() for detecting permanently missing metricID->metricName entries.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5959
+	missingMetricIDsLock          sync.Mutex
+	missingMetricIDs              map[uint64]uint64
+	missingMetricIDsResetDeadline uint64
+
 	// isReadOnly is set to true when the storage is in read-only mode.
 	isReadOnly atomic.Bool
 }
@@ -164,7 +173,7 @@ func MustOpenStorage(path string, retention time.Duration, maxHourlySeries, maxD
 		path:           path,
 		cachePath:      filepath.Join(path, cacheDirname),
 		retentionMsecs: retention.Milliseconds(),
-		stop:           make(chan struct{}),
+		stopCh:         make(chan struct{}),
 	}
 	fs.MustMkdirIfNotExist(path)
 
@@ -684,7 +693,7 @@ func (s *Storage) startFreeDiskSpaceWatcher() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.stop:
+			case <-s.stopCh:
 				return
 			case <-ticker.C:
 				f()
@@ -715,7 +724,7 @@ func (s *Storage) retentionWatcher() {
 	for {
 		d := s.nextRetentionSeconds()
 		select {
-		case <-s.stop:
+		case <-s.stopCh:
 			return
 		case currentTime := <-time.After(time.Second * time.Duration(d)):
 			s.mustRotateIndexDB(currentTime)
@@ -745,7 +754,7 @@ func (s *Storage) currHourMetricIDsUpdater() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-s.stopCh:
 			hour := fasttime.UnixHour()
 			s.updateCurrHourMetricIDs(hour)
 			return
@@ -762,7 +771,7 @@ func (s *Storage) nextDayMetricIDsUpdater() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-s.stopCh:
 			date := fasttime.UnixDate()
 			s.updateNextDayMetricIDs(date)
 			return
@@ -847,7 +856,7 @@ func (s *Storage) resetAndSaveTSIDCache() {
 //
 // It is expected that the s is no longer used during the close.
 func (s *Storage) MustClose() {
-	close(s.stop)
+	close(s.stopCh)
 
 	s.freeDiskSpaceWatcherWG.Wait()
 	s.retentionWatcherWG.Wait()
@@ -1144,7 +1153,7 @@ func (s *Storage) SearchMetricNames(qt *querytracer.Tracer, tfss []*TagFilters, 
 		metricName, ok = idb.searchMetricNameWithCache(metricName[:0], metricID)
 		if !ok {
 			// Skip missing metricName for metricID.
-			// It should be automatically fixed. See indexDB.searchMetricName for details.
+			// It should be automatically fixed. See indexDB.searchMetricNameWithCache for details.
 			continue
 		}
 		if _, ok := metricNamesSeen[string(metricName)]; ok {
@@ -1273,7 +1282,58 @@ func (s *Storage) SearchLabelNamesWithFiltersOnTimeRange(qt *querytracer.Tracer,
 func (s *Storage) SearchLabelValuesWithFiltersOnTimeRange(qt *querytracer.Tracer, labelName string, tfss []*TagFilters,
 	tr TimeRange, maxLabelValues, maxMetrics int, deadline uint64,
 ) ([]string, error) {
-	return s.idb().SearchLabelValuesWithFiltersOnTimeRange(qt, labelName, tfss, tr, maxLabelValues, maxMetrics, deadline)
+	idb := s.idb()
+
+	key := labelName
+	if key == "__name__" {
+		key = ""
+	}
+	if len(tfss) == 1 && len(tfss[0].tfs) == 1 && string(tfss[0].tfs[0].key) == key {
+		// tfss contains only a single filter on labelName. It is faster searching for label values
+		// without any filters and limits and then later applying the filter and the limit to the found label values.
+		qt.Printf("search for up to %d values for the label %q on the time range %s", maxMetrics, labelName, &tr)
+		lvs, err := idb.SearchLabelValuesWithFiltersOnTimeRange(qt, labelName, nil, tr, maxMetrics, maxMetrics, deadline)
+		if err != nil {
+			return nil, err
+		}
+		needSlowSearch := len(lvs) == maxMetrics
+
+		lvsLen := len(lvs)
+		lvs = filterLabelValues(lvs, &tfss[0].tfs[0], key)
+		qt.Printf("found %d out of %d values for the label %q after filtering", len(lvs), lvsLen, labelName)
+		if len(lvs) >= maxLabelValues {
+			qt.Printf("leave %d out of %d values for the label %q because of the limit", maxLabelValues, len(lvs), labelName)
+			lvs = lvs[:maxLabelValues]
+
+			// We found at least maxLabelValues unique values for the label with the given filters.
+			// It is OK returning all these values instead of falling back to the slow search.
+			needSlowSearch = false
+		}
+		if !needSlowSearch {
+			return lvs, nil
+		}
+		qt.Printf("fall back to slow search because only a subset of label values is found")
+	}
+
+	return idb.SearchLabelValuesWithFiltersOnTimeRange(qt, labelName, tfss, tr, maxLabelValues, maxMetrics, deadline)
+}
+
+func filterLabelValues(lvs []string, tf *tagFilter, key string) []string {
+	var b []byte
+	result := lvs[:0]
+	for _, lv := range lvs {
+		b = marshalCommonPrefix(b[:0], nsPrefixTagToMetricIDs)
+		b = marshalTagValue(b, bytesutil.ToUnsafeBytes(key))
+		b = marshalTagValue(b, bytesutil.ToUnsafeBytes(lv))
+		ok, err := tf.match(b)
+		if err != nil {
+			logger.Panicf("BUG: cannot match label %q=%q with tagFilter %s: %w", key, lv, tf.String(), err)
+		}
+		if ok {
+			result = append(result, lv)
+		}
+	}
+	return result
 }
 
 // SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.

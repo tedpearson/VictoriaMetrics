@@ -13,11 +13,11 @@ aliases:
 
 This guide explains the different ways in which you can use vmalert in conjunction with Managed VictoriaMetrics
 
-<img src="alerting-vmalert-managed-victoria-metrics-setup.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_setup.webp">
 
 ## Preconditions 
 
-* [vmalert](https://docs.victoriametrics.com/vmalert.html) is installed. You can obtain it by building it from [source](https://docs.victoriametrics.com/vmalert.html#quickstart), downloading it from the [GitHub releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest), or using the [docker image](https://hub.docker.com/r/victoriametrics/vmalert) for the container ecosystem (such as docker, k8s, etc.).
+* [vmalert](https://docs.victoriametrics.com/vmalert/) is installed. You can obtain it by building it from [source](https://docs.victoriametrics.com/vmalert/#quickstart), downloading it from the [GitHub releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest), or using the [docker image](https://hub.docker.com/r/victoriametrics/vmalert) for the container ecosystem (such as docker, k8s, etc.).
 * [Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/) is installed.
 * You have a [single or cluster](https://docs.victoriametrics.com/managed-victoriametrics/quickstart.html#creating-deployment) deployment in [Managed VictoriaMetrics](https://docs.victoriametrics.com/managed-victoriametrics/overview.html).
 * If you are using helm, add the [VictoriaMetrics helm chart](https://github.com/VictoriaMetrics/helm-charts/tree/master/charts/victoria-metrics-alert#how-to-install) repository to your helm repositories. This step is optional.
@@ -55,14 +55,14 @@ For instructions on how to create tokens, please refer to this section of the [d
 
 #### Single-Node
 
-<img src="alerting_token_created_single.webp">
-<img src="alerting_copy_datasource_single.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_token_created_single.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_copy_datasource_single.webp">
 
 #### Cluster
 
-<img src="alerting_token_created_cluster.webp">
-<img src="alerting_copy_reading_datasource_cluster.webp">
-<img src="alerting_copy_writing_datasource_cluster.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_token_created_cluster.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_copy_reading_datasource_cluster.webp">
+<img src="alerting-vmalert-managed-victoria-metrics_copy_writing_datasource_cluster.webp">
 
 ### vmalert configuration 
 
