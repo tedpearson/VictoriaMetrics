@@ -8,6 +8,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // blockHeader contains information about a single block.
@@ -26,6 +27,12 @@ type blockHeader struct {
 	// timestampsHeader contains information about timestamps for log entries in the block
 	timestampsHeader timestampsHeader
 
+	// columnsHeaderIndexOffset is the offset of columnsHeaderIndex at columnsHeaderIndexFilename
+	columnsHeaderIndexOffset uint64
+
+	// columnsHeaderIndexSize is the size of columnsHeaderIndex at columnsHeaderIndexFilename
+	columnsHeaderIndexSize uint64
+
 	// columnsHeaderOffset is the offset of columnsHeader at columnsHeaderFilename
 	columnsHeaderOffset uint64
 
@@ -39,6 +46,8 @@ func (bh *blockHeader) reset() {
 	bh.uncompressedSizeBytes = 0
 	bh.rowsCount = 0
 	bh.timestampsHeader.reset()
+	bh.columnsHeaderIndexOffset = 0
+	bh.columnsHeaderIndexSize = 0
 	bh.columnsHeaderOffset = 0
 	bh.columnsHeaderSize = 0
 }
@@ -50,20 +59,20 @@ func (bh *blockHeader) copyFrom(src *blockHeader) {
 	bh.uncompressedSizeBytes = src.uncompressedSizeBytes
 	bh.rowsCount = src.rowsCount
 	bh.timestampsHeader.copyFrom(&src.timestampsHeader)
+	bh.columnsHeaderIndexOffset = src.columnsHeaderIndexOffset
+	bh.columnsHeaderIndexSize = src.columnsHeaderIndexSize
 	bh.columnsHeaderOffset = src.columnsHeaderOffset
 	bh.columnsHeaderSize = src.columnsHeaderSize
 }
 
 // marshal appends the marshaled bh to dst and returns the result.
 func (bh *blockHeader) marshal(dst []byte) []byte {
-	// Do not store the version used for encoding directly in the block header, since:
-	// - all the block headers in the same part use the same encoding
-	// - the block header encoding version can be put in metadata file for the part (aka metadataFilename)
-
 	dst = bh.streamID.marshal(dst)
 	dst = encoding.MarshalVarUint64(dst, bh.uncompressedSizeBytes)
 	dst = encoding.MarshalVarUint64(dst, bh.rowsCount)
 	dst = bh.timestampsHeader.marshal(dst)
+	dst = encoding.MarshalVarUint64(dst, bh.columnsHeaderIndexOffset)
+	dst = encoding.MarshalVarUint64(dst, bh.columnsHeaderIndexSize)
 	dst = encoding.MarshalVarUint64(dst, bh.columnsHeaderOffset)
 	dst = encoding.MarshalVarUint64(dst, bh.columnsHeaderSize)
 
@@ -71,7 +80,7 @@ func (bh *blockHeader) marshal(dst []byte) []byte {
 }
 
 // unmarshal unmarshals bh from src and returns the remaining tail.
-func (bh *blockHeader) unmarshal(src []byte) ([]byte, error) {
+func (bh *blockHeader) unmarshal(src []byte, partFormatVersion uint) ([]byte, error) {
 	bh.reset()
 
 	srcOrig := src
@@ -84,23 +93,23 @@ func (bh *blockHeader) unmarshal(src []byte) ([]byte, error) {
 	src = tail
 
 	// unmarshal bh.uncompressedSizeBytes
-	tail, n, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal uncompressedSizeBytes: %w", err)
+	n, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal uncompressedSizeBytes")
 	}
+	src = src[nSize:]
 	bh.uncompressedSizeBytes = n
-	src = tail
 
 	// unmarshal bh.rowsCount
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal rowsCount: %w", err)
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal rowsCount")
 	}
+	src = src[nSize:]
 	if n > maxRowsPerBlock {
 		return srcOrig, fmt.Errorf("too big value for rowsCount: %d; mustn't exceed %d", n, maxRowsPerBlock)
 	}
 	bh.rowsCount = n
-	src = tail
 
 	// unmarshal bh.timestampsHeader
 	tail, err = bh.timestampsHeader.unmarshal(src)
@@ -109,24 +118,42 @@ func (bh *blockHeader) unmarshal(src []byte) ([]byte, error) {
 	}
 	src = tail
 
-	// unmarshal columnsHeaderOffset
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderOffset: %w", err)
+	if partFormatVersion >= 1 {
+		// unmarshal columnsHeaderIndexOffset
+		n, nSize = encoding.UnmarshalVarUint64(src)
+		if nSize <= 0 {
+			return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderIndexOffset")
+		}
+		src = src[nSize:]
+		bh.columnsHeaderIndexOffset = n
+
+		// unmarshal columnsHeaderIndexSize
+		n, nSize = encoding.UnmarshalVarUint64(src)
+		if nSize <= 0 {
+			return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderIndexSize")
+		}
+		src = src[nSize:]
+		bh.columnsHeaderIndexSize = n
 	}
+
+	// unmarshal columnsHeaderOffset
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderOffset")
+	}
+	src = src[nSize:]
 	bh.columnsHeaderOffset = n
-	src = tail
 
 	// unmarshal columnsHeaderSize
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderSize: %w", err)
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal columnsHeaderSize")
 	}
+	src = src[nSize:]
 	if n > maxColumnsHeaderSize {
 		return srcOrig, fmt.Errorf("too big value for columnsHeaderSize: %d; mustn't exceed %d", n, maxColumnsHeaderSize)
 	}
 	bh.columnsHeaderSize = n
-	src = tail
 
 	return src, nil
 }
@@ -147,8 +174,8 @@ func putBlockHeader(bh *blockHeader) {
 var blockHeaderPool sync.Pool
 
 // unmarshalBlockHeaders appends unmarshaled from src blockHeader entries to dst and returns the result.
-func unmarshalBlockHeaders(dst []blockHeader, src []byte) ([]blockHeader, error) {
-	dstOrig := dst
+func unmarshalBlockHeaders(dst []blockHeader, src []byte, partFormatVersion uint) ([]blockHeader, error) {
+	dstLen := len(dst)
 	for len(src) > 0 {
 		if len(dst) < cap(dst) {
 			dst = dst[:len(dst)+1]
@@ -156,14 +183,14 @@ func unmarshalBlockHeaders(dst []blockHeader, src []byte) ([]blockHeader, error)
 			dst = append(dst, blockHeader{})
 		}
 		bh := &dst[len(dst)-1]
-		tail, err := bh.unmarshal(src)
+		tail, err := bh.unmarshal(src, partFormatVersion)
 		if err != nil {
-			return dstOrig, fmt.Errorf("cannot unmarshal blockHeader entries: %w", err)
+			return dst, fmt.Errorf("cannot unmarshal blockHeader entries: %w", err)
 		}
 		src = tail
 	}
-	if err := validateBlockHeaders(dst[len(dstOrig):]); err != nil {
-		return dstOrig, err
+	if err := validateBlockHeaders(dst[dstLen:]); err != nil {
+		return dst, err
 	}
 	return dst, nil
 }
@@ -192,6 +219,128 @@ func resetBlockHeaders(bhs []blockHeader) []blockHeader {
 		bhs[i].reset()
 	}
 	return bhs[:0]
+}
+
+// columnHeaderRef references column header in the marshaled columnsHeader.
+type columnHeaderRef struct {
+	// columnNameID is the ID of the column name. The column name can be obtained from part.columnNames.
+	columnNameID uint64
+
+	// offset is the offset of the the corresponding columnHeader inside marshaled columnsHeader.
+	offset uint64
+}
+
+// columnsHeaderIndex contains offsets for marshaled column headers.
+type columnsHeaderIndex struct {
+	// columnHeadersRefs contains references to columnHeaders.
+	columnHeadersRefs []columnHeaderRef
+
+	// constColumnsRefs contains references to constColumns.
+	constColumnsRefs []columnHeaderRef
+}
+
+func getColumnsHeaderIndex() *columnsHeaderIndex {
+	v := columnsHeaderIndexPool.Get()
+	if v == nil {
+		return &columnsHeaderIndex{}
+	}
+	return v.(*columnsHeaderIndex)
+}
+
+func putColumnsHeaderIndex(cshIndex *columnsHeaderIndex) {
+	cshIndex.reset()
+	columnsHeaderIndexPool.Put(cshIndex)
+}
+
+var columnsHeaderIndexPool sync.Pool
+
+func (cshIndex *columnsHeaderIndex) reset() {
+	clear(cshIndex.columnHeadersRefs)
+	cshIndex.columnHeadersRefs = cshIndex.columnHeadersRefs[:0]
+
+	clear(cshIndex.constColumnsRefs)
+	cshIndex.constColumnsRefs = cshIndex.constColumnsRefs[:0]
+}
+
+func (cshIndex *columnsHeaderIndex) resizeConstColumnsRefs(n int) []columnHeaderRef {
+	cshIndex.constColumnsRefs = slicesutil.SetLength(cshIndex.constColumnsRefs, n)
+	return cshIndex.constColumnsRefs
+}
+
+func (cshIndex *columnsHeaderIndex) resizeColumnHeadersRefs(n int) []columnHeaderRef {
+	cshIndex.columnHeadersRefs = slicesutil.SetLength(cshIndex.columnHeadersRefs, n)
+	return cshIndex.columnHeadersRefs
+}
+
+func (cshIndex *columnsHeaderIndex) marshal(dst []byte) []byte {
+	dst = marshalColumnHeadersRefs(dst, cshIndex.columnHeadersRefs)
+	dst = marshalColumnHeadersRefs(dst, cshIndex.constColumnsRefs)
+	return dst
+}
+
+// unmarshalNoArena unmarshals cshIndex from src.
+//
+// cshIndex is valid until src is changed.
+func (cshIndex *columnsHeaderIndex) unmarshalNoArena(src []byte) error {
+	cshIndex.reset()
+
+	refs, tail, err := unmarshalColumnHeadersRefsNoArena(cshIndex.columnHeadersRefs[:0], src)
+	if err != nil {
+		return fmt.Errorf("cannot unmarshal columnHeadersRefs: %w", err)
+	}
+	cshIndex.columnHeadersRefs = refs
+	src = tail
+
+	refs, tail, err = unmarshalColumnHeadersRefsNoArena(cshIndex.constColumnsRefs[:0], src)
+	if err != nil {
+		return fmt.Errorf("cannot unmarshal constColumnsRefs: %w", err)
+	}
+	cshIndex.constColumnsRefs = refs
+	if len(tail) > 0 {
+		return fmt.Errorf("unexpected non-empty tail left after unmarshaling columnsHeaderIndex; len(tail)=%d", len(tail))
+	}
+
+	return nil
+}
+
+func marshalColumnHeadersRefs(dst []byte, refs []columnHeaderRef) []byte {
+	dst = encoding.MarshalVarUint64(dst, uint64(len(refs)))
+	for _, r := range refs {
+		dst = encoding.MarshalVarUint64(dst, r.columnNameID)
+		dst = encoding.MarshalVarUint64(dst, r.offset)
+	}
+	return dst
+}
+
+func unmarshalColumnHeadersRefsNoArena(dst []columnHeaderRef, src []byte) ([]columnHeaderRef, []byte, error) {
+	srcOrig := src
+
+	n, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return dst, srcOrig, fmt.Errorf("cannot unmarshal the number of columnHeaderRef items")
+	}
+	src = src[nSize:]
+
+	for i := uint64(0); i < n; i++ {
+		columnNameID, nSize := encoding.UnmarshalVarUint64(src)
+		if nSize <= 0 {
+			return dst, srcOrig, fmt.Errorf("cannot unmarshal column name ID number %d out of %d", i, n)
+		}
+		src = src[nSize:]
+
+		offset, nSize := encoding.UnmarshalVarUint64(src)
+		if nSize <= 0 {
+			return dst, srcOrig, fmt.Errorf("cannot unmarshal offset number %d out of %d", i, n)
+		}
+		src = src[nSize:]
+
+		dst = append(dst, columnHeaderRef{
+			columnNameID: columnNameID,
+			offset:       offset,
+		})
+	}
+
+	return dst, src, nil
 }
 
 func getColumnsHeader() *columnsHeader {
@@ -234,85 +383,122 @@ func (csh *columnsHeader) reset() {
 	csh.constColumns = ccs[:0]
 }
 
-func (csh *columnsHeader) getConstColumnValue(name string) string {
-	if name == "_msg" {
-		name = ""
-	}
-	ccs := csh.constColumns
-	for i := range ccs {
-		cc := &ccs[i]
-		if cc.Name == name {
-			return cc.Value
-		}
-	}
-	return ""
+func (csh *columnsHeader) resizeConstColumns(n int) []Field {
+	csh.constColumns = slicesutil.SetLength(csh.constColumns, n)
+	return csh.constColumns
 }
 
-func (csh *columnsHeader) getColumnHeader(name string) *columnHeader {
-	if name == "_msg" {
-		name = ""
+func (csh *columnsHeader) resizeColumnHeaders(n int) []columnHeader {
+	csh.columnHeaders = slicesutil.SetLength(csh.columnHeaders, n)
+	return csh.columnHeaders
+}
+
+func (csh *columnsHeader) setColumnNames(cshIndex *columnsHeaderIndex, columnNames []string) error {
+	if len(cshIndex.columnHeadersRefs) != len(csh.columnHeaders) {
+		return fmt.Errorf("unpexected number of column headers; got %d; want %d", len(cshIndex.columnHeadersRefs), len(csh.columnHeaders))
 	}
-	chs := csh.columnHeaders
-	for i := range chs {
-		ch := &chs[i]
-		if ch.name == name {
-			return ch
+	for i := range csh.columnHeaders {
+		columnNameID := cshIndex.columnHeadersRefs[i].columnNameID
+		if columnNameID >= uint64(len(columnNames)) {
+			return fmt.Errorf("unexpected columnNameID=%d in columnHeadersRef; len(columnNames)=%d; columnNames=%v", columnNameID, len(columnNames), columnNames)
 		}
+		csh.columnHeaders[i].name = columnNames[columnNameID]
 	}
+
+	if len(cshIndex.constColumnsRefs) != len(csh.constColumns) {
+		return fmt.Errorf("unexpected number of const columns; got %d; want %d", len(cshIndex.constColumnsRefs), len(csh.constColumns))
+	}
+	for i := range csh.constColumns {
+		columnNameID := cshIndex.constColumnsRefs[i].columnNameID
+		if columnNameID >= uint64(len(columnNames)) {
+			return fmt.Errorf("unexpected columnNameID=%d in constColumnsRefs; len(columnNames)=%d; columnNames=%v", columnNameID, len(columnNames), columnNames)
+		}
+		csh.constColumns[i].Name = columnNames[columnNameID]
+	}
+
 	return nil
 }
 
-func (csh *columnsHeader) resizeConstColumns(columnsLen int) []Field {
-	ccs := csh.constColumns
-	if n := columnsLen - cap(ccs); n > 0 {
-		ccs = append(ccs[:cap(ccs)], make([]Field, n)...)
+func (csh *columnsHeader) mustWriteTo(bh *blockHeader, sw *streamWriters) {
+	bb := longTermBufPool.Get()
+	defer longTermBufPool.Put(bb)
+
+	cshIndex := getColumnsHeaderIndex()
+
+	bb.B = csh.marshal(bb.B, cshIndex, &sw.columnNameIDGenerator)
+	columnsHeaderData := bb.B
+
+	bb.B = cshIndex.marshal(bb.B)
+	columnsHeaderIndexData := bb.B[len(columnsHeaderData):]
+
+	putColumnsHeaderIndex(cshIndex)
+
+	bh.columnsHeaderIndexOffset = sw.columnsHeaderIndexWriter.bytesWritten
+	bh.columnsHeaderIndexSize = uint64(len(columnsHeaderIndexData))
+	if bh.columnsHeaderIndexSize > maxColumnsHeaderIndexSize {
+		logger.Panicf("BUG: too big columnsHeaderIndexSize: %d bytes; mustn't exceed %d bytes", bh.columnsHeaderIndexSize, maxColumnsHeaderIndexSize)
 	}
-	ccs = ccs[:columnsLen]
-	csh.constColumns = ccs
-	return ccs
+	sw.columnsHeaderIndexWriter.MustWrite(columnsHeaderIndexData)
+
+	bh.columnsHeaderOffset = sw.columnsHeaderWriter.bytesWritten
+	bh.columnsHeaderSize = uint64(len(columnsHeaderData))
+	if bh.columnsHeaderSize > maxColumnsHeaderSize {
+		logger.Panicf("BUG: too big columnsHeaderSize: %d bytes; mustn't exceed %d bytes", bh.columnsHeaderSize, maxColumnsHeaderSize)
+	}
+	sw.columnsHeaderWriter.MustWrite(columnsHeaderData)
 }
 
-func (csh *columnsHeader) resizeColumnHeaders(columnHeadersLen int) []columnHeader {
-	chs := csh.columnHeaders
-	if n := columnHeadersLen - cap(chs); n > 0 {
-		chs = append(chs[:cap(chs)], make([]columnHeader, n)...)
-	}
-	chs = chs[:columnHeadersLen]
-	csh.columnHeaders = chs
-	return chs
-}
+func (csh *columnsHeader) marshal(dst []byte, cshIndex *columnsHeaderIndex, g *columnNameIDGenerator) []byte {
+	dstLen := len(dst)
 
-func (csh *columnsHeader) marshal(dst []byte) []byte {
 	chs := csh.columnHeaders
+	chsRefs := cshIndex.resizeColumnHeadersRefs(len(chs))
 	dst = encoding.MarshalVarUint64(dst, uint64(len(chs)))
 	for i := range chs {
+		columnNameID := g.getColumnNameID(chs[i].name)
+		offset := len(dst) - dstLen
 		dst = chs[i].marshal(dst)
+		chsRefs[i] = columnHeaderRef{
+			columnNameID: columnNameID,
+			offset:       uint64(offset),
+		}
 	}
 
 	ccs := csh.constColumns
+	ccsRefs := cshIndex.resizeConstColumnsRefs(len(ccs))
 	dst = encoding.MarshalVarUint64(dst, uint64(len(ccs)))
 	for i := range ccs {
-		dst = ccs[i].marshal(dst)
+		columnNameID := g.getColumnNameID(ccs[i].Name)
+		offset := len(dst) - dstLen
+		dst = ccs[i].marshal(dst, false)
+		ccsRefs[i] = columnHeaderRef{
+			columnNameID: columnNameID,
+			offset:       uint64(offset),
+		}
 	}
 
 	return dst
 }
 
-func (csh *columnsHeader) unmarshal(src []byte) error {
+// unmarshalNoArena unmarshals csh from src.
+//
+// csh is valid until src is changed.
+func (csh *columnsHeader) unmarshalNoArena(src []byte, partFormatVersion uint) error {
 	csh.reset()
 
 	// unmarshal columnHeaders
-	tail, n, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return fmt.Errorf("cannot unmarshal columnHeaders len: %w", err)
+	n, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return fmt.Errorf("cannot unmarshal columnHeaders len")
 	}
-	if n > maxColumnsPerBlock {
-		return fmt.Errorf("too many column headers: %d; mustn't exceed %d", n, maxColumnsPerBlock)
+	src = src[nSize:]
+	if n > 1e6 {
+		return fmt.Errorf("too big number of columnHeaders: %d", n)
 	}
-	src = tail
+
 	chs := csh.resizeColumnHeaders(int(n))
 	for i := range chs {
-		tail, err = chs[i].unmarshal(src)
+		tail, err := chs[i].unmarshalNoArena(src, partFormatVersion)
 		if err != nil {
 			return fmt.Errorf("cannot unmarshal columnHeader %d out of %d columnHeaders: %w", i, len(chs), err)
 		}
@@ -320,22 +506,36 @@ func (csh *columnsHeader) unmarshal(src []byte) error {
 	}
 	csh.columnHeaders = chs
 
+	if len(chs) > maxColumnsPerBlock {
+		columnNames := getNamesFromColumnHeaders(chs)
+		return fmt.Errorf("too many column headers: %d; it mustn't exceed %d; columns: %s", len(chs), maxColumnsPerBlock, columnNames)
+	}
+
 	// unmarshal constColumns
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return fmt.Errorf("cannot unmarshal constColumns len: %w", err)
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return fmt.Errorf("cannot unmarshal constColumns len")
 	}
-	if n+uint64(len(csh.columnHeaders)) > maxColumnsPerBlock {
-		return fmt.Errorf("too many columns: %d; mustn't exceed %d", n+uint64(len(csh.columnHeaders)), maxColumnsPerBlock)
+	src = src[nSize:]
+	if n > 1e6 {
+		return fmt.Errorf("too big number of constColumns: %d", n)
 	}
-	src = tail
+
 	ccs := csh.resizeConstColumns(int(n))
 	for i := range ccs {
-		tail, err = ccs[i].unmarshal(src)
+		tail, err := ccs[i].unmarshalNoArena(src, partFormatVersion < 1)
 		if err != nil {
 			return fmt.Errorf("cannot unmarshal constColumn %d out of %d columns: %w", i, len(ccs), err)
 		}
 		src = tail
+	}
+
+	if len(ccs)+len(csh.columnHeaders) > maxColumnsPerBlock {
+		columnNames := getNamesFromColumnHeaders(csh.columnHeaders)
+		for _, cc := range ccs {
+			columnNames = append(columnNames, cc.Name)
+		}
+		return fmt.Errorf("too many columns: %d; mustn't exceed %d; columns: %s", len(ccs)+len(csh.columnHeaders), maxColumnsPerBlock, columnNames)
 	}
 
 	// Verify that the src is empty
@@ -346,10 +546,19 @@ func (csh *columnsHeader) unmarshal(src []byte) error {
 	return nil
 }
 
+func getNamesFromColumnHeaders(chs []columnHeader) []string {
+	a := make([]string, 0, len(chs))
+	for _, ch := range chs {
+		a = append(a, ch.name)
+	}
+	return a
+}
+
 // columnHeaders contains information for values, which belong to a single label in a single block.
 //
 // The main column with an empty name is stored in messageValuesFilename,
-// while the rest of columns are stored in fieldValuesFilename.
+// while the rest of columns are stored in smallValuesFilename or bigValuesFilename depending
+// on the block size (see maxSmallValuesBlockSize).
 // This allows minimizing disk read IO when filtering by non-message columns.
 //
 // Every block column contains also a bloom filter for all the tokens stored in the column.
@@ -357,16 +566,18 @@ func (csh *columnsHeader) unmarshal(src []byte) error {
 //
 // Tokens in bloom filter depend on valueType:
 //
-//   - valueTypeString stores lowercased tokens seen in all the values
+//   - valueTypeString stores tokens seen in all the values
 //   - valueTypeDict doesn't store anything in the bloom filter, since all the encoded values
 //     are available directly in the valuesDict field
 //   - valueTypeUint8, valueTypeUint16, valueTypeUint32 and valueTypeUint64 stores encoded uint values
+//   - valueTypeInt64 stores encoded int64 values
 //   - valueTypeFloat64 stores encoded float64 values
 //   - valueTypeIPv4 stores encoded into uint32 ips
 //   - valueTypeTimestampISO8601 stores encoded into uint64 timestamps
 //
 // Bloom filters for main column with an empty name is stored in messageBloomFilename,
-// while the rest of columns are stored in fieldBloomFilename.
+// while the rest of columns are stored in smallBloomFilename or bigBloomFilename depending on their size
+// (see maxSmallBloomFilterBlockSize).
 type columnHeader struct {
 	// name contains column name aka label name
 	name string
@@ -387,16 +598,16 @@ type columnHeader struct {
 	// valuesDict contains unique values for valueType = valueTypeDict
 	valuesDict valuesDict
 
-	// valuesOffset contains the offset of the block in either messageValuesFilename or fieldValuesFilename
+	// valuesOffset contains the offset of the block in either messageValuesFilename, smallValuesFilename or bigValuesFilename
 	valuesOffset uint64
 
-	// valuesSize contains the size of the block in either messageValuesFilename or fieldValuesFilename
+	// valuesSize contains the size of the block in either messageValuesFilename, smallValuesFilename or bigValuesFilename
 	valuesSize uint64
 
-	// bloomFilterOffset contains the offset of the bloom filter in either messageBloomFilename or fieldBloomFilename
+	// bloomFilterOffset contains the offset of the bloom filter in messageBloomFilename, smallBloomFilename or bigBloomFilename
 	bloomFilterOffset uint64
 
-	// bloomFilterSize contains the size of the bloom filter in either messageBloomFilename or fieldBloomFilename
+	// bloomFilterSize contains the size of the bloom filter in messageBloomFilename, smallBloomFilename or bigBloomFilename
 	bloomFilterSize uint64
 }
 
@@ -419,20 +630,34 @@ func (ch *columnHeader) reset() {
 // marshal appends marshaled ch to dst and returns the result.
 func (ch *columnHeader) marshal(dst []byte) []byte {
 	// check minValue/maxValue
-	if ch.valueType == valueTypeFloat64 {
+	switch ch.valueType {
+	case valueTypeInt64:
+		minValue := int64(ch.minValue)
+		maxValue := int64(ch.maxValue)
+		if minValue > maxValue {
+			logger.Panicf("BUG: minValue=%d must be smaller than maxValue=%d for valueTypeInt64", minValue, maxValue)
+		}
+	case valueTypeFloat64:
 		minValue := math.Float64frombits(ch.minValue)
 		maxValue := math.Float64frombits(ch.maxValue)
 		if minValue > maxValue {
-			logger.Panicf("BUG: minValue=%g must be smaller than maxValue=%g", minValue, maxValue)
+			logger.Panicf("BUG: minValue=%g must be smaller than maxValue=%g for valueTypeFloat64", minValue, maxValue)
 		}
-	} else {
+	case valueTypeTimestampISO8601:
+		minValue := int64(ch.minValue)
+		maxValue := int64(ch.maxValue)
+		if minValue > maxValue {
+			logger.Panicf("BUG: minValue=%d must be smaller than maxValue=%d for valueTypeTimestampISO8601", minValue, maxValue)
+		}
+	default:
 		if ch.minValue > ch.maxValue {
-			logger.Panicf("BUG: minValue=%d must be smaller than maxValue=%d", ch.minValue, ch.maxValue)
+			logger.Panicf("BUG: minValue=%d must be smaller than maxValue=%d for valueType=%d", ch.minValue, ch.maxValue, ch.valueType)
 		}
 	}
 
-	// Encode common fields - ch.name and ch.valueType
-	dst = encoding.MarshalBytes(dst, bytesutil.ToUnsafeBytes(ch.name))
+	// Do not encode ch.name, since it should be encoded at columnsHeaderIndex.columnHeadersRefs
+
+	// Encode common field - ch.valueType
 	dst = append(dst, byte(ch.valueType))
 
 	// Encode other fields depending on ch.valueType
@@ -457,6 +682,10 @@ func (ch *columnHeader) marshal(dst []byte) []byte {
 	case valueTypeUint64:
 		dst = encoding.MarshalUint64(dst, ch.minValue)
 		dst = encoding.MarshalUint64(dst, ch.maxValue)
+		dst = ch.marshalValuesAndBloomFilters(dst)
+	case valueTypeInt64:
+		dst = encoding.MarshalInt64(dst, int64(ch.minValue))
+		dst = encoding.MarshalInt64(dst, int64(ch.maxValue))
 		dst = ch.marshalValuesAndBloomFilters(dst)
 	case valueTypeFloat64:
 		// float64 values are encoded as uint64 via math.Float64bits()
@@ -497,20 +726,23 @@ func (ch *columnHeader) marshalBloomFilters(dst []byte) []byte {
 	return dst
 }
 
-// unmarshal unmarshals ch from src and returns the tail left after unmarshaling.
-func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
+// unmarshalNoArena unmarshals ch from src and returns the tail left after unmarshaling.
+//
+// ch is valid until src is changed.
+func (ch *columnHeader) unmarshalNoArena(src []byte, partFormatVersion uint) ([]byte, error) {
 	ch.reset()
 
 	srcOrig := src
 
 	// Unmarshal column name
-	tail, data, err := encoding.UnmarshalBytes(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal column name: %w", err)
+	if partFormatVersion < 1 {
+		data, nSize := encoding.UnmarshalBytes(src)
+		if nSize <= 0 {
+			return srcOrig, fmt.Errorf("cannot unmarshal column name")
+		}
+		src = src[nSize:]
+		ch.name = bytesutil.ToUnsafeString(data)
 	}
-	// Do not use bytesutil.InternBytes(data) here, since it works slower than the string(data) in prod
-	ch.name = string(data)
-	src = tail
 
 	// Unmarshal value type
 	if len(src) < 1 {
@@ -522,13 +754,13 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 	// Unmarshal the rest of data depending on valueType
 	switch ch.valueType {
 	case valueTypeString:
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeString for column %q: %w", ch.name, err)
 		}
 		src = tail
 	case valueTypeDict:
-		tail, err = ch.valuesDict.unmarshal(src)
+		tail, err := ch.valuesDict.unmarshalNoArena(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal dict at valueTypeDict for column %q: %w", ch.name, err)
 		}
@@ -547,7 +779,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = uint64(src[1])
 		src = src[2:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeUint8 for column %q: %w", ch.name, err)
 		}
@@ -560,7 +792,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = uint64(encoding.UnmarshalUint16(src[2:]))
 		src = src[4:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeUint16 for column %q: %w", ch.name, err)
 		}
@@ -573,7 +805,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = uint64(encoding.UnmarshalUint32(src[4:]))
 		src = src[8:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeUint32 for column %q: %w", ch.name, err)
 		}
@@ -586,9 +818,22 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = encoding.UnmarshalUint64(src[8:])
 		src = src[16:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeUint64 for column %q: %w", ch.name, err)
+		}
+		src = tail
+	case valueTypeInt64:
+		if len(src) < 16 {
+			return srcOrig, fmt.Errorf("cannot unmarshal min/max values at valueTypeInt64 from %d bytes for column %q; need at least 16 bytes", len(src), ch.name)
+		}
+		ch.minValue = uint64(encoding.UnmarshalInt64(src))
+		ch.maxValue = uint64(encoding.UnmarshalInt64(src[8:]))
+		src = src[16:]
+
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
+		if err != nil {
+			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeInt64 for column %q: %w", ch.name, err)
 		}
 		src = tail
 	case valueTypeFloat64:
@@ -600,7 +845,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = encoding.UnmarshalUint64(src[8:])
 		src = src[16:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeFloat64 for column %q: %w", ch.name, err)
 		}
@@ -613,7 +858,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = uint64(encoding.UnmarshalUint32(src[4:]))
 		src = src[8:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeIPv4 for column %q: %w", ch.name, err)
 		}
@@ -627,7 +872,7 @@ func (ch *columnHeader) unmarshal(src []byte) ([]byte, error) {
 		ch.maxValue = encoding.UnmarshalUint64(src[8:])
 		src = src[16:]
 
-		tail, err = ch.unmarshalValuesAndBloomFilters(src)
+		tail, err := ch.unmarshalValuesAndBloomFilters(src)
 		if err != nil {
 			return srcOrig, fmt.Errorf("cannot unmarshal values and bloom filters at valueTypeTimestampISO8601 for column %q: %w", ch.name, err)
 		}
@@ -660,22 +905,22 @@ func (ch *columnHeader) unmarshalValuesAndBloomFilters(src []byte) ([]byte, erro
 func (ch *columnHeader) unmarshalValues(src []byte) ([]byte, error) {
 	srcOrig := src
 
-	tail, n, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal valuesOffset: %w", err)
+	n, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal valuesOffset")
 	}
+	src = src[nSize:]
 	ch.valuesOffset = n
-	src = tail
 
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal valuesSize: %w", err)
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal valuesSize")
 	}
+	src = src[nSize:]
 	if n > maxValuesBlockSize {
 		return srcOrig, fmt.Errorf("too big valuesSize: %d bytes; mustn't exceed %d bytes", n, maxValuesBlockSize)
 	}
 	ch.valuesSize = n
-	src = tail
 
 	return src, nil
 }
@@ -683,22 +928,22 @@ func (ch *columnHeader) unmarshalValues(src []byte) ([]byte, error) {
 func (ch *columnHeader) unmarshalBloomFilters(src []byte) ([]byte, error) {
 	srcOrig := src
 
-	tail, n, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal bloomFilterOffset: %w", err)
+	n, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal bloomFilterOffset")
 	}
+	src = src[nSize:]
 	ch.bloomFilterOffset = n
-	src = tail
 
-	tail, n, err = encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		return srcOrig, fmt.Errorf("cannot unmarshal bloomFilterSize: %w", err)
+	n, nSize = encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		return srcOrig, fmt.Errorf("cannot unmarshal bloomFilterSize")
 	}
+	src = src[nSize:]
 	if n > maxBloomFilterBlockSize {
 		return srcOrig, fmt.Errorf("too big bloomFilterSize: %d bytes; mustn't exceed %d bytes", n, maxBloomFilterBlockSize)
 	}
 	ch.bloomFilterSize = n
-	src = tail
 
 	return src, nil
 }
@@ -711,10 +956,10 @@ type timestampsHeader struct {
 	// blockSize is the size of the timestamps block inside timestampsFilename file
 	blockSize uint64
 
-	// minTimestamp is the mimumum timestamp seen in the block
+	// minTimestamp is the mimumum timestamp seen in the block in nanoseconds
 	minTimestamp int64
 
-	// maxTimestamp is the maximum timestamp seen in the block
+	// maxTimestamp is the maximum timestamp seen in the block in nanoseconds
 	maxTimestamp int64
 
 	// marshalType is the type used for encoding the timestamps block

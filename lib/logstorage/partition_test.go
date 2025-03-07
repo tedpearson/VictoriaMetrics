@@ -6,11 +6,12 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 )
 
 func TestPartitionLifecycle(t *testing.T) {
-	const path = "TestPartitionLifecycle"
+	t.Parallel()
+
+	path := t.Name()
 	var ddbStats DatadbStats
 
 	s := newTestStorage()
@@ -26,14 +27,20 @@ func TestPartitionLifecycle(t *testing.T) {
 			if ddbStats.InmemoryParts != 0 {
 				t.Fatalf("unexpected non-zero number of in-memory parts in empty partition: %d", ddbStats.InmemoryParts)
 			}
-			if ddbStats.FileParts != 0 {
-				t.Fatalf("unexpected non-zero number of file parts in empty partition: %d", ddbStats.FileParts)
+			if ddbStats.SmallParts != 0 {
+				t.Fatalf("unexpected non-zero number of small file parts in empty partition: %d", ddbStats.SmallParts)
+			}
+			if ddbStats.BigParts != 0 {
+				t.Fatalf("unexpected non-zero number of big file parts in empty partition: %d", ddbStats.BigParts)
 			}
 			if ddbStats.CompressedInmemorySize != 0 {
 				t.Fatalf("unexpected non-zero size of inmemory parts for empty partition")
 			}
-			if ddbStats.CompressedFileSize != 0 {
-				t.Fatalf("unexpected non-zero size of file parts for empty partition")
+			if ddbStats.CompressedSmallPartSize != 0 {
+				t.Fatalf("unexpected non-zero size of small file parts for empty partition")
+			}
+			if ddbStats.CompressedBigPartSize != 0 {
+				t.Fatalf("unexpected non-zero size of big file parts for empty partition")
 			}
 			time.Sleep(10 * time.Millisecond)
 			mustClosePartition(pt)
@@ -44,7 +51,9 @@ func TestPartitionLifecycle(t *testing.T) {
 }
 
 func TestPartitionMustAddRowsSerial(t *testing.T) {
-	const path = "TestPartitionMustAddRowsSerial"
+	t.Parallel()
+
+	path := t.Name()
 	var ddbStats DatadbStats
 
 	s := newTestStorage()
@@ -87,8 +96,8 @@ func TestPartitionMustAddRowsSerial(t *testing.T) {
 	if ddbStats.InmemoryParts != 0 {
 		t.Fatalf("unexpected non-zero number of in-memory parts after re-opening the partition: %d", ddbStats.InmemoryParts)
 	}
-	if ddbStats.FileParts == 0 {
-		t.Fatalf("the number of file parts must be greater than 0 after re-opening the partition")
+	if ddbStats.SmallParts+ddbStats.BigParts == 0 {
+		t.Fatalf("the number of small parts must be greater than 0 after re-opening the partition")
 	}
 
 	// Try adding entries for multiple streams at a time
@@ -115,7 +124,7 @@ func TestPartitionMustAddRowsSerial(t *testing.T) {
 	if ddbStats.InmemoryParts != 0 {
 		t.Fatalf("unexpected non-zero number of in-memory parts after re-opening the partition: %d", ddbStats.InmemoryParts)
 	}
-	if ddbStats.FileParts == 0 {
+	if ddbStats.SmallParts+ddbStats.BigParts == 0 {
 		t.Fatalf("the number of file parts must be greater than 0 after re-opening the partition")
 	}
 
@@ -126,7 +135,9 @@ func TestPartitionMustAddRowsSerial(t *testing.T) {
 }
 
 func TestPartitionMustAddRowsConcurrent(t *testing.T) {
-	const path = "TestPartitionMustAddRowsConcurrent"
+	t.Parallel()
+
+	path := t.Name()
 	s := newTestStorage()
 
 	mustCreatePartition(path)
@@ -171,17 +182,17 @@ func TestPartitionMustAddRowsConcurrent(t *testing.T) {
 //
 // When the storage is no longer needed, closeTestStorage() must be called.
 func newTestStorage() *Storage {
-	streamIDCache := workingsetcache.New(1024 * 1024)
-	streamFilterCache := workingsetcache.New(1024 * 1024)
+	streamIDCache := newCache()
+	filterStreamCache := newCache()
 	return &Storage{
 		flushInterval:     time.Second,
 		streamIDCache:     streamIDCache,
-		streamFilterCache: streamFilterCache,
+		filterStreamCache: filterStreamCache,
 	}
 }
 
 // closeTestStorage closes storage created via newTestStorage().
 func closeTestStorage(s *Storage) {
-	s.streamIDCache.Stop()
-	s.streamFilterCache.Stop()
+	s.streamIDCache.MustStop()
+	s.filterStreamCache.MustStop()
 }

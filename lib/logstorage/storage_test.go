@@ -7,8 +7,10 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 )
 
-func TestStorageLifecycle(_ *testing.T) {
-	const path = "TestStorageLifecycle"
+func TestStorageLifecycle(t *testing.T) {
+	t.Parallel()
+
+	path := t.Name()
 
 	for i := 0; i < 3; i++ {
 		cfg := &StorageConfig{}
@@ -19,7 +21,9 @@ func TestStorageLifecycle(_ *testing.T) {
 }
 
 func TestStorageMustAddRows(t *testing.T) {
-	const path = "TestStorageMustAddRows"
+	t.Parallel()
+
+	path := t.Name()
 
 	var sStats StorageStats
 
@@ -74,10 +78,10 @@ func TestStorageMustAddRows(t *testing.T) {
 	s = MustOpenStorage(path, cfg)
 
 	lr = newTestLogRows(3, 10, 0)
-	now := time.Now().UTC().UnixNano() - int64(len(lr.timestamps)/2)*nsecPerDay
+	now := time.Now().UTC().UnixNano() - int64(len(lr.timestamps)/2)*nsecsPerDay
 	for i := range lr.timestamps {
 		lr.timestamps[i] = now
-		now += nsecPerDay
+		now += nsecsPerDay
 	}
 	totalRowsCount += uint64(len(lr.timestamps))
 	s.MustAddRows(lr)

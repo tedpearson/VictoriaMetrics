@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logstorage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vlinsert/insertutils"
 )
 
 func BenchmarkParseJSONRequest(b *testing.B) {
@@ -22,13 +22,13 @@ func BenchmarkParseJSONRequest(b *testing.B) {
 }
 
 func benchmarkParseJSONRequest(b *testing.B, streams, rows, labels int) {
+	blp := &insertutils.BenchmarkLogMessageProcessor{}
 	b.ReportAllocs()
 	b.SetBytes(int64(streams * rows))
 	b.RunParallel(func(pb *testing.PB) {
 		data := getJSONBody(streams, rows, labels)
 		for pb.Next() {
-			_, err := parseJSONRequest(data, func(_ int64, _ []logstorage.Field) {})
-			if err != nil {
+			if err := parseJSONRequest(data, blp, false); err != nil {
 				panic(fmt.Errorf("unexpected error: %w", err))
 			}
 		}

@@ -28,14 +28,10 @@ import (
 // This time shouldn't exceed a few days.
 const maxBigPartSize = 1e12
 
-// The maximum number of inmemory parts per partition.
+// The maximum expected number of inmemory parts per partition.
 //
-// This limit allows reducing querying CPU usage under high ingestion rate.
-// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/5212
-//
-// This number may be reached when the insertion pace outreaches merger pace.
-// If this number is reached, then the data ingestion is paused until background
-// mergers reduce the number of parts below this number.
+// The actual number of inmemory parts may exceed this value if in-memory mergers
+// cannot keep up with the rate of creating new in-memory parts.
 const maxInmemoryParts = 60
 
 // Default number of parts to merge at once.
@@ -52,8 +48,7 @@ var rawRowsShardsPerPartition = cgroup.AvailableCPUs()
 // The interval for flushing buffered rows into parts, so they become visible to search.
 const pendingRowsFlushInterval = 2 * time.Second
 
-// The interval for guaranteed flush of recently ingested data from memory to on-disk parts,
-// so they survive process crash.
+// The interval for guaranteed flush of recently ingested data from memory to on-disk parts, so they survive process crash.
 var dataFlushInterval = 5 * time.Second
 
 // SetDataFlushInterval sets the interval for guaranteed flush of recently ingested data from memory to disk.
@@ -62,10 +57,14 @@ var dataFlushInterval = 5 * time.Second
 //
 // This function must be called before initializing the storage.
 func SetDataFlushInterval(d time.Duration) {
-	if d > pendingRowsFlushInterval {
-		dataFlushInterval = d
-		mergeset.SetDataFlushInterval(d)
+	if d < pendingRowsFlushInterval {
+		// There is no sense in setting dataFlushInterval to values smaller than pendingRowsFlushInterval,
+		// since pending rows unconditionally remain in memory for up to pendingRowsFlushInterval.
+		d = pendingRowsFlushInterval
 	}
+
+	dataFlushInterval = d
+	mergeset.SetDataFlushInterval(d)
 }
 
 // The maximum number of rawRow items in rawRowsShard.
@@ -635,7 +634,7 @@ func (pt *partition) inmemoryPartsMerger() {
 		}
 
 		inmemoryPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-inmemoryPartsConcurrencyCh
 
 		if err == nil {
@@ -668,7 +667,7 @@ func (pt *partition) smallPartsMerger() {
 		}
 
 		smallPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-smallPartsConcurrencyCh
 
 		if err == nil {
@@ -701,7 +700,7 @@ func (pt *partition) bigPartsMerger() {
 		}
 
 		bigPartsConcurrencyCh <- struct{}{}
-		err := pt.mergeParts(pws, pt.stopCh, false)
+		err := pt.mergeParts(pws, pt.stopCh, false, false)
 		<-bigPartsConcurrencyCh
 
 		if err == nil {
@@ -746,6 +745,9 @@ func (pt *partition) mustMergeInmemoryParts(pws []*partWrapper) []*partWrapper {
 			}()
 
 			pw := pt.mustMergeInmemoryPartsFinal(pwsChunk)
+			if pw == nil {
+				return
+			}
 
 			pwsResultLock.Lock()
 			pwsResult = append(pwsResult, pw)
@@ -797,7 +799,7 @@ func (pt *partition) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrappe
 
 	// Merge parts.
 	// The merge shouldn't be interrupted by stopCh, so use nil stopCh.
-	ph, err := pt.mergePartsInternal("", bsw, bsrs, partInmemory, nil)
+	ph, err := pt.mergePartsInternal("", bsw, bsrs, partInmemory, nil, time.Now().UnixMilli(), false)
 	putBlockStreamWriter(bsw)
 	for _, bsr := range bsrs {
 		putBlockStreamReader(bsr)
@@ -806,6 +808,11 @@ func (pt *partition) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrappe
 		logger.Panicf("FATAL: cannot merge inmemoryBlocks: %s", err)
 	}
 	mpDst.ph = *ph
+
+	// resulting part is empty, no need to create a part wrapper
+	if ph.BlocksCount == 0 {
+		return nil
+	}
 
 	return newPartWrapperFromInmemoryPart(mpDst, flushToDiskDeadline)
 }
@@ -1100,7 +1107,7 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 	}
 	pt.partsLock.Unlock()
 
-	if err := pt.mergePartsToFiles(pws, nil, inmemoryPartsConcurrencyCh); err != nil {
+	if err := pt.mergePartsToFiles(pws, nil, inmemoryPartsConcurrencyCh, false); err != nil {
 		logger.Panicf("FATAL: cannot merge in-memory parts: %s", err)
 	}
 }
@@ -1165,7 +1172,7 @@ func appendRawRowss(dst [][]rawRow, src []rawRow) [][]rawRow {
 	return dst
 }
 
-func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}) error {
+func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache bool) error {
 	pwsLen := len(pws)
 
 	var errGlobal error
@@ -1181,7 +1188,7 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 				wg.Done()
 			}()
 
-			if err := pt.mergeParts(pwsChunk, stopCh, true); err != nil && !errors.Is(err, errForciblyStopped) {
+			if err := pt.mergeParts(pwsChunk, stopCh, true, useSparseCache); err != nil && !errors.Is(err, errForciblyStopped) {
 				errGlobalLock.Lock()
 				if errGlobal == nil {
 					errGlobal = err
@@ -1221,7 +1228,7 @@ func (pt *partition) ForceMergeAllParts(stopCh <-chan struct{}) error {
 	// If len(pws) == 1, then the merge must run anyway.
 	// This allows applying the configured retention, removing the deleted series
 	// and performing de-duplication if needed.
-	if err := pt.mergePartsToFiles(pws, stopCh, bigPartsConcurrencyCh); err != nil {
+	if err := pt.mergePartsToFiles(pws, stopCh, bigPartsConcurrencyCh, true); err != nil {
 		return fmt.Errorf("cannot force merge %d parts from partition %q: %w", len(pws), pt.name, err)
 	}
 
@@ -1275,10 +1282,6 @@ func (pt *partition) getMaxSmallPartSize() uint64 {
 	// Small parts are cached in the OS page cache,
 	// so limit their size by the remaining free RAM.
 	mem := memory.Remaining()
-	// It is expected no more than defaultPartsToMerge/2 parts exist
-	// in the OS page cache before they are merged into bigger part.
-	// Half of the remaining RAM must be left for lib/mergeset parts,
-	// so the maxItems is calculated using the below code:
 	n := uint64(mem) / defaultPartsToMerge
 	if n < 10e6 {
 		n = 10e6
@@ -1376,7 +1379,7 @@ func getMinDedupInterval(pws []*partWrapper) int64 {
 //
 // All the parts inside pws must have isInMerge field set to true.
 // The isInMerge field inside pws parts is set to false before returning from the function.
-func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFinal bool) error {
+func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFinal, useSparseCache bool) error {
 	if len(pws) == 0 {
 		logger.Panicf("BUG: empty pws cannot be passed to mergeParts()")
 	}
@@ -1414,6 +1417,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 	}
 	rowsPerBlock := float64(srcRowsCount) / float64(srcBlocksCount)
 	compressLevel := getCompressLevel(rowsPerBlock)
+	currentTimestamp := startTime.UnixMilli()
 	bsw := getBlockStreamWriter()
 	var mpNew *inmemoryPart
 	if dstPartType == partInmemory {
@@ -1427,8 +1431,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 		bsw.MustInitFromFilePart(dstPartPath, nocache, compressLevel)
 	}
 
-	// Merge source parts to destination part.
-	ph, err := pt.mergePartsInternal(dstPartPath, bsw, bsrs, dstPartType, stopCh)
+	ph, err := pt.mergePartsInternal(dstPartPath, bsw, bsrs, dstPartType, stopCh, currentTimestamp, useSparseCache)
 	putBlockStreamWriter(bsw)
 	for _, bsr := range bsrs {
 		putBlockStreamReader(bsr)
@@ -1540,7 +1543,7 @@ func mustOpenBlockStreamReaders(pws []*partWrapper) []*blockStreamReader {
 	return bsrs
 }
 
-func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWriter, bsrs []*blockStreamReader, dstPartType partType, stopCh <-chan struct{}) (*partHeader, error) {
+func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWriter, bsrs []*blockStreamReader, dstPartType partType, stopCh <-chan struct{}, currentTimestamp int64, useSparseCache bool) (*partHeader, error) {
 	var ph partHeader
 	var rowsMerged *atomic.Uint64
 	var rowsDeleted *atomic.Uint64
@@ -1565,9 +1568,9 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 	default:
 		logger.Panicf("BUG: unknown partType=%d", dstPartType)
 	}
-	retentionDeadline := timestampFromTime(time.Now()) - pt.s.retentionMsecs
+	retentionDeadline := currentTimestamp - pt.s.retentionMsecs
 	activeMerges.Add(1)
-	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, pt.s, retentionDeadline, rowsMerged, rowsDeleted)
+	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, pt.s, retentionDeadline, rowsMerged, rowsDeleted, useSparseCache)
 	activeMerges.Add(-1)
 	mergesCount.Add(1)
 	if err != nil {

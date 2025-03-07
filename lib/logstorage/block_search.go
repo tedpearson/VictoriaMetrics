@@ -1,32 +1,79 @@
 package logstorage
 
 import (
-	"strconv"
 	"sync"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
+
+// The number of blocks to search at once by a single worker
+//
+// This number must be increased on systems with many CPU cores in order to amortize
+// the overhead for passing the blockSearchWork to worker goroutines.
+const blockSearchWorksPerBatch = 64
 
 type blockSearchWork struct {
 	// p is the part where the block belongs to.
 	p *part
 
-	// so contains search options for the block search
+	// so contains search options for the block search.
 	so *searchOptions
 
 	// bh is the header of the block to search.
 	bh blockHeader
 }
 
-func newBlockSearchWork(p *part, so *searchOptions, bh *blockHeader) *blockSearchWork {
-	var bsw blockSearchWork
-	bsw.p = p
-	bsw.so = so
+func (bsw *blockSearchWork) reset() {
+	bsw.p = nil
+	bsw.so = nil
+	bsw.bh.reset()
+}
+
+type blockSearchWorkBatch struct {
+	bsws []blockSearchWork
+}
+
+func (bswb *blockSearchWorkBatch) reset() {
+	bsws := bswb.bsws
+	for i := range bsws {
+		bsws[i].reset()
+	}
+	bswb.bsws = bsws[:0]
+}
+
+func getBlockSearchWorkBatch() *blockSearchWorkBatch {
+	v := blockSearchWorkBatchPool.Get()
+	if v == nil {
+		return &blockSearchWorkBatch{
+			bsws: make([]blockSearchWork, 0, blockSearchWorksPerBatch),
+		}
+	}
+	return v.(*blockSearchWorkBatch)
+}
+
+func putBlockSearchWorkBatch(bswb *blockSearchWorkBatch) {
+	bswb.reset()
+	blockSearchWorkBatchPool.Put(bswb)
+}
+
+var blockSearchWorkBatchPool sync.Pool
+
+func (bswb *blockSearchWorkBatch) appendBlockSearchWork(p *part, so *searchOptions, bh *blockHeader) bool {
+	bsws := bswb.bsws
+
+	bsws = append(bsws, blockSearchWork{
+		p:  p,
+		so: so,
+	})
+	bsw := &bsws[len(bsws)-1]
 	bsw.bh.copyFrom(bh)
-	return &bsw
+
+	bswb.bsws = bsws
+
+	return len(bsws) < cap(bsws)
 }
 
 func getBlockSearch() *blockSearch {
@@ -39,6 +86,10 @@ func getBlockSearch() *blockSearch {
 
 func putBlockSearch(bs *blockSearch) {
 	bs.reset()
+
+	// reset seenStreams before returning bs to the pool in order to reduce memory usage.
+	bs.seenStreams = nil
+
 	blockSearchPool.Put(bs)
 }
 
@@ -63,8 +114,37 @@ type blockSearch struct {
 	// sbu is used for unmarshaling local columns
 	sbu stringsBlockUnmarshaler
 
-	// csh is the columnsHeader associated with the given block
-	csh columnsHeader
+	// cshIndexBlockCache holds columnsHeaderIndex data for the given block.
+	//
+	// It is initialized lazily by calling getColumnsHeaderIndex().
+	cshIndexBlockCache []byte
+
+	// cshBlockCache holds columnsHeader data for the given block.
+	//
+	// It is initialized lazily by calling getColumnsHeaderBlock().
+	cshBlockCache       []byte
+	cshBlockInitialized bool
+
+	// ccsCache is the cache for accessed const columns
+	ccsCache []Field
+
+	// chsCache is the cache for accessed column headers
+	chsCache []columnHeader
+
+	// cshIndexCache is the columnsHeaderIndex associated with the given block.
+	//
+	// It is initialized lazily by calling getColumnsHeaderIndex().
+	cshIndexCache *columnsHeaderIndex
+
+	// cshCache is the columnsHeader associated with the given block.
+	//
+	// It is initialized lazily by calling getColumnsHeader().
+	cshCache *columnsHeader
+
+	// seenStreams contains seen streamIDs for the recent searches.
+	//
+	// It is used for speeding up fetching _stream column.
+	seenStreams map[u128]string
 }
 
 func (bs *blockSearch) reset() {
@@ -89,68 +169,248 @@ func (bs *blockSearch) reset() {
 	}
 
 	bs.sbu.reset()
-	bs.csh.reset()
+
+	bs.cshIndexBlockCache = bs.cshIndexBlockCache[:0]
+
+	bs.cshBlockCache = bs.cshBlockCache[:0]
+	bs.cshBlockInitialized = false
+
+	ccsCache := bs.ccsCache
+	for i := range ccsCache {
+		ccsCache[i].Reset()
+	}
+	bs.ccsCache = ccsCache[:0]
+
+	chsCache := bs.chsCache
+	for i := range chsCache {
+		chsCache[i].reset()
+	}
+	bs.chsCache = chsCache[:0]
+
+	if bs.cshIndexCache != nil {
+		putColumnsHeaderIndex(bs.cshIndexCache)
+		bs.cshIndexCache = nil
+	}
+
+	if bs.cshCache != nil {
+		putColumnsHeader(bs.cshCache)
+		bs.cshCache = nil
+	}
+
+	// Do not reset seenStreams, since its' lifetime is managed by blockResult.addStreamColumn() code.
 }
 
 func (bs *blockSearch) partPath() string {
 	return bs.bsw.p.path
 }
 
-func (bs *blockSearch) search(bsw *blockSearchWork) {
+func (bs *blockSearch) search(bsw *blockSearchWork, bm *bitmap) {
 	bs.reset()
 
 	bs.bsw = bsw
 
-	bs.csh.initFromBlockHeader(bsw.p, &bsw.bh)
-
 	// search rows matching the given filter
-	bm := getFilterBitmap(int(bsw.bh.rowsCount))
+	bm.init(int(bsw.bh.rowsCount))
 	bm.setBits()
-	bs.bsw.so.filter.apply(bs, bm)
+	bs.bsw.so.filter.applyToBlockSearch(bs, bm)
 
-	bs.br.mustInit(bs, bm)
 	if bm.isZero() {
-		putFilterBitmap(bm)
+		// The filter doesn't match any logs in the current block.
 		return
 	}
 
+	bs.br.mustInit(bs, bm)
+
 	// fetch the requested columns to bs.br.
-	for _, columnName := range bs.bsw.so.resultColumnNames {
-		switch columnName {
-		case "_stream":
-			bs.br.addStreamColumn(bs)
-		case "_time":
-			bs.br.addTimeColumn()
-		default:
-			v := bs.csh.getConstColumnValue(columnName)
-			if v != "" {
-				bs.br.addConstColumn(v)
-				continue
-			}
-			ch := bs.csh.getColumnHeader(columnName)
-			if ch == nil {
-				bs.br.addConstColumn("")
-			} else {
-				bs.br.addColumn(bs, ch, bm)
-			}
-		}
+	if bs.bsw.so.needAllColumns {
+		bs.br.initAllColumns()
+	} else {
+		bs.br.initRequestedColumns()
 	}
-	putFilterBitmap(bm)
 }
 
-func (csh *columnsHeader) initFromBlockHeader(p *part, bh *blockHeader) {
-	bb := longTermBufPool.Get()
-	columnsHeaderSize := bh.columnsHeaderSize
-	if columnsHeaderSize > maxColumnsHeaderSize {
-		logger.Panicf("FATAL: %s: columns header size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderSize, columnsHeaderSize)
-	}
-	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(columnsHeaderSize))
-	p.columnsHeaderFile.MustReadAt(bb.B, int64(bh.columnsHeaderOffset))
+func (bs *blockSearch) partFormatVersion() uint {
+	return bs.bsw.p.ph.FormatVersion
+}
 
-	if err := csh.unmarshal(bb.B); err != nil {
-		logger.Panicf("FATAL: %s: cannot unmarshal columns header: %s", p.path, err)
+func (bs *blockSearch) getConstColumnValue(name string) string {
+	if name == "_msg" {
+		name = ""
 	}
-	longTermBufPool.Put(bb)
+
+	if bs.partFormatVersion() < 1 {
+		csh := bs.getColumnsHeader()
+		for _, cc := range csh.constColumns {
+			if cc.Name == name {
+				return cc.Value
+			}
+		}
+		return ""
+	}
+
+	columnNameID, ok := bs.getColumnNameID(name)
+	if !ok {
+		return ""
+	}
+
+	for i := range bs.ccsCache {
+		if bs.ccsCache[i].Name == name {
+			return bs.ccsCache[i].Value
+		}
+	}
+
+	cshIndex := bs.getColumnsHeaderIndex()
+	for _, cr := range cshIndex.constColumnsRefs {
+		if cr.columnNameID != columnNameID {
+			continue
+		}
+
+		b := bs.getColumnsHeaderBlock()
+		if cr.offset > uint64(len(b)) {
+			logger.Panicf("FATAL: %s: header offset for const column %q cannot exceed %d bytes; got %d bytes", bs.bsw.p.path, name, len(b), cr.offset)
+		}
+		b = b[cr.offset:]
+		bs.ccsCache = slicesutil.SetLength(bs.ccsCache, len(bs.ccsCache)+1)
+		cc := &bs.ccsCache[len(bs.ccsCache)-1]
+		if _, err := cc.unmarshalNoArena(b, false); err != nil {
+			logger.Panicf("FATAL: %s: cannot unmarshal header for const column %q: %s", bs.bsw.p.path, name, err)
+		}
+		cc.Name = bs.getColumnNameByID(columnNameID)
+		return cc.Value
+	}
+	return ""
+}
+
+func (bs *blockSearch) getColumnHeader(name string) *columnHeader {
+	if name == "_msg" {
+		name = ""
+	}
+
+	if bs.partFormatVersion() < 1 {
+		csh := bs.getColumnsHeader()
+		chs := csh.columnHeaders
+		for i := range chs {
+			ch := &chs[i]
+			if ch.name == name {
+				return ch
+			}
+		}
+		return nil
+	}
+
+	columnNameID, ok := bs.getColumnNameID(name)
+	if !ok {
+		return nil
+	}
+
+	for i := range bs.chsCache {
+		if bs.chsCache[i].name == name {
+			return &bs.chsCache[i]
+		}
+	}
+
+	cshIndex := bs.getColumnsHeaderIndex()
+	for _, cr := range cshIndex.columnHeadersRefs {
+		if cr.columnNameID != columnNameID {
+			continue
+		}
+
+		b := bs.getColumnsHeaderBlock()
+		if cr.offset > uint64(len(b)) {
+			logger.Panicf("FATAL: %s: header offset for column %q cannot exceed %d bytes; got %d bytes", bs.bsw.p.path, name, len(b), cr.offset)
+		}
+		b = b[cr.offset:]
+		bs.chsCache = slicesutil.SetLength(bs.chsCache, len(bs.chsCache)+1)
+		ch := &bs.chsCache[len(bs.chsCache)-1]
+		if _, err := ch.unmarshalNoArena(b, partFormatLatestVersion); err != nil {
+			logger.Panicf("FATAL: %s: cannot unmarshal header for column %q: %s", bs.bsw.p.path, name, err)
+		}
+		ch.name = bs.getColumnNameByID(columnNameID)
+		return ch
+	}
+	return nil
+}
+
+func (bs *blockSearch) getColumnNameID(name string) (uint64, bool) {
+	id, ok := bs.bsw.p.columnNameIDs[name]
+	return id, ok
+}
+
+func (bs *blockSearch) getColumnNameByID(columnNameID uint64) string {
+	columnNames := bs.bsw.p.columnNames
+	if columnNameID >= uint64(len(columnNames)) {
+		logger.Panicf("FATAL: %s: too big columnNameID=%d; it must be smaller than %d", bs.bsw.p.path, columnNameID, len(columnNames))
+	}
+	return columnNames[columnNameID]
+}
+
+func (bs *blockSearch) getColumnsHeaderIndex() *columnsHeaderIndex {
+	if bs.partFormatVersion() < 1 {
+		logger.Panicf("BUG: getColumnsHeaderIndex() can be called only for part encoding v1+, while it has been called for v%d", bs.partFormatVersion())
+	}
+
+	if bs.cshIndexCache == nil {
+		bs.cshIndexBlockCache = readColumnsHeaderIndexBlock(bs.cshIndexBlockCache[:0], bs.bsw.p, &bs.bsw.bh)
+
+		bs.cshIndexCache = getColumnsHeaderIndex()
+		if err := bs.cshIndexCache.unmarshalNoArena(bs.cshIndexBlockCache); err != nil {
+			logger.Panicf("FATAL: %s: cannot unmarshal columns header index: %s", bs.bsw.p.path, err)
+		}
+	}
+	return bs.cshIndexCache
+}
+
+func (bs *blockSearch) getColumnsHeader() *columnsHeader {
+	if bs.cshCache == nil {
+		b := bs.getColumnsHeaderBlock()
+
+		csh := getColumnsHeader()
+		partFormatVersion := bs.partFormatVersion()
+		if err := csh.unmarshalNoArena(b, partFormatVersion); err != nil {
+			logger.Panicf("FATAL: %s: cannot unmarshal columns header: %s", bs.bsw.p.path, err)
+		}
+		if partFormatVersion >= 1 {
+			cshIndex := bs.getColumnsHeaderIndex()
+			if err := csh.setColumnNames(cshIndex, bs.bsw.p.columnNames); err != nil {
+				logger.Panicf("FATAL: %s: %s", bs.bsw.p.path, err)
+			}
+		}
+
+		bs.cshCache = csh
+	}
+	return bs.cshCache
+}
+
+func (bs *blockSearch) getColumnsHeaderBlock() []byte {
+	if !bs.cshBlockInitialized {
+		bs.cshBlockCache = readColumnsHeaderBlock(bs.cshBlockCache[:0], bs.bsw.p, &bs.bsw.bh)
+		bs.cshBlockInitialized = true
+	}
+	return bs.cshBlockCache
+}
+
+func readColumnsHeaderIndexBlock(dst []byte, p *part, bh *blockHeader) []byte {
+	n := bh.columnsHeaderIndexSize
+	if n > maxColumnsHeaderIndexSize {
+		logger.Panicf("FATAL: %s: columns header index size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderIndexSize, n)
+	}
+
+	dstLen := len(dst)
+	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
+	p.columnsHeaderIndexFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderIndexOffset))
+
+	return dst
+}
+
+func readColumnsHeaderBlock(dst []byte, p *part, bh *blockHeader) []byte {
+	n := bh.columnsHeaderSize
+	if n > maxColumnsHeaderSize {
+		logger.Panicf("FATAL: %s: columns header size cannot exceed %d bytes; got %d bytes", p.path, maxColumnsHeaderSize, n)
+	}
+	dstLen := len(dst)
+	dst = bytesutil.ResizeNoCopyMayOverallocate(dst, int(n)+dstLen)
+	p.columnsHeaderFile.MustReadAt(dst[dstLen:], int64(bh.columnsHeaderOffset))
+	return dst
 }
 
 // getBloomFilterForColumn returns bloom filter for the given ch.
@@ -163,11 +423,7 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 	}
 
 	p := bs.bsw.p
-
-	bloomFilterFile := p.fieldBloomFilterFile
-	if ch.name == "" {
-		bloomFilterFile = p.messageBloomFilterFile
-	}
+	bloomValuesFile := p.getBloomValuesFileForColumnName(ch.name)
 
 	bb := longTermBufPool.Get()
 	bloomFilterSize := ch.bloomFilterSize
@@ -175,7 +431,8 @@ func (bs *blockSearch) getBloomFilterForColumn(ch *columnHeader) *bloomFilter {
 		logger.Panicf("FATAL: %s: bloom filter block size cannot exceed %d bytes; got %d bytes", bs.partPath(), maxBloomFilterBlockSize, bloomFilterSize)
 	}
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(bloomFilterSize))
-	bloomFilterFile.MustReadAt(bb.B, int64(ch.bloomFilterOffset))
+
+	bloomValuesFile.bloom.MustReadAt(bb.B, int64(ch.bloomFilterOffset))
 	bf = getBloomFilter()
 	if err := bf.unmarshal(bb.B); err != nil {
 		logger.Panicf("FATAL: %s: cannot unmarshal bloom filter: %s", bs.partPath(), err)
@@ -199,11 +456,7 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 	}
 
 	p := bs.bsw.p
-
-	valuesFile := p.fieldValuesFile
-	if ch.name == "" {
-		valuesFile = p.messageValuesFile
-	}
+	bloomValuesFile := p.getBloomValuesFileForColumnName(ch.name)
 
 	bb := longTermBufPool.Get()
 	valuesSize := ch.valuesSize
@@ -211,7 +464,7 @@ func (bs *blockSearch) getValuesForColumn(ch *columnHeader) []string {
 		logger.Panicf("FATAL: %s: values block size cannot exceed %d bytes; got %d bytes", bs.partPath(), maxValuesBlockSize, valuesSize)
 	}
 	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(valuesSize))
-	valuesFile.MustReadAt(bb.B, int64(ch.valuesOffset))
+	bloomValuesFile.values.MustReadAt(bb.B, int64(ch.valuesOffset))
 
 	values = getStringBucket()
 	var err error
@@ -278,7 +531,7 @@ func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part) []b
 		logger.Panicf("FATAL: %s: cannot decompress indexBlock read at offset %d with size %d: %s", p.indexFile.Path(), ih.indexBlockOffset, ih.indexBlockSize, err)
 	}
 
-	dst, err = unmarshalBlockHeaders(dst, bb.B)
+	dst, err = unmarshalBlockHeaders(dst, bb.B, p.ph.FormatVersion)
 	longTermBufPool.Put(bb)
 	if err != nil {
 		logger.Panicf("FATAL: %s: cannot unmarshal block headers read at offset %d with size %d: %s", p.indexFile.Path(), ih.indexBlockOffset, ih.indexBlockSize, err)
@@ -287,359 +540,47 @@ func (ih *indexBlockHeader) mustReadBlockHeaders(dst []blockHeader, p *part) []b
 	return dst
 }
 
-type blockResult struct {
-	buf       []byte
-	valuesBuf []string
-
-	// streamID is streamID for the given blockResult
-	streamID streamID
-
-	// cs contain values for result columns
-	cs []blockResultColumn
-
-	// timestamps contain timestamps for the selected log entries
-	timestamps []int64
-}
-
-func (br *blockResult) reset() {
-	br.buf = br.buf[:0]
-
-	vb := br.valuesBuf
-	for i := range vb {
-		vb[i] = ""
-	}
-	br.valuesBuf = vb[:0]
-
-	br.streamID.reset()
-
-	cs := br.cs
-	for i := range cs {
-		cs[i].reset()
-	}
-	br.cs = cs[:0]
-
-	br.timestamps = br.timestamps[:0]
-}
-
-func (br *blockResult) RowsCount() int {
-	return len(br.timestamps)
-}
-
-func (br *blockResult) mustInit(bs *blockSearch, bm *filterBitmap) {
-	br.reset()
-
-	br.streamID = bs.bsw.bh.streamID
-
-	if !bm.isZero() {
-		// Initialize timestamps, since they are used for determining the number of rows in br.RowsCount()
-		srcTimestamps := bs.getTimestamps()
-		dstTimestamps := br.timestamps[:0]
-		bm.forEachSetBit(func(idx int) bool {
-			ts := srcTimestamps[idx]
-			dstTimestamps = append(dstTimestamps, ts)
-			return true
-		})
-		br.timestamps = dstTimestamps
-	}
-}
-
-func (br *blockResult) addColumn(bs *blockSearch, ch *columnHeader, bm *filterBitmap) {
-	buf := br.buf
-	valuesBuf := br.valuesBuf
-	valuesBufLen := len(valuesBuf)
-	var dictValues []string
-
-	appendValue := func(v string) {
-		bufLen := len(buf)
-		buf = append(buf, v...)
-		s := bytesutil.ToUnsafeString(buf[bufLen:])
-		valuesBuf = append(valuesBuf, s)
+// getStreamStr returns _stream value for the given block at bs.
+func (bs *blockSearch) getStreamStr() string {
+	sid := bs.bsw.bh.streamID.id
+	streamStr := bs.seenStreams[sid]
+	if streamStr != "" {
+		// Fast path - streamStr is found in the seenStreams.
+		return streamStr
 	}
 
-	switch ch.valueType {
-	case valueTypeString:
-		visitValues(bs, ch, bm, func(v string) bool {
-			appendValue(v)
-			return true
-		})
-	case valueTypeDict:
-		dictValues = ch.valuesDict.values
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 1 {
-				logger.Panicf("FATAL: %s: unexpected dict value size for column %q; got %d bytes; want 1 byte", bs.partPath(), ch.name, len(v))
-			}
-			dictIdx := v[0]
-			if int(dictIdx) >= len(dictValues) {
-				logger.Panicf("FATAL: %s: too big dict index for column %q: %d; should be smaller than %d", bs.partPath(), ch.name, dictIdx, len(dictValues))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeUint8:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 1 {
-				logger.Panicf("FATAL: %s: unexpected size for uint8 column %q; got %d bytes; want 1 byte", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeUint16:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 2 {
-				logger.Panicf("FATAL: %s: unexpected size for uint16 column %q; got %d bytes; want 2 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeUint32:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 4 {
-				logger.Panicf("FATAL: %s: unexpected size for uint32 column %q; got %d bytes; want 4 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeUint64:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 8 {
-				logger.Panicf("FATAL: %s: unexpected size for uint64 column %q; got %d bytes; want 8 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeFloat64:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 8 {
-				logger.Panicf("FATAL: %s: unexpected size for float64 column %q; got %d bytes; want 8 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeIPv4:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 4 {
-				logger.Panicf("FATAL: %s: unexpected size for ipv4 column %q; got %d bytes; want 4 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	case valueTypeTimestampISO8601:
-		visitValues(bs, ch, bm, func(v string) bool {
-			if len(v) != 8 {
-				logger.Panicf("FATAL: %s: unexpected size for timestmap column %q; got %d bytes; want 8 bytes", bs.partPath(), ch.name, len(v))
-			}
-			appendValue(v)
-			return true
-		})
-	default:
-		logger.Panicf("FATAL: %s: unknown valueType=%d for column %q", bs.partPath(), ch.valueType, ch.name)
+	// Slow path - load streamStr from the storage.
+	streamStr = bs.getStreamStrSlow()
+	if streamStr != "" {
+		// Store the found streamStr in seenStreams.
+		if len(bs.seenStreams) > 20_000 {
+			bs.seenStreams = nil
+		}
+		if bs.seenStreams == nil {
+			bs.seenStreams = make(map[u128]string)
+		}
+		bs.seenStreams[sid] = streamStr
 	}
-
-	encodedValues := valuesBuf[valuesBufLen:]
-
-	valuesBufLen = len(valuesBuf)
-	for _, v := range dictValues {
-		appendValue(v)
-	}
-	dictValues = valuesBuf[valuesBufLen:]
-
-	br.cs = append(br.cs, blockResultColumn{
-		valueType:     ch.valueType,
-		dictValues:    dictValues,
-		encodedValues: encodedValues,
-	})
-	br.buf = buf
-	br.valuesBuf = valuesBuf
+	return streamStr
 }
 
-func (br *blockResult) addTimeColumn() {
-	br.cs = append(br.cs, blockResultColumn{
-		isTime: true,
-	})
-}
-
-func (br *blockResult) addStreamColumn(bs *blockSearch) {
+func (bs *blockSearch) getStreamStrSlow() string {
 	bb := bbPool.Get()
-	bb.B = bs.bsw.p.pt.appendStreamTagsByStreamID(bb.B[:0], &br.streamID)
-	if len(bb.B) > 0 {
-		st := GetStreamTags()
-		mustUnmarshalStreamTags(st, bb.B)
-		bb.B = st.marshalString(bb.B[:0])
-		PutStreamTags(st)
-	}
-	s := bytesutil.ToUnsafeString(bb.B)
-	br.addConstColumn(s)
-	bbPool.Put(bb)
-}
+	defer bbPool.Put(bb)
 
-func (br *blockResult) addConstColumn(value string) {
-	buf := br.buf
-	bufLen := len(buf)
-	buf = append(buf, value...)
-	s := bytesutil.ToUnsafeString(buf[bufLen:])
-	br.buf = buf
-
-	valuesBuf := br.valuesBuf
-	valuesBufLen := len(valuesBuf)
-	valuesBuf = append(valuesBuf, s)
-	br.valuesBuf = valuesBuf
-
-	br.cs = append(br.cs, blockResultColumn{
-		isConst:       true,
-		valueType:     valueTypeUnknown,
-		encodedValues: valuesBuf[valuesBufLen:],
-	})
-}
-
-// getColumnValues returns values for the column with the given idx.
-//
-// The returned values are valid until br.reset() is called.
-func (br *blockResult) getColumnValues(idx int) []string {
-	c := &br.cs[idx]
-	if c.values != nil {
-		return c.values
+	bb.B = bs.bsw.p.pt.idb.appendStreamTagsByStreamID(bb.B[:0], &bs.bsw.bh.streamID)
+	if len(bb.B) == 0 {
+		// Couldn't find stream tags by sid. This may be the case when the corresponding log stream
+		// was recently registered and its tags aren't visible to search yet.
+		// The stream tags must become visible in a few seconds.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6042
+		return ""
 	}
 
-	buf := br.buf
-	valuesBuf := br.valuesBuf
-	valuesBufLen := len(valuesBuf)
+	st := GetStreamTags()
+	mustUnmarshalStreamTags(st, bb.B)
+	bb.B = st.marshalString(bb.B[:0])
+	PutStreamTags(st)
 
-	if c.isConst {
-		v := c.encodedValues[0]
-		for range br.timestamps {
-			valuesBuf = append(valuesBuf, v)
-		}
-		c.values = valuesBuf[valuesBufLen:]
-		br.valuesBuf = valuesBuf
-		return c.values
-	}
-	if c.isTime {
-		for _, timestamp := range br.timestamps {
-			t := time.Unix(0, timestamp).UTC()
-			bufLen := len(buf)
-			buf = t.AppendFormat(buf, time.RFC3339Nano)
-			s := bytesutil.ToUnsafeString(buf[bufLen:])
-			valuesBuf = append(valuesBuf, s)
-		}
-		c.values = valuesBuf[valuesBufLen:]
-		br.buf = buf
-		br.valuesBuf = valuesBuf
-		return c.values
-	}
-
-	appendValue := func(v string) {
-		bufLen := len(buf)
-		buf = append(buf, v...)
-		s := bytesutil.ToUnsafeString(buf[bufLen:])
-		valuesBuf = append(valuesBuf, s)
-	}
-
-	switch c.valueType {
-	case valueTypeString:
-		c.values = c.encodedValues
-		return c.values
-	case valueTypeDict:
-		dictValues := c.dictValues
-		for _, v := range c.encodedValues {
-			dictIdx := v[0]
-			appendValue(dictValues[dictIdx])
-		}
-	case valueTypeUint8:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			n := uint64(v[0])
-			bb.B = strconv.AppendUint(bb.B[:0], n, 10)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeUint16:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			b := bytesutil.ToUnsafeBytes(v)
-			n := uint64(encoding.UnmarshalUint16(b))
-			bb.B = strconv.AppendUint(bb.B[:0], n, 10)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeUint32:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			b := bytesutil.ToUnsafeBytes(v)
-			n := uint64(encoding.UnmarshalUint32(b))
-			bb.B = strconv.AppendUint(bb.B[:0], n, 10)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeUint64:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			b := bytesutil.ToUnsafeBytes(v)
-			n := encoding.UnmarshalUint64(b)
-			bb.B = strconv.AppendUint(bb.B[:0], n, 10)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeFloat64:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			bb.B = toFloat64String(bb.B[:0], v)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeIPv4:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			bb.B = toIPv4String(bb.B[:0], v)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	case valueTypeTimestampISO8601:
-		bb := bbPool.Get()
-		for _, v := range c.encodedValues {
-			bb.B = toTimestampISO8601String(bb.B[:0], v)
-			appendValue(bytesutil.ToUnsafeString(bb.B))
-		}
-		bbPool.Put(bb)
-	default:
-		logger.Panicf("BUG: unknown valueType=%d", c.valueType)
-	}
-
-	c.values = valuesBuf[valuesBufLen:]
-	br.buf = buf
-	br.valuesBuf = valuesBuf
-
-	return c.values
-}
-
-type blockResultColumn struct {
-	// isConst is set to true if the column is const.
-	//
-	// The column value is stored in encodedValues[0]
-	isConst bool
-
-	// isTime is set to true if the column contains _time values.
-	//
-	// The column values are stored in blockResult.timestamps
-	isTime bool
-
-	// valueType is the type of non-cost value
-	valueType valueType
-
-	// dictValues contain dictionary values for valueTypeDict column
-	dictValues []string
-
-	// encodedValues contain encoded values for non-const column
-	encodedValues []string
-
-	// values contain decoded values after getColumnValues() call for the given column
-	values []string
-}
-
-func (c *blockResultColumn) reset() {
-	c.isConst = false
-	c.isTime = false
-	c.valueType = valueTypeUnknown
-	c.dictValues = nil
-	c.encodedValues = nil
-	c.values = nil
+	return string(bb.B)
 }

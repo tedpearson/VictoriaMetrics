@@ -11,7 +11,7 @@ import (
 func BenchmarkParseStream(b *testing.B) {
 	samples := []*pb.Metric{
 		generateGauge("my-gauge", ""),
-		generateHistogram("my-histogram", ""),
+		generateHistogram("my-histogram", "", true),
 		generateSum("my-sum", "", false),
 		generateSummary("my-summary", ""),
 	}
@@ -32,5 +32,4 @@ func BenchmarkParseStream(b *testing.B) {
 			}
 		}
 	})
-
 }

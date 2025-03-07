@@ -1,5 +1,5 @@
 import React, { FC } from "preact/compat";
-import { InfoIcon } from "../../../components/Main/Icons";
+import { InfoOutlinedIcon } from "../../../components/Main/Icons";
 import Tooltip from "../../../components/Main/Tooltip/Tooltip";
 import { TopHeapEntry } from "../types";
 import { useSearchParams } from "react-router-dom";
@@ -41,10 +41,10 @@ const CardinalityTotals: FC<CardinalityTotalsProps> = ({
       value: totalSeries.toLocaleString("en-US"),
       dynamic: (!totalSeries || !totalSeriesPrev || isPrometheus) ? "" : `${dynamic.toFixed(2)}%`,
       display: !focusLabel,
-      info: `The total number of active time series. 
+      info: `The total number of unique time series for a selected day.
              A time series is uniquely identified by its name plus a set of its labels. 
              For example, temperature{city="NY",country="US"} and temperature{city="SF",country="US"} 
-             are two distinct series, since they differ by the city label.`
+             are two distinct series, since they differ by the "city" label.`
     },
     {
       title: "Percentage from total",
@@ -71,12 +71,12 @@ const CardinalityTotals: FC<CardinalityTotalsProps> = ({
           key={title}
         >
           <h4 className="vm-cardinality-totals-card__title">
-            {title}
             {info && (
               <Tooltip title={<p className="vm-cardinality-totals-card__tooltip">{info}</p>}>
-                <div className="vm-cardinality-totals-card__info-icon"><InfoIcon/></div>
+                <div className="vm-cardinality-totals-card__info-icon"><InfoOutlinedIcon/></div>
               </Tooltip>
             )}
+            {title}
           </h4>
           <span className="vm-cardinality-totals-card__value">{value}</span>
           {!!dynamic && (

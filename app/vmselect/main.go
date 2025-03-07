@@ -2,7 +2,6 @@ package vmselect
 
 import (
 	"embed"
-	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -30,13 +29,13 @@ import (
 )
 
 var (
-	deleteAuthKey         = flagutil.NewPassword("deleteAuthKey", "authKey for metrics' deletion via /api/v1/admin/tsdb/delete_series and /tags/delSeries")
+	deleteAuthKey         = flagutil.NewPassword("deleteAuthKey", "authKey for metrics' deletion via /api/v1/admin/tsdb/delete_series and /tags/delSeries. It could be passed via authKey query arg. It overrides -httpAuth.*")
 	maxConcurrentRequests = flag.Int("search.maxConcurrentRequests", getDefaultMaxConcurrentRequests(), "The maximum number of concurrent search requests. "+
 		"It shouldn't be high, since a single request can saturate all the CPU cores, while many concurrently executed requests may require high amounts of memory. "+
 		"See also -search.maxQueueDuration and -search.maxMemoryPerQuery")
 	maxQueueDuration = flag.Duration("search.maxQueueDuration", 10*time.Second, "The maximum time the request waits for execution when -search.maxConcurrentRequests "+
 		"limit is reached; see also -search.maxQueryDuration")
-	resetCacheAuthKey    = flagutil.NewPassword("search.resetCacheAuthKey", "Optional authKey for resetting rollup cache via /internal/resetRollupResultCache call")
+	resetCacheAuthKey    = flagutil.NewPassword("search.resetCacheAuthKey", "Optional authKey for resetting rollup cache via /internal/resetRollupResultCache call. It could be passed via authKey query arg. It overrides -httpAuth.*")
 	logSlowQueryDuration = flag.Duration("search.logSlowQueryDuration", 5*time.Second, "Log queries with execution time exceeding this value. Zero disables slow query logging. "+
 		"See also -search.logQueryMemoryUsage")
 	vmalertProxyURL = flag.String("vmalert.proxyURL", "", "Optional URL for proxying requests to vmalert. For example, if -vmalert.proxyURL=http://vmalert:8880 , then alerting API requests such as /api/v1/rules from Grafana will be proxied to http://vmalert:8880/api/v1/rules")
@@ -45,10 +44,7 @@ var (
 var slowQueries = metrics.NewCounter(`vm_slow_queries_total`)
 
 func getDefaultMaxConcurrentRequests() int {
-	n := cgroup.AvailableCPUs()
-	if n <= 4 {
-		n *= 2
-	}
+	n := cgroup.AvailableCPUs() * 2
 	if n > 16 {
 		// A single request can saturate all the CPU cores, so there is no sense
 		// in allowing higher number of concurrent requests - they will just contend
@@ -64,6 +60,7 @@ func Init() {
 	fs.RemoveDirContents(tmpDirPath)
 	netstorage.InitTmpBlocksDir(tmpDirPath)
 	promql.InitRollupResultCache(*vmstorage.DataPath + "/cache/rollupResult")
+	prometheus.InitMaxUniqueTimeseries(*maxConcurrentRequests)
 
 	concurrencyLimitCh = make(chan struct{}, *maxConcurrentRequests)
 	initVMAlertProxy()
@@ -85,6 +82,9 @@ var (
 	})
 	_ = metrics.NewGauge(`vm_concurrent_select_current`, func() float64 {
 		return float64(len(concurrencyLimitCh))
+	})
+	_ = metrics.NewGauge(`vm_search_max_unique_timeseries`, func() float64 {
+		return float64(prometheus.GetMaxUniqueTimeSeries())
 	})
 )
 
@@ -115,7 +115,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	startTime := time.Now()
 	defer requestDuration.UpdateDuration(startTime)
 	tracerEnabled := httputils.GetBool(r, "trace")
-	qt := querytracer.New(tracerEnabled, r.URL.Path)
+	qt := querytracer.New(tracerEnabled, "%s", r.URL.Path)
 
 	// Limit the number of concurrent queries.
 	select {
@@ -138,7 +138,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 			timerpool.Put(t)
 			remoteAddr := httpserver.GetQuotedRemoteAddr(r)
 			requestURI := httpserver.GetRequestURI(r)
-			logger.Infof("client has cancelled the request after %.3f seconds: remoteAddr=%s, requestURI: %q",
+			logger.Infof("client has canceled the request after %.3f seconds: remoteAddr=%s, requestURI: %q",
 				time.Since(startTime).Seconds(), remoteAddr, requestURI)
 			return true
 		case <-t.C:
@@ -172,7 +172,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	if path == "/internal/resetRollupResultCache" {
-		if !httpserver.CheckAuthFlag(w, r, resetCacheAuthKey.Get(), "resetCacheAuthKey") {
+		if !httpserver.CheckAuthFlag(w, r, resetCacheAuthKey) {
 			return true
 		}
 		promql.ResetRollupResultCache()
@@ -187,7 +187,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 			httpserver.EnableCORS(w, r)
 			if err := prometheus.LabelValuesHandler(qt, startTime, labelName, w, r); err != nil {
 				labelValuesErrors.Inc()
-				sendPrometheusError(w, r, err)
+				httpserver.SendPrometheusError(w, r, err)
 				return true
 			}
 			return true
@@ -210,7 +210,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.QueryHandler(qt, startTime, w, r); err != nil {
 			queryErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -219,7 +219,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.QueryRangeHandler(qt, startTime, w, r); err != nil {
 			queryRangeErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -228,7 +228,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.SeriesHandler(qt, startTime, w, r); err != nil {
 			seriesErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -237,7 +237,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.SeriesCountHandler(startTime, w, r); err != nil {
 			seriesCountErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -246,7 +246,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.LabelsHandler(qt, startTime, w, r); err != nil {
 			labelsErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -255,7 +255,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.TSDBStatusHandler(qt, startTime, w, r); err != nil {
 			statusTSDBErrors.Inc()
-			sendPrometheusError(w, r, err)
+			httpserver.SendPrometheusError(w, r, err)
 			return true
 		}
 		return true
@@ -369,7 +369,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/tags/delSeries":
-		if !httpserver.CheckAuthFlag(w, r, deleteAuthKey.Get(), "deleteAuthKey") {
+		if !httpserver.CheckAuthFlag(w, r, deleteAuthKey) {
 			return true
 		}
 		graphiteTagsDelSeriesRequests.Inc()
@@ -388,7 +388,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/api/v1/admin/tsdb/delete_series":
-		if !httpserver.CheckAuthFlag(w, r, deleteAuthKey.Get(), "deleteAuthKey") {
+		if !httpserver.CheckAuthFlag(w, r, deleteAuthKey) {
 			return true
 		}
 		deleteRequests.Inc()
@@ -498,7 +498,7 @@ func handleStaticAndSimpleRequests(w http.ResponseWriter, r *http.Request, path 
 		httpserver.EnableCORS(w, r)
 		if err := prometheus.QueryStatsHandler(w, r); err != nil {
 			topQueriesErrors.Inc()
-			sendPrometheusError(w, r, fmt.Errorf("cannot query status endpoint: %w", err))
+			httpserver.SendPrometheusError(w, r, fmt.Errorf("cannot query status endpoint: %w", err))
 			return true
 		}
 		return true
@@ -573,24 +573,6 @@ func isGraphiteTagsPath(path string) bool {
 	default:
 		return false
 	}
-}
-
-func sendPrometheusError(w http.ResponseWriter, r *http.Request, err error) {
-	logger.WarnfSkipframes(1, "error in %q: %s", httpserver.GetRequestURI(r), err)
-
-	w.Header().Set("Content-Type", "application/json")
-	statusCode := http.StatusUnprocessableEntity
-	var esc *httpserver.ErrorWithStatusCode
-	if errors.As(err, &esc) {
-		statusCode = esc.StatusCode
-	}
-	w.WriteHeader(statusCode)
-
-	var ure *promql.UserReadableError
-	if errors.As(err, &ure) {
-		err = ure
-	}
-	prometheus.WriteErrorResponse(w, statusCode, err)
 }
 
 var (

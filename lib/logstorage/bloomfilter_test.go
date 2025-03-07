@@ -8,19 +8,21 @@ import (
 func TestBloomFilter(t *testing.T) {
 	f := func(tokens []string) {
 		t.Helper()
-		data := bloomFilterMarshal(nil, tokens)
+		dataTokens := bloomFilterMarshalTokens(nil, tokens)
+		hashes := tokenizeHashes(nil, tokens)
+		dataHashes := bloomFilterMarshalHashes(nil, hashes)
+		if string(dataTokens) != string(dataHashes) {
+			t.Fatalf("unexpected marshaled bloom filters from hashes\ngot\n%X\nwant\n%X", dataHashes, dataTokens)
+		}
+
 		bf := getBloomFilter()
 		defer putBloomFilter(bf)
-		if err := bf.unmarshal(data); err != nil {
+		if err := bf.unmarshal(dataTokens); err != nil {
 			t.Fatalf("unexpected error when unmarshaling bloom filter: %s", err)
 		}
-		for _, token := range tokens {
-			if !bf.containsAny([]string{token}) {
-				t.Fatalf("bloomFilterContains must return true for the added token %q", token)
-			}
-		}
-		if !bf.containsAll(tokens) {
-			t.Fatalf("bloomFilterContains must return true for the added tokens")
+		tokensHashes := appendTokensHashes(nil, tokens)
+		if !bf.containsAll(tokensHashes) {
+			t.Fatalf("containsAll must return true for the added tokens")
 		}
 	}
 	f(nil)
@@ -61,7 +63,7 @@ func TestBloomFilterFalsePositive(t *testing.T) {
 	for i := range tokens {
 		tokens[i] = fmt.Sprintf("token_%d", i)
 	}
-	data := bloomFilterMarshal(nil, tokens)
+	data := bloomFilterMarshalTokens(nil, tokens)
 	bf := getBloomFilter()
 	defer putBloomFilter(bf)
 	if err := bf.unmarshal(data); err != nil {
@@ -72,7 +74,8 @@ func TestBloomFilterFalsePositive(t *testing.T) {
 	falsePositives := 0
 	for i := range tokens {
 		token := fmt.Sprintf("non-existing-token_%d", i)
-		if bf.containsAny([]string{token}) {
+		tokensHashes := appendTokensHashes(nil, []string{token})
+		if bf.containsAll(tokensHashes) {
 			falsePositives++
 		}
 	}
@@ -81,4 +84,36 @@ func TestBloomFilterFalsePositive(t *testing.T) {
 	if p > maxFalsePositive {
 		t.Fatalf("too high false positive rate; got %.4f; want %.4f max", p, maxFalsePositive)
 	}
+}
+
+func TestBloomFilterMarshal_TokensVSHashes(t *testing.T) {
+	tokens := make([]string, 100)
+	for i := range tokens {
+		tokens[i] = fmt.Sprintf("token_%d", i)
+	}
+
+	dataTokens := bloomFilterMarshalTokens(nil, tokens)
+
+	hashes := tokenizeHashes(nil, tokens)
+	dataHashes := bloomFilterMarshalHashes(nil, hashes)
+
+	if string(dataTokens) != string(dataHashes) {
+		t.Fatalf("unexpected bloom filter obtained from hashes\ngot\n%X\nwant\n%X", dataHashes, dataTokens)
+	}
+}
+
+func TestBloomFilterMarshalTokens(t *testing.T) {
+	f := func(tokens []string, resultExpected string) {
+		t.Helper()
+
+		result := bloomFilterMarshalTokens(nil, tokens)
+		if string(result) != resultExpected {
+			t.Fatalf("unexpected result\ngot\n%X\nwant\n%X", result, resultExpected)
+		}
+	}
+
+	f([]string{}, "")
+	f([]string{"foo"}, "\x00\x00\x00\x82\x40\x18\x00\x04")
+	f([]string{"foo", "bar", "baz"}, "\x00\x00\x81\xA3\x48\x5C\x10\x26")
+	f([]string{"foo", "bar", "baz", "foo"}, "\x00\x00\x81\xA3\x48\x5C\x10\x26")
 }

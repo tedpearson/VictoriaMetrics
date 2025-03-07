@@ -59,8 +59,19 @@ func (lc *LabelsCompressor) compress(dst []uint64, labels []prompbmarshal.Label)
 			idx := lc.nextIdx.Add(1)
 			v = idx
 			labelCopy := cloneLabel(label)
+
+			// Must store idxToLabel entry before labelToIdx,
+			// so it can be found by possible concurrent goroutines.
+			//
+			// We might store duplicated entries for single label with different indexes,
+			// and it's fine, see https://github.com/VictoriaMetrics/VictoriaMetrics/pull/7118.
 			lc.idxToLabel.Store(idx, labelCopy)
-			lc.labelToIdx.Store(labelCopy, v)
+			vNew, loaded := lc.labelToIdx.LoadOrStore(labelCopy, v)
+			if loaded {
+				// This label has been stored by a concurrent goroutine with different index,
+				// use it for key consistency in aggrState.
+				v = vNew
+			}
 
 			// Update lc.totalSizeBytes
 			labelSizeBytes := uint64(len(label.Name) + len(label.Value))
@@ -91,10 +102,11 @@ func cloneLabel(label prompbmarshal.Label) prompbmarshal.Label {
 //
 // It is safe calling Decompress from concurrent goroutines.
 func (lc *LabelsCompressor) Decompress(dst []prompbmarshal.Label, src []byte) []prompbmarshal.Label {
-	tail, labelsLen, err := encoding.UnmarshalVarUint64(src)
-	if err != nil {
-		logger.Panicf("BUG: cannot unmarshal labels length: %s", err)
+	labelsLen, nSize := encoding.UnmarshalVarUint64(src)
+	if nSize <= 0 {
+		logger.Panicf("BUG: cannot unmarshal labels length from uvarint")
 	}
+	tail := src[nSize:]
 	if labelsLen == 0 {
 		// fast path - nothing to decode
 		if len(tail) > 0 {
@@ -104,6 +116,7 @@ func (lc *LabelsCompressor) Decompress(dst []prompbmarshal.Label, src []byte) []
 	}
 
 	a := encoding.GetUint64s(int(labelsLen))
+	var err error
 	tail, err = encoding.UnmarshalVarUint64s(a.A, tail)
 	if err != nil {
 		logger.Panicf("BUG: cannot unmarshal label indexes: %s", err)

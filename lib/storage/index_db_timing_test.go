@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"math/rand"
 	"regexp"
 	"strconv"
 	"testing"
@@ -40,7 +41,7 @@ func BenchmarkRegexpFilterMismatch(b *testing.B) {
 
 func BenchmarkIndexDBAddTSIDs(b *testing.B) {
 	const path = "BenchmarkIndexDBAddTSIDs"
-	s := MustOpenStorage(path, retentionMax, 0, 0)
+	s := MustOpenStorage(path, OpenOptions{})
 	db := s.idb()
 
 	const recordsPerLoop = 1e3
@@ -94,7 +95,7 @@ func BenchmarkHeadPostingForMatchers(b *testing.B) {
 	// This benchmark is equivalent to https://github.com/prometheus/prometheus/blob/23c0299d85bfeb5d9b59e994861553a25ca578e5/tsdb/head_bench_test.go#L52
 	// See https://www.robustperception.io/evaluating-performance-and-correctness for more details.
 	const path = "BenchmarkHeadPostingForMatchers"
-	s := MustOpenStorage(path, retentionMax, 0, 0)
+	s := MustOpenStorage(path, OpenOptions{})
 	db := s.idb()
 
 	// Fill the db with data as in https://github.com/prometheus/prometheus/blob/23c0299d85bfeb5d9b59e994861553a25ca578e5/tsdb/head_bench_test.go#L66
@@ -261,7 +262,7 @@ func BenchmarkHeadPostingForMatchers(b *testing.B) {
 
 func BenchmarkIndexDBGetTSIDs(b *testing.B) {
 	const path = "BenchmarkIndexDBGetTSIDs"
-	s := MustOpenStorage(path, retentionMax, 0, 0)
+	s := MustOpenStorage(path, OpenOptions{})
 	db := s.idb()
 
 	const recordsPerLoop = 1000
@@ -313,4 +314,34 @@ func BenchmarkIndexDBGetTSIDs(b *testing.B) {
 
 	s.MustClose()
 	fs.MustRemoveAll(path)
+}
+
+func BenchmarkMarshalUnmarshalMetricIDs(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+
+	f := func(b *testing.B, numMetricIDs int) {
+		metricIDs := make([]uint64, numMetricIDs)
+		// metric IDs need to be sorted.
+		ts := uint64(time.Now().UnixNano())
+		for i := range numMetricIDs {
+			metricIDs[i] = ts + uint64(rng.Intn(100))
+		}
+
+		var marshalledLen int
+		b.ResetTimer()
+		for range b.N {
+			marshalled := marshalMetricIDs(nil, metricIDs)
+			marshalledLen = len(marshalled)
+			_ = mustUnmarshalMetricIDs(nil, marshalled)
+		}
+		b.StopTimer()
+		compressionRate := float64(numMetricIDs*8) / float64(marshalledLen)
+		b.ReportMetric(compressionRate, "compression-rate")
+	}
+
+	for _, n := range []int{0, 1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7} {
+		b.Run(fmt.Sprintf("numMetricIDs-%d", n), func(b *testing.B) {
+			f(b, n)
+		})
+	}
 }

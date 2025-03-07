@@ -5,6 +5,40 @@ import (
 	"testing"
 )
 
+func TestStreamIDMarshalUnmarshalString(t *testing.T) {
+	f := func(sid *streamID, resultExpected string) {
+		t.Helper()
+
+		result := string(sid.marshalString(nil))
+
+		if result != resultExpected {
+			t.Fatalf("unexpected result\ngot\n%q\nwant\n%q", result, resultExpected)
+		}
+
+		var sid2 streamID
+		if !sid2.tryUnmarshalFromString(result) {
+			t.Fatalf("cannot unmarshal streamID from %q", result)
+		}
+
+		result2 := string(sid2.marshalString(nil))
+		if result != result2 {
+			t.Fatalf("unexpected marshaled streamID; got %s; want %s", result2, result)
+		}
+	}
+
+	f(&streamID{}, "000000000000000000000000000000000000000000000000")
+	f(&streamID{
+		tenantID: TenantID{
+			AccountID: 123,
+			ProjectID: 456,
+		},
+		id: u128{
+			lo: 89,
+			hi: 344334,
+		},
+	}, "0000007b000001c8000000000005410e0000000000000059")
+}
+
 func TestStreamIDMarshalUnmarshal(t *testing.T) {
 	f := func(sid *streamID, marshaledLen int) {
 		t.Helper()

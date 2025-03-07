@@ -14,11 +14,10 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 )
 
 var (
-	maxScrapeSize = flagutil.NewBytes("promscrape.maxScrapeSize", 16*1024*1024, "The maximum size of scrape response in bytes to process from Prometheus targets. "+
-		"Bigger responses are rejected")
 	maxResponseHeadersSize = flagutil.NewBytes("promscrape.maxResponseHeadersSize", 4096, "The maximum size of http response headers from Prometheus scrape targets")
 	disableCompression     = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
 		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
@@ -39,6 +38,7 @@ type client struct {
 	scrapeTimeoutSecondsStr string
 	setHeaders              func(req *http.Request) error
 	setProxyHeaders         func(req *http.Request) error
+	maxScrapeSize           int64
 }
 
 func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
@@ -49,20 +49,34 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
 	setProxyHeaders := func(_ *http.Request) error {
 		return nil
 	}
+	dialFunc := netutil.NewStatDialFunc("vm_promscrape")
 	proxyURL := sw.ProxyURL
-	if !strings.HasPrefix(sw.ScrapeURL, "https://") && proxyURL.IsHTTPOrHTTPS() {
-		pu := proxyURL.GetURL()
-		if pu.Scheme == "https" {
-			ac = sw.ProxyAuthConfig
-		}
-		setProxyHeaders = func(req *http.Request) error {
-			return proxyURL.SetHeaders(sw.ProxyAuthConfig, req)
-		}
-	}
 	var proxyURLFunc func(*http.Request) (*url.URL, error)
-	if pu := sw.ProxyURL.GetURL(); pu != nil {
-		proxyURLFunc = http.ProxyURL(pu)
+
+	if proxyURL != nil {
+		// case for direct http proxy connection.
+		// must be used for http based scrape targets
+		// since standard golang http.transport has special case for it
+		if strings.HasPrefix(sw.ScrapeURL, "http://") {
+			if proxyURL.URL.Scheme == "https" {
+				ac = sw.ProxyAuthConfig
+			}
+			proxyURLFunc = http.ProxyURL(proxyURL.URL)
+			setProxyHeaders = func(req *http.Request) error {
+				return proxyURL.SetHeaders(sw.ProxyAuthConfig, req)
+			}
+		} else {
+			// HTTP-Connect or socks5 proxy tunnel
+			// it makes possible to use separate tls configurations
+			// for proxy and backend connections
+			proxyDial, err := proxyURL.NewDialFunc(sw.ProxyAuthConfig)
+			if err != nil {
+				return nil, fmt.Errorf("cannot create dialer for proxy_url=%q connection: %w", proxyURL, err)
+			}
+			dialFunc = netutil.NewStatDialFuncWithDial("vm_promscrape", proxyDial)
+		}
 	}
+
 	hc := &http.Client{
 		Transport: ac.NewRoundTripper(&http.Transport{
 			Proxy:                  proxyURLFunc,
@@ -70,7 +84,7 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
 			IdleConnTimeout:        2 * sw.ScrapeInterval,
 			DisableCompression:     *disableCompression || sw.DisableCompression,
 			DisableKeepAlives:      *disableKeepAlive || sw.DisableKeepAlive,
-			DialContext:            statStdDial,
+			DialContext:            dialFunc,
 			MaxIdleConnsPerHost:    100,
 			MaxResponseHeaderBytes: int64(maxResponseHeadersSize.N),
 		}),
@@ -89,6 +103,7 @@ func newClient(ctx context.Context, sw *ScrapeWork) (*client, error) {
 		scrapeTimeoutSecondsStr: fmt.Sprintf("%.3f", sw.ScrapeTimeout.Seconds()),
 		setHeaders:              setHeaders,
 		setProxyHeaders:         setProxyHeaders,
+		maxScrapeSize:           sw.MaxScrapeSize,
 	}
 	return c, nil
 }
@@ -141,7 +156,7 @@ func (c *client) ReadData(dst *bytesutil.ByteBuffer) error {
 	// Read the data from resp.Body
 	r := &io.LimitedReader{
 		R: resp.Body,
-		N: maxScrapeSize.N,
+		N: c.maxScrapeSize,
 	}
 	_, err = dst.ReadFrom(r)
 	_ = resp.Body.Close()
@@ -152,10 +167,11 @@ func (c *client) ReadData(dst *bytesutil.ByteBuffer) error {
 		}
 		return fmt.Errorf("cannot read data from %s: %w", c.scrapeURL, err)
 	}
-	if int64(len(dst.B)) >= maxScrapeSize.N {
+	if int64(len(dst.B)) >= c.maxScrapeSize {
 		maxScrapeSizeExceeded.Inc()
-		return fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize=%d; "+
-			"either reduce the response size for the target or increase -promscrape.maxScrapeSize command-line flag value", c.scrapeURL, maxScrapeSize.N)
+		return fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize or max_scrape_size in the scrape config (%d bytes). "+
+			"Possible solutions are: reduce the response size for the target, increase -promscrape.maxScrapeSize command-line flag, "+
+			"increase max_scrape_size value in scrape config for the given target", c.scrapeURL, c.maxScrapeSize)
 	}
 	return nil
 }

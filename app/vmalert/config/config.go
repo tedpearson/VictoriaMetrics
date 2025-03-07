@@ -1,19 +1,25 @@
 package config
 
 import (
+	"bytes"
 	"crypto/md5"
+	"flag"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net/url"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v2"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config/log"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"gopkg.in/yaml.v2"
+)
+
+var (
+	defaultRuleType = flag.String("rule.defaultRuleType", "prometheus", `Default type for rule expressions, can be overridden via "type" parameter on the group level, see https://docs.victoriametrics.com/vmalert/#groups. Supported values: "graphite", "prometheus" and "vlogs".`)
 )
 
 // Group contains list of Rules grouped into
@@ -45,11 +51,11 @@ type Group struct {
 	// EvalAlignment will make the timestamp of group query requests be aligned with interval
 	EvalAlignment *bool `yaml:"eval_alignment,omitempty"`
 	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline"`
+	XXX map[string]any `yaml:",inline"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (g *Group) UnmarshalYAML(unmarshal func(any) error) error {
 	type group Group
 	if err := unmarshal((*group)(g)); err != nil {
 		return err
@@ -58,11 +64,9 @@ func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal group configuration for checksum: %w", err)
 	}
-	// change default value to prometheus datasource.
 	if g.Type.Get() == "" {
-		g.Type.Set(NewPrometheusType())
+		g.Type = NewRawType(*defaultRuleType)
 	}
-
 	h := md5.New()
 	h.Write(b)
 	g.Checksum = fmt.Sprintf("%x", h.Sum(nil))
@@ -142,11 +146,11 @@ type Rule struct {
 	UpdateEntriesLimit *int `yaml:"update_entries_limit,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
-	XXX map[string]interface{} `yaml:",inline"`
+	XXX map[string]any `yaml:",inline"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (r *Rule) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (r *Rule) UnmarshalYAML(unmarshal func(any) error) error {
 	type rule Rule
 	if err := unmarshal((*rule)(r)); err != nil {
 		return err
@@ -234,7 +238,7 @@ func ParseSilent(pathPatterns []string, validateTplFn ValidateTplFn, validateExp
 	cLogger.Suppress(true)
 	defer cLogger.Suppress(false)
 
-	files, err := readFromFS(pathPatterns)
+	files, err := ReadFromFS(pathPatterns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from the config: %w", err)
 	}
@@ -243,7 +247,7 @@ func ParseSilent(pathPatterns []string, validateTplFn ValidateTplFn, validateExp
 
 // Parse parses rule configs from given file patterns
 func Parse(pathPatterns []string, validateTplFn ValidateTplFn, validateExpressions bool) ([]Group, error) {
-	files, err := readFromFS(pathPatterns)
+	files, err := ReadFromFS(pathPatterns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from the config: %w", err)
 	}
@@ -298,19 +302,33 @@ func parseConfig(data []byte) ([]Group, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot expand environment vars: %w", err)
 	}
-	g := struct {
+
+	var result []Group
+	type cfgFile struct {
 		Groups []Group `yaml:"groups"`
 		// Catches all undefined fields and must be empty after parsing.
-		XXX map[string]interface{} `yaml:",inline"`
-	}{}
-	err = yaml.Unmarshal(data, &g)
-	if err != nil {
-		return nil, err
+		XXX map[string]any `yaml:",inline"`
 	}
-	return g.Groups, checkOverflow(g.XXX, "config")
+
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var cf cfgFile
+		if err = decoder.Decode(&cf); err != nil {
+			if err == io.EOF { // EOF indicates no more documents to read
+				break
+			}
+			return nil, err
+		}
+		if err = checkOverflow(cf.XXX, "config"); err != nil {
+			return nil, err
+		}
+		result = append(result, cf.Groups...)
+	}
+
+	return result, nil
 }
 
-func checkOverflow(m map[string]interface{}, ctx string) error {
+func checkOverflow(m map[string]any, ctx string) error {
 	if len(m) > 0 {
 		var keys []string
 		for k := range m {

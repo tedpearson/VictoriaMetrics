@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,9 +19,11 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
+	"golang.org/x/net/http2"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
@@ -31,6 +34,8 @@ var (
 	apiServerTimeout      = flag.Duration("promscrape.kubernetes.apiServerTimeout", 30*time.Minute, "How frequently to reload the full state from Kubernetes API server")
 	attachNodeMetadataAll = flag.Bool("promscrape.kubernetes.attachNodeMetadataAll", false, "Whether to set attach_metadata.node=true for all the kubernetes_sd_configs at -promscrape.config . "+
 		"It is possible to set attach_metadata.node=false individually per each kubernetes_sd_configs . See https://docs.victoriametrics.com/sd_configs/#kubernetes_sd_configs")
+	useHTTP2Client = flag.Bool("promscrape.kubernetes.useHTTP2Client", false, "Whether to use HTTP/2 client for connection to Kubernetes API server."+
+		" This may reduce amount of concurrent connections to API server when watching for a big number of Kubernetes objects.")
 )
 
 // WatchEvent is a watch event returned from API server endpoints if `watch=1` query arg is set.
@@ -65,7 +70,7 @@ type apiWatcher struct {
 	gw *groupWatcher
 
 	// swosByURLWatcher contains per-urlWatcher maps of ScrapeWork objects for the given apiWatcher
-	swosByURLWatcher     map[*urlWatcher]map[string][]interface{}
+	swosByURLWatcher     map[*urlWatcher]map[string][]any
 	swosByURLWatcherLock sync.Mutex
 
 	swosCount *metrics.Counter
@@ -94,7 +99,7 @@ func newAPIWatcher(apiServer string, ac *promauth.Config, sdc *SDConfig, swcFunc
 		role:             role,
 		swcFunc:          swcFunc,
 		gw:               gw,
-		swosByURLWatcher: make(map[*urlWatcher]map[string][]interface{}),
+		swosByURLWatcher: make(map[*urlWatcher]map[string][]any),
 		swosCount:        metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_discovery_kubernetes_scrape_works{role=%q}`, role)),
 	}
 	return aw, nil
@@ -106,7 +111,7 @@ func (aw *apiWatcher) mustStart() {
 	aw.gw.apiWatcherInflightStartCalls.Add(-1)
 }
 
-func (aw *apiWatcher) updateSwosCount(multiplier int, swosByKey map[string][]interface{}) {
+func (aw *apiWatcher) updateSwosCount(multiplier int, swosByKey map[string][]any) {
 	n := 0
 	for _, swos := range swosByKey {
 		n += len(swos)
@@ -121,11 +126,11 @@ func (aw *apiWatcher) mustStop() {
 	for _, swosByKey := range aw.swosByURLWatcher {
 		aw.updateSwosCount(-1, swosByKey)
 	}
-	aw.swosByURLWatcher = make(map[*urlWatcher]map[string][]interface{})
+	aw.swosByURLWatcher = make(map[*urlWatcher]map[string][]any)
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func (aw *apiWatcher) replaceScrapeWorks(uw *urlWatcher, swosByKey map[string][]interface{}) {
+func (aw *apiWatcher) replaceScrapeWorks(uw *urlWatcher, swosByKey map[string][]any) {
 	aw.swosByURLWatcherLock.Lock()
 	aw.updateSwosCount(-1, aw.swosByURLWatcher[uw])
 	aw.updateSwosCount(1, swosByKey)
@@ -133,11 +138,11 @@ func (aw *apiWatcher) replaceScrapeWorks(uw *urlWatcher, swosByKey map[string][]
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func (aw *apiWatcher) updateScrapeWorks(uw *urlWatcher, swosByKey map[string][]interface{}) {
+func (aw *apiWatcher) updateScrapeWorks(uw *urlWatcher, swosByKey map[string][]any) {
 	aw.swosByURLWatcherLock.Lock()
 	dst := aw.swosByURLWatcher[uw]
 	if dst == nil {
-		dst = make(map[string][]interface{})
+		dst = make(map[string][]any)
 		aw.swosByURLWatcher[uw] = dst
 	}
 	for key, swos := range swosByKey {
@@ -156,7 +161,7 @@ func (aw *apiWatcher) setScrapeWorks(uw *urlWatcher, key string, labelss []*prom
 	aw.swosByURLWatcherLock.Lock()
 	swosByKey := aw.swosByURLWatcher[uw]
 	if swosByKey == nil {
-		swosByKey = make(map[string][]interface{})
+		swosByKey = make(map[string][]any)
 		aw.swosByURLWatcher[uw] = swosByKey
 	}
 	aw.swosCount.Add(len(swos) - len(swosByKey[key]))
@@ -178,9 +183,9 @@ func (aw *apiWatcher) removeScrapeWorks(uw *urlWatcher, key string) {
 	aw.swosByURLWatcherLock.Unlock()
 }
 
-func getScrapeWorkObjectsForLabels(swcFunc ScrapeWorkConstructorFunc, labelss []*promutils.Labels) []interface{} {
+func getScrapeWorkObjectsForLabels(swcFunc ScrapeWorkConstructorFunc, labelss []*promutils.Labels) []any {
 	// Do not pre-allocate swos, since it is likely the swos will be empty because of relabeling
-	var swos []interface{}
+	var swos []any
 	for _, labels := range labelss {
 		swo := swcFunc(labels)
 		// The reflect check is needed because of https://mangatmodi.medium.com/go-check-nil-interface-the-right-way-d142776edef1
@@ -192,10 +197,10 @@ func getScrapeWorkObjectsForLabels(swcFunc ScrapeWorkConstructorFunc, labelss []
 }
 
 // getScrapeWorkObjects returns all the ScrapeWork objects for the given aw.
-func (aw *apiWatcher) getScrapeWorkObjects() []interface{} {
+func (aw *apiWatcher) getScrapeWorkObjects() []any {
 	aw.gw.registerPendingAPIWatchers()
 
-	swos := make([]interface{}, 0, aw.swosCount.Get())
+	swos := make([]any, 0, aw.swosCount.Get())
 	aw.swosByURLWatcherLock.Lock()
 	for _, swosByKey := range aw.swosByURLWatcher {
 		for _, swosLocal := range swosByKey {
@@ -243,20 +248,55 @@ type groupWatcher struct {
 	noAPIWatchers bool
 }
 
-func newGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, attachNodeMetadata bool, proxyURL *url.URL) *groupWatcher {
+var (
+	httpClientsCache = make(map[string]*http.Client)
+	httpClientsLock  sync.Mutex
+)
+
+func getHTTPClient(ac *promauth.Config, proxyURL *url.URL) *http.Client {
+	key := fmt.Sprintf("authConfig=%s, proxyURL=%s", ac.String(), proxyURL)
+	httpClientsLock.Lock()
+	if c, ok := httpClientsCache[key]; ok {
+		httpClientsLock.Unlock()
+		return c
+	}
+
 	var proxy func(*http.Request) (*url.URL, error)
 	if proxyURL != nil {
 		proxy = http.ProxyURL(proxyURL)
 	}
-	client := &http.Client{
-		Transport: ac.NewRoundTripper(&http.Transport{
+	getTransport := func(cfg *tls.Config) http.RoundTripper {
+		return &http.Transport{
 			Proxy:               proxy,
+			DialContext:         netutil.Dialer.DialContext,
 			TLSHandshakeTimeout: 10 * time.Second,
 			IdleConnTimeout:     *apiServerTimeout,
 			MaxIdleConnsPerHost: 100,
-		}),
-		Timeout: *apiServerTimeout,
+			TLSClientConfig:     cfg,
+		}
 	}
+	if *useHTTP2Client {
+		// proxy is not supported for http2 client
+		// see: https://github.com/golang/go/issues/26479
+		getTransport = func(cfg *tls.Config) http.RoundTripper {
+			return &http2.Transport{
+				IdleConnTimeout: *apiServerTimeout,
+				TLSClientConfig: cfg,
+				PingTimeout:     10 * time.Second,
+			}
+		}
+	}
+	c := &http.Client{
+		Transport: ac.NewRoundTripperFromGetter(getTransport),
+		Timeout:   *apiServerTimeout,
+	}
+	httpClientsCache[key] = c
+	httpClientsLock.Unlock()
+	return c
+}
+
+func newGroupWatcher(apiServer string, ac *promauth.Config, namespaces []string, selectors []Selector, attachNodeMetadata bool, proxyURL *url.URL) *groupWatcher {
+	client := getHTTPClient(ac, proxyURL)
 	ctx, cancel := context.WithCancel(context.Background())
 	gw := &groupWatcher{
 		apiServer:          apiServer,
@@ -352,7 +392,7 @@ func groupWatchersCleaner() {
 
 type swosByKeyWithLock struct {
 	mu        sync.Mutex
-	swosByKey map[string][]interface{}
+	swosByKey map[string][]any
 }
 
 func (gw *groupWatcher) getScrapeWorkObjectsByAPIWatcherLocked(objectsByKey map[string]object, awsMap map[*apiWatcher]struct{}) map[*apiWatcher]*swosByKeyWithLock {
@@ -362,7 +402,7 @@ func (gw *groupWatcher) getScrapeWorkObjectsByAPIWatcherLocked(objectsByKey map[
 	swosByAPIWatcher := make(map[*apiWatcher]*swosByKeyWithLock, len(awsMap))
 	for aw := range awsMap {
 		swosByAPIWatcher[aw] = &swosByKeyWithLock{
-			swosByKey: make(map[string][]interface{}),
+			swosByKey: make(map[string][]any),
 		}
 	}
 
@@ -936,9 +976,12 @@ func (uw *urlWatcher) maybeUpdateDependedScrapeWorksLocked() {
 // Bookmark is a bookmark message from Kubernetes Watch API.
 // See https://kubernetes.io/docs/reference/using-api/api-concepts/#watch-bookmarks
 type Bookmark struct {
-	Metadata struct {
-		ResourceVersion string
-	}
+	Metadata BookmarkMetadata
+}
+
+// BookmarkMetadata is metadata for Bookmark
+type BookmarkMetadata struct {
+	ResourceVersion string
 }
 
 func parseBookmark(data []byte) (*Bookmark, error) {

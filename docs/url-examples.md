@@ -1,18 +1,15 @@
 ---
-sort: 33
 weight: 33
-title: VictoriaMetrics API examples
+title: API examples
 menu:
   docs:
     parent: 'victoriametrics'
     weight: 33
+    identifier: vm-api-examples
 
 aliases:
   - /url-examples.html
 ---
-
-# VictoriaMetrics API examples
-
 ### /api/v1/admin/tsdb/delete_series
 
 **Deletes time series from VictoriaMetrics**
@@ -183,6 +180,8 @@ Single-node VictoriaMetrics:
 
 ```sh
 curl -d "GOOG,1.23,4.56,NYSE" 'http://localhost:8428/api/v1/import/csv?format=2:metric:ask,3:metric:bid,1:label:ticker,4:label:market'
+
+curl -X POST 'http://localhost:8428/api/v1/import/csv?format=2:metric:ask,3:metric:bid,1:label:ticker,4:label:market' -T exported_data.csv
 ```
 
 
@@ -190,6 +189,8 @@ Cluster version of VictoriaMetrics:
 
 ```sh
 curl -d "GOOG,1.23,4.56,NYSE" 'http://<vminsert>:8480/insert/0/prometheus/api/v1/import/csv?format=2:metric:ask,3:metric:bid,1:label:ticker,4:label:market'
+
+curl -X POST 'http://<vminsert>:8480/insert/0/prometheus/api/v1/import/csv?format=2:metric:ask,3:metric:bid,1:label:ticker,4:label:market' -T exported_data.csv
 ```
 
 
@@ -620,12 +621,10 @@ Single-node VictoriaMetrics:
 curl -Is http://localhost:8428/internal/resetRollupResultCache
 ```
 
-
 Cluster version of VictoriaMetrics:
 
-
 ```sh
-curl -Is http://<vmselect>:8481/select/internal/resetRollupResultCache
+curl -Is http://<vmselect>:8481/internal/resetRollupResultCache
 ```
 
 vmselect will propagate this call to the rest of the vmselects listed in its `-selectNode` cmd-line flag. If this
@@ -666,7 +665,7 @@ curl -H 'Content-Type: application/json' -d '[{"metric":"foo","value":45.34},{"m
 Cluster version of VictoriaMetrics:
 
 ```sh
-curl -H 'Content-Type: application/json' -d '[{"metric":"foo","value":45.34},{"metric":"bar","value":43}]' http://<vminsert>:8480/insert/42/opentsdb/api/put
+curl -H 'Content-Type: application/json' -d '[{"metric":"foo","value":45.34},{"metric":"bar","value":43}]' http://<vminsert>:4242/insert/42/opentsdb/api/put
 ```
 
 

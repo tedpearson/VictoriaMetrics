@@ -21,14 +21,18 @@ func TestHandler(t *testing.T) {
 	fq.Add(datasource.Metric{
 		Values: []float64{1}, Timestamps: []int64{0},
 	})
-	g := &rule.Group{
+	g := rule.NewGroup(config.Group{
 		Name:        "group",
 		File:        "rules.yaml",
 		Concurrency: 1,
-	}
-	ar := rule.NewAlertingRule(fq, g, config.Rule{ID: 0, Alert: "alert"})
-	rr := rule.NewRecordingRule(fq, g, config.Rule{ID: 1, Record: "record"})
-	g.Rules = []rule.Rule{ar, rr}
+		Rules: []config.Rule{
+			{ID: 0, Alert: "alert"},
+			{ID: 1, Record: "record"},
+		},
+	}, fq, 1*time.Minute, nil)
+	ar := g.Rules[0].(*rule.AlertingRule)
+	rr := g.Rules[1].(*rule.RecordingRule)
+
 	g.ExecOnce(context.Background(), func() []notifier.Notifier { return nil }, nil, time.Time{})
 
 	m := &manager{groups: map[uint64]*rule.Group{
@@ -36,23 +40,23 @@ func TestHandler(t *testing.T) {
 	}}
 	rh := &requestHandler{m: m}
 
-	getResp := func(t *testing.T, url string, to interface{}, code int) {
+	getResp := func(t *testing.T, url string, to any, code int) {
 		t.Helper()
 		resp, err := http.Get(url)
 		if err != nil {
 			t.Fatalf("unexpected err %s", err)
 		}
 		if code != resp.StatusCode {
-			t.Errorf("unexpected status code %d want %d", resp.StatusCode, code)
+			t.Fatalf("unexpected status code %d want %d", resp.StatusCode, code)
 		}
 		defer func() {
 			if err := resp.Body.Close(); err != nil {
-				t.Errorf("err closing body %s", err)
+				t.Fatalf("err closing body %s", err)
 			}
 		}()
 		if to != nil {
 			if err = json.NewDecoder(resp.Body).Decode(to); err != nil {
-				t.Errorf("unexpected err %s", err)
+				t.Fatalf("unexpected err %s", err)
 			}
 		}
 	}
@@ -92,13 +96,13 @@ func TestHandler(t *testing.T) {
 		lr := listAlertsResponse{}
 		getResp(t, ts.URL+"/api/v1/alerts", &lr, 200)
 		if length := len(lr.Data.Alerts); length != 1 {
-			t.Errorf("expected 1 alert got %d", length)
+			t.Fatalf("expected 1 alert got %d", length)
 		}
 
 		lr = listAlertsResponse{}
 		getResp(t, ts.URL+"/vmalert/api/v1/alerts", &lr, 200)
 		if length := len(lr.Data.Alerts); length != 1 {
-			t.Errorf("expected 1 alert got %d", length)
+			t.Fatalf("expected 1 alert got %d", length)
 		}
 	})
 	t.Run("/api/v1/alert?alertID&groupID", func(t *testing.T) {
@@ -106,13 +110,13 @@ func TestHandler(t *testing.T) {
 		alert := &apiAlert{}
 		getResp(t, ts.URL+"/"+expAlert.APILink(), alert, 200)
 		if !reflect.DeepEqual(alert, expAlert) {
-			t.Errorf("expected %v is equal to %v", alert, expAlert)
+			t.Fatalf("expected %v is equal to %v", alert, expAlert)
 		}
 
 		alert = &apiAlert{}
 		getResp(t, ts.URL+"/vmalert/"+expAlert.APILink(), alert, 200)
 		if !reflect.DeepEqual(alert, expAlert) {
-			t.Errorf("expected %v is equal to %v", alert, expAlert)
+			t.Fatalf("expected %v is equal to %v", alert, expAlert)
 		}
 	})
 
@@ -135,13 +139,13 @@ func TestHandler(t *testing.T) {
 		lr := listGroupsResponse{}
 		getResp(t, ts.URL+"/api/v1/rules", &lr, 200)
 		if length := len(lr.Data.Groups); length != 1 {
-			t.Errorf("expected 1 group got %d", length)
+			t.Fatalf("expected 1 group got %d", length)
 		}
 
 		lr = listGroupsResponse{}
 		getResp(t, ts.URL+"/vmalert/api/v1/rules", &lr, 200)
 		if length := len(lr.Data.Groups); length != 1 {
-			t.Errorf("expected 1 group got %d", length)
+			t.Fatalf("expected 1 group got %d", length)
 		}
 	})
 	t.Run("/api/v1/rule?ruleID&groupID", func(t *testing.T) {
@@ -150,19 +154,19 @@ func TestHandler(t *testing.T) {
 		getResp(t, ts.URL+"/"+expRule.APILink(), &gotRule, 200)
 
 		if expRule.ID != gotRule.ID {
-			t.Errorf("expected to get Rule %q; got %q instead", expRule.ID, gotRule.ID)
+			t.Fatalf("expected to get Rule %q; got %q instead", expRule.ID, gotRule.ID)
 		}
 
 		gotRule = apiRule{}
 		getResp(t, ts.URL+"/vmalert/"+expRule.APILink(), &gotRule, 200)
 
 		if expRule.ID != gotRule.ID {
-			t.Errorf("expected to get Rule %q; got %q instead", expRule.ID, gotRule.ID)
+			t.Fatalf("expected to get Rule %q; got %q instead", expRule.ID, gotRule.ID)
 		}
 
 		gotRuleWithUpdates := apiRuleWithUpdates{}
 		getResp(t, ts.URL+"/"+expRule.APILink(), &gotRuleWithUpdates, 200)
-		if gotRuleWithUpdates.StateUpdates == nil || len(gotRuleWithUpdates.StateUpdates) < 1 {
+		if len(gotRuleWithUpdates.StateUpdates) < 1 {
 			t.Fatalf("expected %+v to have state updates field not empty", gotRuleWithUpdates.StateUpdates)
 		}
 	})
@@ -173,7 +177,7 @@ func TestHandler(t *testing.T) {
 			lr := listGroupsResponse{}
 			getResp(t, ts.URL+url, &lr, 200)
 			if length := len(lr.Data.Groups); length != expGroups {
-				t.Errorf("expected %d groups got %d", expGroups, length)
+				t.Fatalf("expected %d groups got %d", expGroups, length)
 			}
 			if len(lr.Data.Groups) < 1 {
 				return
@@ -183,7 +187,7 @@ func TestHandler(t *testing.T) {
 				rulesN += len(gr.Rules)
 			}
 			if rulesN != expRules {
-				t.Errorf("expected %d rules got %d", expRules, rulesN)
+				t.Fatalf("expected %d rules got %d", expRules, rulesN)
 			}
 		}
 
@@ -241,23 +245,23 @@ func TestEmptyResponse(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { rhWithNoGroups.handler(w, r) }))
 	defer ts.Close()
 
-	getResp := func(t *testing.T, url string, to interface{}, code int) {
+	getResp := func(t *testing.T, url string, to any, code int) {
 		t.Helper()
 		resp, err := http.Get(url)
 		if err != nil {
 			t.Fatalf("unexpected err %s", err)
 		}
 		if code != resp.StatusCode {
-			t.Errorf("unexpected status code %d want %d", resp.StatusCode, code)
+			t.Fatalf("unexpected status code %d want %d", resp.StatusCode, code)
 		}
 		defer func() {
 			if err := resp.Body.Close(); err != nil {
-				t.Errorf("err closing body %s", err)
+				t.Fatalf("err closing body %s", err)
 			}
 		}()
 		if to != nil {
 			if err = json.NewDecoder(resp.Body).Decode(to); err != nil {
-				t.Errorf("unexpected err %s", err)
+				t.Fatalf("unexpected err %s", err)
 			}
 		}
 	}
@@ -266,13 +270,13 @@ func TestEmptyResponse(t *testing.T) {
 		lr := listAlertsResponse{}
 		getResp(t, ts.URL+"/api/v1/alerts", &lr, 200)
 		if lr.Data.Alerts == nil {
-			t.Errorf("expected /api/v1/alerts response to have non-nil data")
+			t.Fatalf("expected /api/v1/alerts response to have non-nil data")
 		}
 
 		lr = listAlertsResponse{}
 		getResp(t, ts.URL+"/vmalert/api/v1/alerts", &lr, 200)
 		if lr.Data.Alerts == nil {
-			t.Errorf("expected /api/v1/alerts response to have non-nil data")
+			t.Fatalf("expected /api/v1/alerts response to have non-nil data")
 		}
 	})
 
@@ -280,13 +284,13 @@ func TestEmptyResponse(t *testing.T) {
 		lr := listGroupsResponse{}
 		getResp(t, ts.URL+"/api/v1/rules", &lr, 200)
 		if lr.Data.Groups == nil {
-			t.Errorf("expected /api/v1/rules response to have non-nil data")
+			t.Fatalf("expected /api/v1/rules response to have non-nil data")
 		}
 
 		lr = listGroupsResponse{}
 		getResp(t, ts.URL+"/vmalert/api/v1/rules", &lr, 200)
 		if lr.Data.Groups == nil {
-			t.Errorf("expected /api/v1/rules response to have non-nil data")
+			t.Fatalf("expected /api/v1/rules response to have non-nil data")
 		}
 	})
 

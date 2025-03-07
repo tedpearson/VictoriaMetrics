@@ -25,8 +25,25 @@
       justify-content: normal;
     }
 
-    &__execute {
+    &-contols {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      flex-grow: 1;
+    }
+
+    &-execute {
+      position: relative;
       display: grid;
+
+      &__text {
+        position: absolute;
+
+        &_hidden {
+          position: relative;
+          visibility: hidden;
+        }
+      }
     }
 
     &-helpful {

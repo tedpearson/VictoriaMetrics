@@ -1,15 +1,14 @@
 ---
-sort: 10
 weight: 10
 menu:
   docs:
-    parent: 'victoriametrics'
+    parent: victoriametrics
     weight: 10
 title: vmbackupmanager
 aliases:
   - /vmbackupmanager.html
 ---
-# vmbackupmanager
+## vmbackupmanager
 
 ***vmbackupmanager is a part of [enterprise package](https://docs.victoriametrics.com/enterprise/).
 It is available for download and evaluation at [releases page](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/latest).
@@ -25,7 +24,7 @@ The required flags for running the service are as follows:
 
 * `-license` or `-licenseFile` . See [these docs](https://docs.victoriametrics.com/enterprise/#running-victoriametrics-enterprise).
 * `-storageDataPath` - path to VictoriaMetrics or vmstorage data path to make backup from.
-* `-snapshot.createURL` - VictoriaMetrics creates snapshot URL which will automatically be created during backup. Example: <http://victoriametrics:8428/snapshot/create>
+* `-snapshot.createURL` - VictoriaMetrics creates snapshot URL which will automatically be created during backup. Example: http://victoriametrics:8428/snapshot/create
 * `-dst` - backup destination at [the supported storage types](https://docs.victoriametrics.com/vmbackup/#supported-storage-types).
 * `-credsFilePath` - path to file with GCS or S3 credentials. Credentials are loaded from default locations if not set.
   See [https://cloud.google.com/iam/docs/creating-managing-service-account-keys](https://cloud.google.com/iam/docs/creating-managing-service-account-keys)
@@ -48,6 +47,10 @@ The backup manager creates the following directory hierarchy at `-dst`:
 * `/weekly/` - contains weekly backups. Each backup is named as `YYYY-WW`
 * `/monthly/` - contains monthly backups. Each backup is named as `YYYY-MM`
 
+The `vmbackupmanager` takes backups every hour if hourly backups are not disabled; otherwise, 
+it defaults to taking backups every 24 hours. You can control the schedule using the `-backupInterval` flag. 
+For example, if you want to take backups three times per day, set `-backupInterval=8h`.
+
 To get the full list of supported flags please run the following command:
 
 ```sh
@@ -68,7 +71,7 @@ There are two flags which could help with performance tuning:
 * `-maxBytesPerSecond` - the maximum upload speed. There is no limit if it is set to 0
 * `-concurrency` - The number of concurrent workers. Higher concurrency may improve upload speed (default 10)
 
-## Example of Usage
+### Example of Usage
 
 GCS and cluster version. You need to have a credentials file in json format with following structure:
 
@@ -117,11 +120,11 @@ The result on the GCS bucket
 
 * The root folder
 
-  <img alt="root folder" src="vmbackupmanager_root_folder.webp">
+  ![root folder](vmbackupmanager_root_folder.webp)
 
 * The latest folder
 
-  <img alt="latest folder" src="vmbackupmanager_latest_folder.webp">
+  ![latest folder](vmbackupmanager_latest_folder.webp)
 
 `vmbackupmanager` uses [smart backups](https://docs.victoriametrics.com/vmbackup/#smart-backups) technique in order
 to accelerate backups and save both data transfer costs and data copying costs. This includes server-side copy of already existing
@@ -132,7 +135,7 @@ which perform full object copy during server-side copying. This may be slow and 
 Please, see [vmbackup docs](https://docs.victoriametrics.com/vmbackup/#advanced-usage) for more examples of authentication with different
 storage types.
 
-## Backup Retention Policy
+### Backup Retention Policy
 
 Backup retention policy is controlled by:
 
@@ -147,7 +150,7 @@ Backup retention policy is controlled by:
 
 Let’s assume we have a backup manager collecting daily backups for the past 10 days.
 
-<img alt="retention policy daily before retention cycle" src="vmbackupmanager_rp_daily_1.webp">
+![retention policy daily before retention cycle](vmbackupmanager_rp_daily_1.webp)
 
 We enable backup retention policy for backup manager by using following configuration:
 
@@ -172,9 +175,9 @@ info    app/vmbackupmanager/retention.go:106    daily backups to delete [daily/2
 
 The result on the GCS bucket. We see only 3 daily backups:
 
-<img alt="retention policy daily after retention cycle" src="vmbackupmanager_rp_daily_2.webp">
+[retention policy daily after retention cycle](vmbackupmanager_rp_daily_2.webp "retention policy daily after retention cycle")
 
-### Protection backups against deletion by retention policy
+#### Protection backups against deletion by retention policy
 
 You can protect any backup against deletion by retention policy with the `vmbackupmanager backups lock` command.
 
@@ -203,19 +206,25 @@ For example:
 
 `vmbackupmanager` exposes the following API methods:
 
+* POST `/api/v1/backups` - schedule/create the backup. Response examples:
+
+  success, status code - 201, body:
+  ```json
+      {}
+  ```
+
+  failure, status code - 400, body:
+  ```json
+      {"error": "backups <name> is in progress"}
+  ```
+
 * GET `/api/v1/backups` - returns list of backups in remote storage.
-  Example output:
+  Response example:
   ```json
   [{"name":"daily/2023-04-07","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:07+00:00"},{"name":"hourly/2023-04-07:11","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:06+00:00"},{"name":"latest","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:04+00:00"},{"name":"monthly/2023-04","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:10+00:00"},{"name":"weekly/2023-14","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:09+00:00"}]
   ```
   > Note: `created_at` field is in RFC3339 format.
-
-* GET `/api/v1/backups/<BACKUP_NAME>` - returns backup info by name.
-  Example output:
-  ```json
-  {"name":"daily/2023-04-07","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:07+00:00","locked":true}
-  ```
-
+  
 * PUT `/api/v1/backups/<BACKUP_NAME>` - update "locked" attribute for backup by name.
   Example request body:
   ```json
@@ -240,7 +249,7 @@ For example:
 
 * DELETE `/api/v1/restore` - delete restore mark.
 
-## CLI
+### CLI
 
 `vmbackupmanager` exposes CLI commands to work with [API methods](#api-methods) without external dependencies.
 
@@ -277,7 +286,7 @@ It can be changed by using flag:
       vmbackupmanager address to perform API requests (default "http://127.0.0.1:8300")
 ```
 
-### Backup commands
+#### Backup commands
 
 `vmbackupmanager backup list` lists backups in remote storage:
 ```sh
@@ -285,7 +294,7 @@ $ ./vmbackupmanager backup list
 [{"name":"daily/2023-04-07","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:07+00:00"},{"name":"hourly/2023-04-07:11","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:06+00:00"},{"name":"latest","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:04+00:00"},{"name":"monthly/2023-04","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:10+00:00"},{"name":"weekly/2023-14","size_bytes":318837,"size":"311.4ki","created_at":"2023-04-07T16:15:09+00:00"}]
 ```
 
-### Restore commands
+#### Restore commands
 
 Restore commands are used to create, get and delete restore mark.
 Restore mark is used by `vmbackupmanager` to store backup name to restore when running restore.
@@ -339,10 +348,10 @@ If restore mark doesn't exist at `storageDataPath`(restore wasn't requested) `vm
 1. Start `vmstorage` or `vmsingle` node
 
 
-### How to restore in Kubernetes
+#### How to restore in Kubernetes
 
 1. Ensure there is an init container with `vmbackupmanager restore` in `vmstorage` or `vmsingle` pod.
-   For [VictoriaMetrics operator](https://docs.victoriametrics.com/operator/VictoriaMetrics-Operator.html) deployments it is required to add:
+   For [VictoriaMetrics operator](https://docs.victoriametrics.com/operator/) deployments it is required to add:
    ```yaml
    vmbackup:
      restore:
@@ -367,9 +376,9 @@ If restore mark doesn't exist at `storageDataPath`(restore wasn't requested) `vm
   ```
 1. Restart pod
 
-#### Restore cluster into another cluster
+##### Restore cluster into another cluster
 
-These steps are assuming that [VictoriaMetrics operator](https://docs.victoriametrics.com/operator/VictoriaMetrics-Operator.html) is used to manage `VMCluster`.
+These steps are assuming that [VictoriaMetrics operator](https://docs.victoriametrics.com/operator/) is used to manage `VMCluster`.
 Clusters here are referred to as `source` and `destination`.
 
 1. Create a new cluster with access to *source* cluster `vmbackupmanager` storage and same number of storage nodes.
@@ -396,7 +405,7 @@ Clusters here are referred to as `source` and `destination`.
   ```
 1. Restart `vmstorage` pods of *destination* cluster. On pod start `vmbackupmanager` will restore data from the specified backup.
 
-## Monitoring
+### Monitoring
 
 `vmbackupmanager` exports various metrics in Prometheus exposition format at `http://vmbackupmanager:8300/metrics` page. It is recommended setting up regular scraping of this page
 either via [vmagent](https://docs.victoriametrics.com/vmagent/) or via Prometheus, so the exported metrics could be analyzed later.
@@ -406,9 +415,9 @@ Graphs on this dashboard contain useful hints - hover the `i` icon in the top le
 If you have suggestions for improvements or have found a bug - please open an issue on github or add
 a review to the dashboard.
 
-## Configuration
+### Configuration
 
-### Flags
+#### Flags
 
 Pass `-help` to `vmbackupmanager` in order to see the full list of supported
 command-line flags with their descriptions.
@@ -462,7 +471,7 @@ command-line flags:
   -filestream.disableFadvise
      Whether to disable fadvise() syscall when reading large data files. The fadvise() syscall prevents from eviction of recently accessed data from OS page cache during background merges and backups. In some rare cases it is better to disable the syscall if it uses too much CPU
   -flagsAuthKey value
-     Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides -httpAuth.*
      Flag value can be read from the given file when using -flagsAuthKey=file:///abs/path/to/file or -flagsAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -flagsAuthKey=http://host/path or -flagsAuthKey=https://host/path
   -fs.disableMmap
      Whether to use pread() instead of mmap() for reading data files. By default, mmap() is used for 64-bit arches and pread() is used for 32-bit arches, since they cannot read data files bigger than 2^32 bytes in memory. mmap() is usually faster for reading small data chunks than pread()
@@ -508,9 +517,9 @@ command-line flags:
   -keepLastWeekly int
      Keep last N weekly backups. If 0 is specified next retention cycle removes all backups for given time period. (default -1)
   -license string
-     Lisense key for VictoriaMetrics Enterprise. See https://victoriametrics.com/products/enterprise/ . Trial Enterprise license can be obtained from https://victoriametrics.com/products/enterprise/trial/ . This flag is available only in Enterprise binaries. The license key can be also passed via file specified by -licenseFile command-line flag
+     License key for VictoriaMetrics Enterprise. See https://victoriametrics.com/products/enterprise/ . Trial Enterprise license can be obtained from https://victoriametrics.com/products/enterprise/trial/ . This flag is available only in Enterprise binaries. The license key can be also passed via file specified by -licenseFile command-line flag
   -license.forceOffline
-     Whether to enable offline verification for VictoriaMetrics Enterprise license key, which has been passed either via -license or via -licenseFile command-line flag. The issued license key must support offline verification feature. Contact info@victoriametrics.com if you need offline license verification. This flag is avilable only in Enterprise binaries
+     Whether to enable offline verification for VictoriaMetrics Enterprise license key, which has been passed either via -license or via -licenseFile command-line flag. The issued license key must support offline verification feature. Contact info@victoriametrics.com if you need offline license verification. This flag is available only in Enterprise binaries
   -licenseFile string
      Path to file with license key for VictoriaMetrics Enterprise. See https://victoriametrics.com/products/enterprise/ . Trial Enterprise license can be obtained from https://victoriametrics.com/products/enterprise/trial/ . This flag is available only in Enterprise binaries. The license key can be also passed inline via -license command-line flag
   -loggerDisableTimestamps
@@ -541,7 +550,7 @@ command-line flags:
   -metrics.exposeMetadata
      Whether to expose TYPE and HELP metadata at the /metrics page, which is exposed at -httpListenAddr . The metadata may be needed when the /metrics page is consumed by systems, which require this information. For example, Managed Prometheus in Google Cloud - https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type
   -metricsAuthKey value
-     Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides -httpAuth.*
      Flag value can be read from the given file when using -metricsAuthKey=file:///abs/path/to/file or -metricsAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -metricsAuthKey=http://host/path or -metricsAuthKey=https://host/path
   -mtls array
      Whether to require valid client certificate for https requests to the corresponding -httpListenAddr . This flag works only if -tls flag is set. See also -mtlsCAFile . This flag is available only in Enterprise binaries. See https://docs.victoriametrics.com/enterprise/
@@ -552,7 +561,7 @@ command-line flags:
      Supports an array of values separated by comma or specified via multiple flags.
      Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -pprofAuthKey value
-     Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings
+     Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides -httpAuth.*
      Flag value can be read from the given file when using -pprofAuthKey=file:///abs/path/to/file or -pprofAuthKey=file://./relative/path/to/file . Flag value can be read from the given http/https url when using -pprofAuthKey=http://host/path or -pprofAuthKey=https://host/path
   -pushmetrics.disableCompression
      Whether to disable request body compression when pushing metrics to every -pushmetrics.url
@@ -577,10 +586,12 @@ command-line flags:
   -s3StorageClass string
      The Storage Class applied to objects uploaded to AWS S3. Supported values are: GLACIER, DEEP_ARCHIVE, GLACIER_IR, INTELLIGENT_TIERING, ONEZONE_IA, OUTPOSTS, REDUCED_REDUNDANCY, STANDARD, STANDARD_IA.
      See https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html
+  -s3TLSInsecureSkipVerify
+     Whether to skip TLS verification when connecting to the S3 endpoint.
   -snapshot.createURL string
      VictoriaMetrics create snapshot url. When this is given a snapshot will automatically be created during backup.Example: http://victoriametrics:8428/snapshot/create
   -snapshot.deleteURL string
-     VictoriaMetrics delete snapshot url. Optional. Will be generated from snapshot.createURL if not provided. All created snaphosts will be automatically deleted.Example: http://victoriametrics:8428/snapshot/delete
+     VictoriaMetrics delete snapshot url. Optional. Will be generated from snapshot.createURL if not provided. All created snapshots will be automatically deleted. Example: http://victoriametrics:8428/snapshot/delete
   -storageDataPath string
      Path to VictoriaMetrics data. Must match -storageDataPath from VictoriaMetrics or vmstorage (default "victoria-metrics-data")
   -tls array

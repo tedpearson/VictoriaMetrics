@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "preact/compat";
-import { StateUpdater } from "preact/hooks";
+import { Dispatch, SetStateAction, useCallback, useEffect, useMemo, useState } from "preact/compat";
 import { getQueryRangeUrl, getQueryUrl } from "../api/query-range";
 import { useAppState } from "../state/common/StateContext";
 import { InstantMetricResult, MetricBase, MetricResult, QueryStats } from "../api/types";
@@ -12,8 +11,9 @@ import { useTimeState } from "../state/time/TimeStateContext";
 import { useCustomPanelState } from "../state/customPanel/CustomPanelStateContext";
 import { isHistogramData } from "../utils/metric";
 import { useGraphState } from "../state/graph/GraphStateContext";
-import { getSecondsFromDuration, getStepFromDuration } from "../utils/time";
-import { AppType } from "../types/appType";
+import { getStepFromDuration } from "../utils/time";
+import { getQueryStringValue } from "../utils/query-string";
+import { APP_TYPE_ANOMALY } from "../constants/appType";
 
 interface FetchQueryParams {
   predefinedQuery?: string[]
@@ -31,11 +31,12 @@ interface FetchQueryReturn {
   liveData?: InstantMetricResult[],
   error?: ErrorTypes | string,
   queryErrors: (ErrorTypes | string)[],
-  setQueryErrors: StateUpdater<string[]>,
+  setQueryErrors: Dispatch<SetStateAction<string[]>>,
   queryStats: QueryStats[],
   warning?: string,
   traces?: Trace[],
-  isHistogram: boolean
+  isHistogram: boolean,
+  abortFetch: () => void
 }
 
 interface FetchDataParams {
@@ -47,8 +48,6 @@ interface FetchDataParams {
   showAllSeries?: boolean,
   hideQuery?: number[]
 }
-
-const isAnomalyUI = AppType.anomaly === process.env.REACT_APP_TYPE;
 
 export const useFetchQuery = ({
   predefinedQuery,
@@ -77,8 +76,8 @@ export const useFetchQuery = ({
 
   const defaultStep = useMemo(() => {
     const { end, start } = period;
-    return getStepFromDuration(end - start, isHistogramState);
-  }, [period, isHistogramState]);
+    return getStepFromDuration(end - start, isHistogramState, displayType);
+  }, [period, isHistogramState, displayType]);
 
   const fetchData = async ({
     fetchUrl,
@@ -111,7 +110,12 @@ export const useFetchQuery = ({
           continue;
         }
 
-        const response = await fetch(url, { signal: controller.signal });
+        const urlObj = new URL(url);
+        const response = await fetch(`${urlObj.origin}${urlObj.pathname}`, {
+          signal: controller.signal,
+          method: "POST",
+          body: urlObj.searchParams
+        });
         const resp = await response.json();
 
         if (response.ok) {
@@ -127,7 +131,8 @@ export const useFetchQuery = ({
             tempTraces.push(trace);
           }
 
-          isHistogramResult = !isAnomalyUI && isDisplayChart && isHistogramData(resp.data.result);
+          const preventChangeType = !!getQueryStringValue("display_mode", null);
+          isHistogramResult = !APP_TYPE_ANOMALY && isDisplayChart && !preventChangeType && isHistogramData(resp.data.result);
           seriesLimit = isHistogramResult ? Infinity : defaultLimit;
           const freeTempSize = seriesLimit - tempData.length;
           resp.data.result.slice(0, freeTempSize).forEach((d: MetricBase) => {
@@ -156,6 +161,7 @@ export const useFetchQuery = ({
       const error = e as Error;
       if (error.name === "AbortError") {
         // Aborts are expected, don't show an error for them.
+        setIsLoading(false);
         return;
       }
       const helperText = "Please check your serverURL settings and confirm server availability.";
@@ -183,7 +189,7 @@ export const useFetchQuery = ({
       setQueryErrors(expr.map(() => ErrorTypes.validQuery));
     } else if (isValidHttpUrl(serverUrl)) {
       const updatedPeriod = { ...period };
-      updatedPeriod.step = isAnomalyUI ? `${getSecondsFromDuration(customStep)*1000}ms` : customStep;
+      updatedPeriod.step = customStep;
       return expr.map(q => displayChart
         ? getQueryRangeUrl(serverUrl, q, updatedPeriod, nocache, isTracingEnabled)
         : getQueryUrl(serverUrl, q, updatedPeriod, nocache, isTracingEnabled));
@@ -192,6 +198,13 @@ export const useFetchQuery = ({
     }
   },
   [serverUrl, period, displayType, customStep, hideQuery]);
+
+  const abortFetch = useCallback(() => {
+    fetchQueue.map(f => f.abort());
+    setFetchQueue([]);
+    setGraphData([]);
+    setLiveData([]);
+  }, [fetchQueue]);
 
   const [prevUrl, setPrevUrl] = useState<string[]>([]);
 
@@ -234,6 +247,7 @@ export const useFetchQuery = ({
     queryStats,
     warning,
     traces,
-    isHistogram
+    isHistogram,
+    abortFetch,
   };
 };

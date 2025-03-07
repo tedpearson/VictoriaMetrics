@@ -2,10 +2,11 @@
 
 DOCKER_NAMESPACE ?= victoriametrics
 
-ROOT_IMAGE ?= alpine:3.19.1
-CERTS_IMAGE := alpine:3.19.1
+ROOT_IMAGE ?= alpine:3.21.3
+ROOT_IMAGE_SCRATCH ?= scratch
+CERTS_IMAGE := alpine:3.21.3
 
-GO_BUILDER_IMAGE := golang:1.22.2-alpine
+GO_BUILDER_IMAGE := golang:1.23.6-alpine
 BUILDER_IMAGE := local/builder:2.0.0-$(shell echo $(GO_BUILDER_IMAGE) | tr :/ __)-1
 BASE_IMAGE := local/base:1.1.4-$(shell echo $(ROOT_IMAGE) | tr :/ __)-$(shell echo $(CERTS_IMAGE) | tr :/ __)
 DOCKER ?= docker
@@ -41,7 +42,7 @@ app-via-docker: package-builder
 		$(BUILDER_IMAGE) \
 		go build $(RACE) -trimpath -buildvcs=false \
 			-ldflags "-extldflags '-static' $(GO_BUILDINFO)" \
-			-tags 'netgo osusergo nethttpomithttp2 musl' \
+			-tags 'netgo osusergo musl' \
 			-o bin/$(APP_NAME)$(APP_SUFFIX)-prod $(PKG_PREFIX)/app/$(APP_NAME)
 
 app-via-docker-windows: package-builder
@@ -56,7 +57,7 @@ app-via-docker-windows: package-builder
 		$(BUILDER_IMAGE) \
 		go build $(RACE) -trimpath -buildvcs=false \
 			-ldflags "-s -w -extldflags '-static' $(GO_BUILDINFO)" \
-			-tags 'netgo osusergo nethttpomithttp2' \
+			-tags 'netgo osusergo' \
 			-o bin/$(APP_NAME)-windows$(APP_SUFFIX)-prod.exe $(PKG_PREFIX)/app/$(APP_NAME)
 
 package-via-docker: package-base
@@ -65,6 +66,12 @@ package-via-docker: package-base
 		$(DOCKER_BUILD) \
 			--build-arg src_binary=$(APP_NAME)$(APP_SUFFIX)-prod \
 			--build-arg base_image=$(BASE_IMAGE) \
+			--label "org.opencontainers.image.source=https://github.com/VictoriaMetrics/VictoriaMetrics" \
+			--label "org.opencontainers.image.documentation=https://docs.victoriametrics.com/" \
+			--label "org.opencontainers.image.title=$(APP_NAME)" \
+			--label "org.opencontainers.image.vendor=VictoriaMetrics" \
+			--label "org.opencontainers.image.version=$(PKG_TAG)" \
+			--label "org.opencontainers.image.created=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")" \
 			--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE) \
 			-f app/$(APP_NAME)/deployment/Dockerfile bin)
 
@@ -79,8 +86,32 @@ publish-via-docker:
 		--build-arg certs_image=$(CERTS_IMAGE) \
 		--build-arg root_image=$(ROOT_IMAGE) \
 		--build-arg APP_NAME=$(APP_NAME) \
+		--label "org.opencontainers.image.source=https://github.com/VictoriaMetrics/VictoriaMetrics" \
+		--label "org.opencontainers.image.documentation=https://docs.victoriametrics.com/" \
+		--label "org.opencontainers.image.title=$(APP_NAME)" \
+		--label "org.opencontainers.image.vendor=VictoriaMetrics" \
+		--label "org.opencontainers.image.version=$(PKG_TAG)" \
+		--label "org.opencontainers.image.created=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")" \
 		--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(RACE) \
 		--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(LATEST_TAG)$(RACE) \
+		-o type=image \
+		--provenance=false \
+		-f app/$(APP_NAME)/multiarch/Dockerfile \
+		--push \
+		bin
+	$(DOCKER) buildx build \
+		--platform=linux/amd64,linux/arm,linux/arm64,linux/ppc64le,linux/386 \
+		--build-arg certs_image=$(CERTS_IMAGE) \
+		--build-arg root_image=$(ROOT_IMAGE_SCRATCH) \
+		--build-arg APP_NAME=$(APP_NAME) \
+		--label "org.opencontainers.image.source=https://github.com/VictoriaMetrics/VictoriaMetrics" \
+		--label "org.opencontainers.image.documentation=https://docs.victoriametrics.com/" \
+		--label "org.opencontainers.image.title=$(APP_NAME)" \
+		--label "org.opencontainers.image.vendor=VictoriaMetrics" \
+		--label "org.opencontainers.image.version=$(PKG_TAG)" \
+		--label "org.opencontainers.image.created=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+		--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(RACE)-scratch \
+		--tag $(DOCKER_NAMESPACE)/$(APP_NAME):$(LATEST_TAG)$(RACE)-scratch \
 		-o type=image \
 		--provenance=false \
 		-f app/$(APP_NAME)/multiarch/Dockerfile \
@@ -102,23 +133,23 @@ run-via-docker: package-via-docker
 
 app-via-docker-goos-goarch:
 	APP_SUFFIX='-$(GOOS)-$(GOARCH)' \
-	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=$(GOOS) --env GOARCH=$(GOARCH) $(foreach v,$(EXTRA_ENVS),--env $(v))' \
+	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=$(GOOS) --env GOARCH=$(GOARCH) $(foreach v,$(EXTRA_DOCKER_ENVS),--env $(v))' \
 	$(MAKE) app-via-docker
 
 app-via-docker-pure:
 	APP_SUFFIX='-pure' DOCKER_OPTS='--env CGO_ENABLED=0' $(MAKE) app-via-docker
 
 app-via-docker-linux-amd64:
-	EXTRA_ENVS='CC=/opt/cross-builder/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc' \
+	EXTRA_DOCKER_ENVS='CC=/opt/cross-builder/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc' \
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(MAKE) app-via-docker-goos-goarch
 
-app-via-docker-linux-arm:
-	EXTRA_ENVS='GOARM=5' \
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm $(MAKE) app-via-docker-goos-goarch
-
 app-via-docker-linux-arm64:
-	EXTRA_ENVS='CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
+	EXTRA_DOCKER_ENVS='CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
 	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 $(MAKE) app-via-docker-goos-goarch
+
+app-via-docker-linux-arm:
+	EXTRA_DOCKER_ENVS='GOARM=5' \
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm $(MAKE) app-via-docker-goos-goarch
 
 app-via-docker-linux-ppc64le:
 	CGO_ENABLED=0 GOOS=linux GOARCH=ppc64le $(MAKE) app-via-docker-goos-goarch
@@ -145,28 +176,29 @@ app-via-docker-windows-amd64:
 
 package-via-docker-goarch:
 	APP_SUFFIX='-$(GOARCH)' \
-	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=linux --env GOARCH=$(GOARCH) $(foreach v,$(EXTRA_ENVS),--env $(v))' \
+	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=linux --env GOARCH=$(GOARCH) $(foreach v,$(EXTRA_DOCKER_ENVS),--env $(v))' \
 	$(MAKE) package-via-docker
 
 package-via-docker-pure:
 	APP_SUFFIX='-pure' DOCKER_OPTS='--env CGO_ENABLED=0' $(MAKE) package-via-docker
 
 package-via-docker-amd64:
-	EXTRA_ENVS='CC=/opt/cross-builder/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc' \
-	GOARCH=amd64 GOARCH=amd64 $(MAKE) package-via-docker-goarch
-
-package-via-docker-arm:
-	GOARCH=arm CGO_ENABLED=0 $(MAKE) package-via-docker-goarch
+	EXTRA_DOCKER_ENVS='CC=/opt/cross-builder/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc' \
+	CGO_ENABLED=1 GOARCH=amd64 $(MAKE) package-via-docker-goarch
 
 package-via-docker-arm64:
-	EXTRA_ENVS='CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
+	EXTRA_DOCKER_ENVS='CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
 	CGO_ENABLED=1 GOARCH=arm64 $(MAKE) package-via-docker-goarch
 
+package-via-docker-arm:
+	EXTRA_DOCKER_ENVS='GOARM=5' \
+	CGO_ENABLED=0 GOARCH=arm $(MAKE) package-via-docker-goarch
+
 package-via-docker-ppc64le:
-	GOARCH=ppc64le CGO_ENABLED=0 $(MAKE) package-via-docker-goarch
+	CGO_ENABLED=0 GOARCH=ppc64le $(MAKE) package-via-docker-goarch
 
 package-via-docker-386:
-	GOARCH=386 CGO_ENABLED=0 $(MAKE) package-via-docker-goarch
+	CGO_ENABLED=0 GOARCH=386 $(MAKE) package-via-docker-goarch
 
 remove-docker-images:
 	docker image ls --format '{{.ID}}' | xargs docker image rm -f

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
 // ParseTimeMsec parses time s in different formats.
@@ -14,12 +16,12 @@ import (
 //
 // It returns unix timestamp in milliseconds.
 func ParseTimeMsec(s string) (int64, error) {
-	currentTimestamp := float64(time.Now().UnixNano()) / 1e9
-	secs, err := ParseTimeAt(s, currentTimestamp)
+	currentTimestamp := time.Now().UnixNano()
+	nsecs, err := ParseTimeAt(s, currentTimestamp)
 	if err != nil {
 		return 0, err
 	}
-	msecs := int64(math.Round(secs * 1000))
+	msecs := int64(math.Round(float64(nsecs) / 1e6))
 	return msecs, nil
 }
 
@@ -33,13 +35,15 @@ const (
 //
 // See https://docs.victoriametrics.com/single-server-victoriametrics/#timestamp-formats
 //
-// It returns unix timestamp in seconds.
-func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
+// If s doesn't contain timezone information, then the local timezone is used.
+//
+// It returns unix timestamp in nanoseconds.
+func ParseTimeAt(s string, currentTimestamp int64) (int64, error) {
 	if s == "now" {
 		return currentTimestamp, nil
 	}
 	sOrig := s
-	tzOffset := float64(0)
+	tzOffset := int64(0)
 	if len(sOrig) > 6 {
 		// Try parsing timezone offset
 		tz := sOrig[len(sOrig)-6:]
@@ -53,11 +57,17 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 			if err != nil {
 				return 0, fmt.Errorf("cannot parse minute from timezone offset %q: %w", tz, err)
 			}
-			tzOffset = float64(hour*3600 + minute*60)
+			tzOffset = int64(hour*3600+minute*60) * 1e9
 			if isPlus {
 				tzOffset = -tzOffset
 			}
 			s = sOrig[:len(sOrig)-6]
+		} else {
+			if !strings.HasSuffix(s, "Z") {
+				tzOffset = -timeutil.GetLocalTimezoneOffsetNsecs()
+			} else {
+				s = s[:len(s)-1]
+			}
 		}
 	}
 	s = strings.TrimSuffix(s, "Z")
@@ -71,7 +81,7 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if d > 0 {
 			d = -d
 		}
-		return currentTimestamp + float64(d)/1e9, nil
+		return currentTimestamp + int64(d), nil
 	}
 	if len(s) == 4 {
 		// Parse YYYY
@@ -83,19 +93,10 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if y > maxValidYear || y < minValidYear {
 			return 0, fmt.Errorf("cannot parse year from %q: year must in range [%d, %d]", s, minValidYear, maxValidYear)
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	if !strings.Contains(sOrig, "-") {
-		// Parse the timestamp in seconds or in milliseconds
-		ts, err := strconv.ParseFloat(sOrig, 64)
-		if err != nil {
-			return 0, err
-		}
-		if ts >= (1 << 32) {
-			// The timestamp is in milliseconds. Convert it to seconds.
-			ts /= 1000
-		}
-		return ts, nil
+		return parseNumericTimestamp(sOrig)
 	}
 	if len(s) == 7 {
 		// Parse YYYY-MM
@@ -103,7 +104,7 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	if len(s) == 10 {
 		// Parse YYYY-MM-DD
@@ -111,7 +112,7 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	if len(s) == 13 {
 		// Parse YYYY-MM-DDTHH
@@ -119,7 +120,7 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	if len(s) == 16 {
 		// Parse YYYY-MM-DDTHH:MM
@@ -127,7 +128,7 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	if len(s) == 19 {
 		// Parse YYYY-MM-DDTHH:MM:SS
@@ -135,12 +136,49 @@ func ParseTimeAt(s string, currentTimestamp float64) (float64, error) {
 		if err != nil {
 			return 0, err
 		}
-		return tzOffset + float64(t.UnixNano())/1e9, nil
+		return tzOffset + t.UnixNano(), nil
 	}
 	// Parse RFC3339
 	t, err := time.Parse(time.RFC3339, sOrig)
 	if err != nil {
 		return 0, err
 	}
-	return float64(t.UnixNano()) / 1e9, nil
+	return t.UnixNano(), nil
+}
+
+// parseNumericTimestamp parses timestamp at s in seconds, milliseconds, microseconds or nanoseconds.
+//
+// It returns nanoseconds for the parsed timestamp.
+func parseNumericTimestamp(s string) (int64, error) {
+	if strings.ContainsAny(s, ".eE") {
+		// The timestamp is a floating-point number
+		ts, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, err
+		}
+		if ts >= (1 << 32) {
+			// The timestamp is in milliseconds
+			return int64(ts * 1_000_000), nil
+		}
+		return int64(math.Round(ts*1_000)) * 1_000_000, nil
+	}
+
+	// The timestamp is an integer number
+	ts, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case ts >= (1<<32)*1e6:
+		// The timestamp is in nanoseconds
+		return ts, nil
+	case ts >= (1<<32)*1e3:
+		// The timestamp is in microseconds
+		return ts * 1_000, nil
+	case ts >= (1 << 32):
+		// The timestamp is in milliseconds
+		return ts * 1_000_000, nil
+	default:
+		return ts * 1_000_000_000, nil
+	}
 }

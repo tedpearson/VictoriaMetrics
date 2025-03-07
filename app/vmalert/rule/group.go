@@ -8,22 +8,20 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/url"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
+
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
@@ -77,25 +75,37 @@ type Group struct {
 }
 
 type groupMetrics struct {
-	iterationTotal    *utils.Counter
-	iterationDuration *utils.Summary
-	iterationMissed   *utils.Counter
-	iterationInterval *utils.Gauge
+	set *metrics.Set
+
+	iterationTotal    *metrics.Counter
+	iterationDuration *metrics.Summary
+	iterationMissed   *metrics.Counter
+	iterationInterval *metrics.Gauge
 }
 
 func newGroupMetrics(g *Group) *groupMetrics {
 	m := &groupMetrics{}
+	m.set = metrics.NewSet()
+
 	labels := fmt.Sprintf(`group=%q, file=%q`, g.Name, g.File)
-	m.iterationTotal = utils.GetOrCreateCounter(fmt.Sprintf(`vmalert_iteration_total{%s}`, labels))
-	m.iterationDuration = utils.GetOrCreateSummary(fmt.Sprintf(`vmalert_iteration_duration_seconds{%s}`, labels))
-	m.iterationMissed = utils.GetOrCreateCounter(fmt.Sprintf(`vmalert_iteration_missed_total{%s}`, labels))
-	m.iterationInterval = utils.GetOrCreateGauge(fmt.Sprintf(`vmalert_iteration_interval_seconds{%s}`, labels), func() float64 {
+	m.iterationTotal = m.set.GetOrCreateCounter(fmt.Sprintf(`vmalert_iteration_total{%s}`, labels))
+	m.iterationDuration = m.set.GetOrCreateSummary(fmt.Sprintf(`vmalert_iteration_duration_seconds{%s}`, labels))
+	m.iterationMissed = m.set.GetOrCreateCounter(fmt.Sprintf(`vmalert_iteration_missed_total{%s}`, labels))
+	m.iterationInterval = m.set.GetOrCreateGauge(fmt.Sprintf(`vmalert_iteration_interval_seconds{%s}`, labels), func() float64 {
 		g.mu.RLock()
 		i := g.Interval.Seconds()
 		g.mu.RUnlock()
 		return i
 	})
 	return m
+}
+
+func (m *groupMetrics) start() {
+	metrics.RegisterSet(m.set)
+}
+
+func (m *groupMetrics) close() {
+	metrics.UnregisterSet(m.set, true)
 }
 
 // merges group rule labels into result map
@@ -212,7 +222,6 @@ func (g *Group) restore(ctx context.Context, qb datasource.QuerierBuilder, ts ti
 			continue
 		}
 		q := qb.BuildWithParams(datasource.QuerierParams{
-			DataSourceType:     g.Type.String(),
 			EvaluationInterval: g.Interval,
 			QueryParams:        g.Params,
 			Headers:            g.Headers,
@@ -241,7 +250,7 @@ func (g *Group) updateWith(newGroup *Group) error {
 		if !ok {
 			// old rule is not present in the new list
 			// so we mark it for removing
-			g.Rules[i].close()
+			g.Rules[i].unregisterMetrics()
 			g.Rules[i] = nil
 			continue
 		}
@@ -261,6 +270,7 @@ func (g *Group) updateWith(newGroup *Group) error {
 	}
 	// add the rest of rules from registry
 	for _, nr := range rulesRegistry {
+		nr.registerMetrics(g)
 		newRules = append(newRules, nr)
 	}
 	// note that g.Interval is not updated here
@@ -299,13 +309,7 @@ func (g *Group) Close() {
 	g.InterruptEval()
 	<-g.finishedCh
 
-	g.metrics.iterationDuration.Unregister()
-	g.metrics.iterationTotal.Unregister()
-	g.metrics.iterationMissed.Unregister()
-	g.metrics.iterationInterval.Unregister()
-	for _, rule := range g.Rules {
-		rule.close()
-	}
+	g.metrics.close()
 }
 
 // SkipRandSleepOnGroupStart will skip random sleep delay in group first evaluation
@@ -315,6 +319,8 @@ var SkipRandSleepOnGroupStart bool
 func (g *Group) Start(ctx context.Context, nts func() []notifier.Notifier, rw remotewrite.RWClient, rr datasource.QuerierBuilder) {
 	defer func() { close(g.finishedCh) }()
 
+	g.metrics.start()
+
 	evalTS := time.Now()
 	// sleep random duration to spread group rules evaluation
 	// over time in order to reduce load on datasource.
@@ -323,23 +329,36 @@ func (g *Group) Start(ctx context.Context, nts func() []notifier.Notifier, rw re
 		g.infof("will start in %v", sleepBeforeStart)
 
 		sleepTimer := time.NewTimer(sleepBeforeStart)
-		select {
-		case <-ctx.Done():
-			sleepTimer.Stop()
-			return
-		case <-g.doneCh:
-			sleepTimer.Stop()
-			return
-		case <-sleepTimer.C:
+	randSleep:
+		for {
+			select {
+			case <-ctx.Done():
+				sleepTimer.Stop()
+				return
+			case <-g.doneCh:
+				sleepTimer.Stop()
+				return
+			case ng := <-g.updateCh:
+				g.mu.Lock()
+				err := g.updateWith(ng)
+				if err != nil {
+					logger.Errorf("group %q: failed to update: %s", g.Name, err)
+					g.mu.Unlock()
+					continue
+				}
+				g.mu.Unlock()
+				g.infof("reload successfully")
+			case <-sleepTimer.C:
+				break randSleep
+			}
 		}
 		evalTS = evalTS.Add(sleepBeforeStart)
 	}
 
 	e := &executor{
-		Rw:                       rw,
-		Notifiers:                nts,
-		notifierHeaders:          g.NotifierHeaders,
-		previouslySentSeriesToRW: make(map[uint64]map[string][]prompbmarshal.Label),
+		Rw:              rw,
+		Notifiers:       nts,
+		notifierHeaders: g.NotifierHeaders,
 	}
 
 	g.infof("started")
@@ -412,8 +431,6 @@ func (g *Group) Start(ctx context.Context, nts func() []notifier.Notifier, rw re
 				continue
 			}
 
-			// ensure that staleness is tracked for existing rules only
-			e.purgeStaleSeries(g.Rules)
 			e.notifierHeaders = g.NotifierHeaders
 			g.mu.Unlock()
 
@@ -436,8 +453,8 @@ func (g *Group) Start(ctx context.Context, nts func() []notifier.Notifier, rw re
 }
 
 // UpdateWith inserts new group to updateCh
-func (g *Group) UpdateWith(new *Group) {
-	g.updateCh <- new
+func (g *Group) UpdateWith(newGroup *Group) {
+	g.updateCh <- newGroup
 }
 
 // DeepCopy returns a deep copy of group
@@ -474,7 +491,7 @@ func delayBeforeStart(ts time.Time, key uint64, interval time.Duration, offset *
 	return randSleep
 }
 
-func (g *Group) infof(format string, args ...interface{}) {
+func (g *Group) infof(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	logger.Infof("group %q %s; interval=%v; eval_offset=%v; concurrency=%d",
 		g.Name, msg, g.Interval, g.EvalOffset, g.Concurrency)
@@ -525,10 +542,9 @@ func (g *Group) Replay(start, end time.Time, rw remotewrite.RWClient, maxDataPoi
 // ExecOnce evaluates all the rules under group for once with given timestamp.
 func (g *Group) ExecOnce(ctx context.Context, nts func() []notifier.Notifier, rw remotewrite.RWClient, evalTS time.Time) chan error {
 	e := &executor{
-		Rw:                       rw,
-		Notifiers:                nts,
-		notifierHeaders:          g.NotifierHeaders,
-		previouslySentSeriesToRW: make(map[uint64]map[string][]prompbmarshal.Label),
+		Rw:              rw,
+		Notifiers:       nts,
+		notifierHeaders: g.NotifierHeaders,
 	}
 	if len(g.Rules) < 1 {
 		return nil
@@ -619,13 +635,6 @@ type executor struct {
 	notifierHeaders map[string]string
 
 	Rw remotewrite.RWClient
-
-	previouslySentSeriesToRWMu sync.Mutex
-	// previouslySentSeriesToRW stores series sent to RW on previous iteration
-	// map[ruleID]map[ruleLabels][]prompb.Label
-	// where `ruleID` is ID of the Rule within a Group
-	// and `ruleLabels` is []prompb.Label marshalled to a string
-	previouslySentSeriesToRW map[uint64]map[string][]prompbmarshal.Label
 }
 
 // execConcurrently executes rules concurrently if concurrency>1
@@ -692,11 +701,6 @@ func (e *executor) exec(ctx context.Context, r Rule, ts time.Time, resolveDurati
 		if err := pushToRW(tss); err != nil {
 			return err
 		}
-
-		staleSeries := e.getStaleSeries(r, tss, ts)
-		if err := pushToRW(staleSeries); err != nil {
-			return err
-		}
 	}
 
 	ar, ok := r.(*AlertingRule)
@@ -722,75 +726,4 @@ func (e *executor) exec(ctx context.Context, r Rule, ts time.Time, resolveDurati
 	}
 	wg.Wait()
 	return errGr.Err()
-}
-
-// getStaleSeries checks whether there are stale series from previously sent ones.
-func (e *executor) getStaleSeries(r Rule, tss []prompbmarshal.TimeSeries, timestamp time.Time) []prompbmarshal.TimeSeries {
-	ruleLabels := make(map[string][]prompbmarshal.Label, len(tss))
-	for _, ts := range tss {
-		// convert labels to strings so we can compare with previously sent series
-		key := labelsToString(ts.Labels)
-		ruleLabels[key] = ts.Labels
-	}
-
-	rID := r.ID()
-	var staleS []prompbmarshal.TimeSeries
-	// check whether there are series which disappeared and need to be marked as stale
-	e.previouslySentSeriesToRWMu.Lock()
-	for key, labels := range e.previouslySentSeriesToRW[rID] {
-		if _, ok := ruleLabels[key]; ok {
-			continue
-		}
-		// previously sent series are missing in current series, so we mark them as stale
-		ss := newTimeSeriesPB([]float64{decimal.StaleNaN}, []int64{timestamp.Unix()}, labels)
-		staleS = append(staleS, ss)
-	}
-	// set previous series to current
-	e.previouslySentSeriesToRW[rID] = ruleLabels
-	e.previouslySentSeriesToRWMu.Unlock()
-
-	return staleS
-}
-
-// purgeStaleSeries deletes references in tracked
-// previouslySentSeriesToRW list to Rules which aren't present
-// in the given activeRules list. The method is used when the list
-// of loaded rules has changed and executor has to remove
-// references to non-existing rules.
-func (e *executor) purgeStaleSeries(activeRules []Rule) {
-	newPreviouslySentSeriesToRW := make(map[uint64]map[string][]prompbmarshal.Label)
-
-	e.previouslySentSeriesToRWMu.Lock()
-
-	for _, rule := range activeRules {
-		id := rule.ID()
-		prev, ok := e.previouslySentSeriesToRW[id]
-		if ok {
-			// keep previous series for staleness detection
-			newPreviouslySentSeriesToRW[id] = prev
-		}
-	}
-	e.previouslySentSeriesToRW = nil
-	e.previouslySentSeriesToRW = newPreviouslySentSeriesToRW
-
-	e.previouslySentSeriesToRWMu.Unlock()
-}
-
-func labelsToString(labels []prompbmarshal.Label) string {
-	var b strings.Builder
-	b.WriteRune('{')
-	for i, label := range labels {
-		if len(label.Name) == 0 {
-			b.WriteString("__name__")
-		} else {
-			b.WriteString(label.Name)
-		}
-		b.WriteRune('=')
-		b.WriteString(strconv.Quote(label.Value))
-		if i < len(labels)-1 {
-			b.WriteRune(',')
-		}
-	}
-	b.WriteRune('}')
-	return b.String()
 }

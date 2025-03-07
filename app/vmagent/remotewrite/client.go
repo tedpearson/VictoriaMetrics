@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/awsapi"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
@@ -32,11 +34,13 @@ var (
 	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", 0, "Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. "+
 		"By default, the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data "+
 		"is sent after temporary unavailability of the remote storage. See also -maxIngestionRate")
-	sendTimeout = flagutil.NewArrayDuration("remoteWrite.sendTimeout", time.Minute, "Timeout for sending a single block of data to the corresponding -remoteWrite.url")
-	proxyURL    = flagutil.NewArrayString("remoteWrite.proxyURL", "Optional proxy URL for writing data to the corresponding -remoteWrite.url. "+
+	sendTimeout      = flagutil.NewArrayDuration("remoteWrite.sendTimeout", time.Minute, "Timeout for sending a single block of data to the corresponding -remoteWrite.url")
+	retryMinInterval = flagutil.NewArrayDuration("remoteWrite.retryMinInterval", time.Second, "The minimum delay between retry attempts to send a block of data to the corresponding -remoteWrite.url. Every next retry attempt will double the delay to prevent hammering of remote database. See also -remoteWrite.retryMaxTime")
+	retryMaxTime     = flagutil.NewArrayDuration("remoteWrite.retryMaxTime", time.Minute, "The max time spent on retry attempts to send a block of data to the corresponding -remoteWrite.url. Change this value if it is expected for -remoteWrite.url to be unreachable for more than -remoteWrite.retryMaxTime. See also -remoteWrite.retryMinInterval")
+	proxyURL         = flagutil.NewArrayString("remoteWrite.proxyURL", "Optional proxy URL for writing data to the corresponding -remoteWrite.url. "+
 		"Supported proxies: http, https, socks5. Example: -remoteWrite.proxyURL=socks5://proxy:1234")
 
-	tlsHandshakeTimeout   = flagutil.NewArrayDuration("remoteWrite.tlsHandshakeTimeout", 20*time.Second, "The timeout for estabilishing tls connections to the corresponding -remoteWrite.url")
+	tlsHandshakeTimeout   = flagutil.NewArrayDuration("remoteWrite.tlsHandshakeTimeout", 20*time.Second, "The timeout for establishing tls connections to the corresponding -remoteWrite.url")
 	tlsInsecureSkipVerify = flagutil.NewArrayBool("remoteWrite.tlsInsecureSkipVerify", "Whether to skip tls verification when connecting to the corresponding -remoteWrite.url")
 	tlsCertFile           = flagutil.NewArrayString("remoteWrite.tlsCertFile", "Optional path to client-side TLS certificate file to use when connecting "+
 		"to the corresponding -remoteWrite.url")
@@ -88,6 +92,9 @@ type client struct {
 	fq *persistentqueue.FastQueue
 	hc *http.Client
 
+	retryMinInterval time.Duration
+	retryMaxTime     time.Duration
+
 	sendBlock func(block []byte) bool
 	authCfg   *promauth.Config
 	awsCfg    *awsapi.Config
@@ -118,7 +125,7 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		logger.Fatalf("cannot initialize AWS Config for -remoteWrite.url=%q: %s", remoteWriteURL, err)
 	}
 	tr := &http.Transport{
-		DialContext:         statDial,
+		DialContext:         netutil.NewStatDialFunc("vmagent_remotewrite"),
 		TLSHandshakeTimeout: tlsHandshakeTimeout.GetOptionalArg(argIdx),
 		MaxConnsPerHost:     2 * concurrency,
 		MaxIdleConnsPerHost: 2 * concurrency,
@@ -141,13 +148,15 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		Timeout:   sendTimeout.GetOptionalArg(argIdx),
 	}
 	c := &client{
-		sanitizedURL:   sanitizedURL,
-		remoteWriteURL: remoteWriteURL,
-		authCfg:        authCfg,
-		awsCfg:         awsCfg,
-		fq:             fq,
-		hc:             hc,
-		stopCh:         make(chan struct{}),
+		sanitizedURL:     sanitizedURL,
+		remoteWriteURL:   remoteWriteURL,
+		authCfg:          authCfg,
+		awsCfg:           awsCfg,
+		fq:               fq,
+		hc:               hc,
+		retryMinInterval: retryMinInterval.GetOptionalArg(argIdx),
+		retryMaxTime:     retryMaxTime.GetOptionalArg(argIdx),
+		stopCh:           make(chan struct{}),
 	}
 	c.sendBlock = c.sendBlockHTTP
 
@@ -298,6 +307,11 @@ func (c *client) runWorker() {
 		if !ok {
 			return
 		}
+		if len(block) == 0 {
+			// skip empty data blocks from sending
+			// see https://github.com/VictoriaMetrics/VictoriaMetrics/pull/6241
+			continue
+		}
 		go func() {
 			startTime := time.Now()
 			ch <- c.sendBlock(block)
@@ -389,11 +403,11 @@ func (c *client) newRequest(url string, body []byte) (*http.Request, error) {
 // sendBlockHTTP sends the given block to c.remoteWriteURL.
 //
 // The function returns false only if c.stopCh is closed.
-// Otherwise it tries sending the block to remote storage indefinitely.
+// Otherwise, it tries sending the block to remote storage indefinitely.
 func (c *client) sendBlockHTTP(block []byte) bool {
 	c.rl.Register(len(block))
-	maxRetryDuration := timeutil.AddJitterToDuration(time.Minute)
-	retryDuration := timeutil.AddJitterToDuration(time.Second)
+	maxRetryDuration := timeutil.AddJitterToDuration(c.retryMaxTime)
+	retryDuration := timeutil.AddJitterToDuration(c.retryMinInterval)
 	retriesCount := 0
 
 again:
@@ -449,10 +463,10 @@ again:
 
 	// Unexpected status code returned
 	retriesCount++
-	retryDuration *= 2
-	if retryDuration > maxRetryDuration {
-		retryDuration = maxRetryDuration
-	}
+	retryAfterHeader := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
+	retryDuration = getRetryDuration(retryAfterHeader, retryDuration, maxRetryDuration)
+
+	// Handle response
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
@@ -474,3 +488,49 @@ again:
 }
 
 var remoteWriteRejectedLogger = logger.WithThrottler("remoteWriteRejected", 5*time.Second)
+
+// getRetryDuration returns retry duration.
+// retryAfterDuration has the highest priority.
+// If retryAfterDuration is not specified, retryDuration gets doubled.
+// retryDuration can't exceed maxRetryDuration.
+//
+// Also see: https://github.com/VictoriaMetrics/VictoriaMetrics/issues/6097
+func getRetryDuration(retryAfterDuration, retryDuration, maxRetryDuration time.Duration) time.Duration {
+	// retryAfterDuration has the highest priority duration
+	if retryAfterDuration > 0 {
+		return timeutil.AddJitterToDuration(retryAfterDuration)
+	}
+
+	// default backoff retry policy
+	retryDuration *= 2
+	if retryDuration > maxRetryDuration {
+		retryDuration = maxRetryDuration
+	}
+
+	return retryDuration
+}
+
+// parseRetryAfterHeader parses `Retry-After` value retrieved from HTTP response header.
+// retryAfterString should be in either HTTP-date or a number of seconds.
+// It will return time.Duration(0) if `retryAfterString` does not follow RFC 7231.
+func parseRetryAfterHeader(retryAfterString string) (retryAfterDuration time.Duration) {
+	if retryAfterString == "" {
+		return retryAfterDuration
+	}
+
+	defer func() {
+		v := retryAfterDuration.Seconds()
+		logger.Infof("'Retry-After: %s' parsed into %.2f second(s)", retryAfterString, v)
+	}()
+
+	// Retry-After could be in "Mon, 02 Jan 2006 15:04:05 GMT" format.
+	if parsedTime, err := time.Parse(http.TimeFormat, retryAfterString); err == nil {
+		return time.Duration(time.Until(parsedTime).Seconds()) * time.Second
+	}
+	// Retry-After could be in seconds.
+	if seconds, err := strconv.Atoi(retryAfterString); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+
+	return 0
+}

@@ -12,10 +12,10 @@ func TestParseEndpointSliceListFail(t *testing.T) {
 		r := bytes.NewBufferString(data)
 		objectsByKey, _, err := parseEndpointSliceList(r)
 		if err == nil {
-			t.Errorf("unexpected result, test must fail! data: %s", data)
+			t.Fatalf("unexpected result, test must fail! data: %s", data)
 		}
 		if len(objectsByKey) != 0 {
-			t.Errorf("EndpointSliceList must be emptry, got: %v", objectsByKey)
+			t.Fatalf("EndpointSliceList must be emptry, got: %v", objectsByKey)
 		}
 	}
 
@@ -156,8 +156,7 @@ func TestParseEndpointSliceListSuccess(t *testing.T) {
 	r := bytes.NewBufferString(data)
 	objectsByKey, meta, err := parseEndpointSliceList(r)
 	if err != nil {
-		t.Errorf("cannot parse data for EndpointSliceList: %v", err)
-		return
+		t.Fatalf("cannot parse data for EndpointSliceList: %v", err)
 	}
 	expectedResourceVersion := "1177"
 	if meta.ResourceVersion != expectedResourceVersion {
@@ -226,8 +225,9 @@ func TestParseEndpointSliceListSuccess(t *testing.T) {
 
 func TestGetEndpointsliceLabels(t *testing.T) {
 	type testArgs struct {
-		containerPorts map[string][]ContainerPort
-		endpointPorts  []EndpointPort
+		initContainerPorts map[string][]ContainerPort
+		containerPorts     map[string][]ContainerPort
+		endpointPorts      []EndpointPort
 	}
 	f := func(t *testing.T, args testArgs, wantLabels []*promutils.Labels) {
 		t.Helper()
@@ -296,6 +296,14 @@ func TestGetEndpointsliceLabels(t *testing.T) {
 			Metadata: ObjectMeta{
 				Labels: promutils.NewLabelsFromMap(map[string]string{"node-label": "xyz"}),
 			},
+		}
+		for cn, ports := range args.initContainerPorts {
+			pod.Spec.InitContainers = append(pod.Spec.InitContainers, Container{
+				Name:          cn,
+				Image:         "test-init-image",
+				Ports:         ports,
+				RestartPolicy: "Always",
+			})
 		}
 		for cn, ports := range args.containerPorts {
 			pod.Spec.Containers = append(pod.Spec.Containers, Container{
@@ -438,6 +446,7 @@ func TestGetEndpointsliceLabels(t *testing.T) {
 				"__meta_kubernetes_node_labelpresent_node_label":                          "true",
 				"__meta_kubernetes_node_name":                                             "test-node",
 				"__meta_kubernetes_pod_container_image":                                   "test-image",
+				"__meta_kubernetes_pod_container_init":                                    "false",
 				"__meta_kubernetes_pod_container_name":                                    "metrics",
 				"__meta_kubernetes_pod_container_port_name":                               "http-metrics",
 				"__meta_kubernetes_pod_container_port_number":                             "8428",
@@ -491,6 +500,61 @@ func TestGetEndpointsliceLabels(t *testing.T) {
 				"__meta_kubernetes_node_labelpresent_node_label":                          "true",
 				"__meta_kubernetes_node_name":                                             "test-node",
 				"__meta_kubernetes_pod_container_image":                                   "test-image",
+				"__meta_kubernetes_pod_container_init":                                    "false",
+				"__meta_kubernetes_pod_container_name":                                    "metrics",
+				"__meta_kubernetes_pod_container_port_name":                               "web",
+				"__meta_kubernetes_pod_container_port_number":                             "8428",
+				"__meta_kubernetes_pod_container_port_protocol":                           "sdc",
+				"__meta_kubernetes_pod_host_ip":                                           "4.5.6.7",
+				"__meta_kubernetes_pod_ip":                                                "192.168.15.1",
+				"__meta_kubernetes_pod_name":                                              "test-pod",
+				"__meta_kubernetes_pod_node_name":                                         "test-node",
+				"__meta_kubernetes_pod_phase":                                             "abc",
+				"__meta_kubernetes_pod_ready":                                             "unknown",
+				"__meta_kubernetes_pod_uid":                                               "pod-uid",
+				"__meta_kubernetes_service_cluster_ip":                                    "1.2.3.4",
+				"__meta_kubernetes_service_name":                                          "test-svc",
+				"__meta_kubernetes_service_type":                                          "service-type",
+			}),
+		})
+	})
+
+	t.Run("1 init container port from endpoint", func(t *testing.T) {
+		f(t, testArgs{
+			initContainerPorts: map[string][]ContainerPort{"metrics": {{
+				Name:          "web",
+				ContainerPort: 8428,
+				Protocol:      "sdc",
+			}}},
+			endpointPorts: []EndpointPort{
+				{
+					Name:     "web",
+					Port:     8428,
+					Protocol: "xabc",
+				},
+			},
+		}, []*promutils.Labels{
+			promutils.NewLabelsFromMap(map[string]string{
+				"__address__": "10.13.15.15:8428",
+				"__meta_kubernetes_endpointslice_address_target_kind":                     "Pod",
+				"__meta_kubernetes_endpointslice_address_target_name":                     "test-pod",
+				"__meta_kubernetes_endpointslice_address_type":                            "foobar",
+				"__meta_kubernetes_endpointslice_endpoint_conditions_ready":               "true",
+				"__meta_kubernetes_endpointslice_endpoint_hostname":                       "foo.bar",
+				"__meta_kubernetes_endpointslice_endpoint_topology_present_x":             "true",
+				"__meta_kubernetes_endpointslice_endpoint_topology_x":                     "y",
+				"__meta_kubernetes_endpointslice_label_kubernetes_io_service_name":        "test-svc",
+				"__meta_kubernetes_endpointslice_labelpresent_kubernetes_io_service_name": "true",
+				"__meta_kubernetes_endpointslice_name":                                    "test-eps",
+				"__meta_kubernetes_endpointslice_port":                                    "8428",
+				"__meta_kubernetes_endpointslice_port_name":                               "web",
+				"__meta_kubernetes_endpointslice_port_protocol":                           "xabc",
+				"__meta_kubernetes_namespace":                                             "default",
+				"__meta_kubernetes_node_label_node_label":                                 "xyz",
+				"__meta_kubernetes_node_labelpresent_node_label":                          "true",
+				"__meta_kubernetes_node_name":                                             "test-node",
+				"__meta_kubernetes_pod_container_image":                                   "test-init-image",
+				"__meta_kubernetes_pod_container_init":                                    "true",
 				"__meta_kubernetes_pod_container_name":                                    "metrics",
 				"__meta_kubernetes_pod_container_port_name":                               "web",
 				"__meta_kubernetes_pod_container_port_number":                             "8428",

@@ -4,15 +4,15 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 )
 
 // StorageStats represents stats for the storage. It may be obtained by calling Storage.UpdateStats().
@@ -45,7 +45,12 @@ type StorageConfig struct {
 	// Older data is automatically deleted.
 	Retention time.Duration
 
-	// FlushInterval is the interval for flushing the in-memory data to disk at the Storage
+	// MaxDiskSpaceUsageBytes is an optional maximum disk space logs can use.
+	//
+	// The oldest per-day partitions are automatically dropped if the total disk space usage exceeds this limit.
+	MaxDiskSpaceUsageBytes int64
+
+	// FlushInterval is the interval for flushing the in-memory data to disk at the Storage.
 	FlushInterval time.Duration
 
 	// FutureRetention is the allowed retention from the current time to future for the ingested data.
@@ -53,13 +58,14 @@ type StorageConfig struct {
 	// Log entries with timestamps bigger than now+FutureRetention are ignored.
 	FutureRetention time.Duration
 
-	// MinFreeDiskSpaceBytes is the minimum free disk space at storage path after which the storage stops accepting new data.
+	// MinFreeDiskSpaceBytes is the minimum free disk space at storage path after which the storage stops accepting new data
+	// and enters read-only mode.
 	MinFreeDiskSpaceBytes int64
 
 	// LogNewStreams indicates whether to log newly created log streams.
 	//
 	// This can be useful for debugging of high cardinality issues.
-	// https://docs.victoriametrics.com/VictoriaLogs/keyConcepts.html#high-cardinality
+	// https://docs.victoriametrics.com/victorialogs/keyconcepts/#high-cardinality
 	LogNewStreams bool
 
 	// LogIngestedRows indicates whether to log the ingested log entries.
@@ -80,6 +86,11 @@ type Storage struct {
 	//
 	// older data is automatically deleted
 	retention time.Duration
+
+	// maxDiskSpaceUsageBytes is an optional maximum disk space logs can use.
+	//
+	// The oldest per-day partitions are automatically dropped if the total disk space usage exceeds this limit.
+	maxDiskSpaceUsageBytes int64
 
 	// flushInterval is the interval for flushing in-memory data to disk
 	flushInterval time.Duration
@@ -102,6 +113,8 @@ type Storage struct {
 	// partitions is a list of partitions for the Storage.
 	//
 	// It must be accessed under partitionsLock.
+	//
+	// partitions are sorted by time.
 	partitions []*partitionWrapper
 
 	// ptwHot is the "hot" partition, were the last rows were ingested.
@@ -122,21 +135,12 @@ type Storage struct {
 	//
 	// It reduces the load on persistent storage during data ingestion by skipping
 	// the check whether the given stream is already registered in the persistent storage.
-	streamIDCache *workingsetcache.Cache
+	streamIDCache *cache
 
-	// streamTagsCache caches StreamTags entries keyed by streamID.
-	//
-	// There is no need to put partition into the key for StreamTags,
-	// since StreamTags are uniquely identified by streamID.
-	//
-	// It reduces the load on persistent storage during querying
-	// when StreamTags must be found for the particular streamID
-	streamTagsCache *workingsetcache.Cache
-
-	// streamFilterCache caches streamIDs keyed by (partition, []TenanID, StreamFilter).
+	// filterStreamCache caches streamIDs keyed by (partition, []TenanID, StreamFilter).
 	//
 	// It reduces the load on persistent storage during querying by _stream:{...} filter.
-	streamFilterCache *workingsetcache.Cache
+	filterStreamCache *cache
 }
 
 type partitionWrapper struct {
@@ -189,8 +193,8 @@ func (ptw *partitionWrapper) decRef() {
 }
 
 func (ptw *partitionWrapper) canAddAllRows(lr *LogRows) bool {
-	minTimestamp := ptw.day * nsecPerDay
-	maxTimestamp := minTimestamp + nsecPerDay - 1
+	minTimestamp := ptw.day * nsecsPerDay
+	maxTimestamp := minTimestamp + nsecsPerDay - 1
 	for _, ts := range lr.timestamps {
 		if ts < minTimestamp || ts > maxTimestamp {
 			return false
@@ -238,48 +242,58 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 	flockF := fs.MustCreateFlockFile(path)
 
 	// Load caches
-	mem := memory.Allowed()
-	streamIDCachePath := filepath.Join(path, cacheDirname, streamIDCacheFilename)
-	streamIDCache := workingsetcache.Load(streamIDCachePath, mem/16)
-
-	streamTagsCache := workingsetcache.New(mem / 10)
-
-	streamFilterCache := workingsetcache.New(mem / 10)
+	streamIDCache := newCache()
+	filterStreamCache := newCache()
 
 	s := &Storage{
-		path:                  path,
-		retention:             retention,
-		flushInterval:         flushInterval,
-		futureRetention:       futureRetention,
-		minFreeDiskSpaceBytes: minFreeDiskSpaceBytes,
-		logNewStreams:         cfg.LogNewStreams,
-		logIngestedRows:       cfg.LogIngestedRows,
-		flockF:                flockF,
-		stopCh:                make(chan struct{}),
+		path:                   path,
+		retention:              retention,
+		maxDiskSpaceUsageBytes: cfg.MaxDiskSpaceUsageBytes,
+		flushInterval:          flushInterval,
+		futureRetention:        futureRetention,
+		minFreeDiskSpaceBytes:  minFreeDiskSpaceBytes,
+		logNewStreams:          cfg.LogNewStreams,
+		logIngestedRows:        cfg.LogIngestedRows,
+		flockF:                 flockF,
+		stopCh:                 make(chan struct{}),
 
 		streamIDCache:     streamIDCache,
-		streamTagsCache:   streamTagsCache,
-		streamFilterCache: streamFilterCache,
+		filterStreamCache: filterStreamCache,
 	}
 
 	partitionsPath := filepath.Join(path, partitionsDirname)
 	fs.MustMkdirIfNotExist(partitionsPath)
 	des := fs.MustReadDir(partitionsPath)
 	ptws := make([]*partitionWrapper, len(des))
+
+	// Open partitions in parallel. This should improve VictoriaLogs initializiation duration
+	// when it opens many partitions.
+	var wg sync.WaitGroup
+	concurrencyLimiterCh := make(chan struct{}, cgroup.AvailableCPUs())
 	for i, de := range des {
 		fname := de.Name()
 
-		// Parse the day for the partition
-		t, err := time.Parse(partitionNameFormat, fname)
-		if err != nil {
-			logger.Panicf("FATAL: cannot parse partition filename %q at %q; it must be in the form YYYYMMDD: %s", fname, partitionsPath, err)
-		}
-		day := t.UTC().UnixNano() / nsecPerDay
+		wg.Add(1)
+		concurrencyLimiterCh <- struct{}{}
+		go func(idx int) {
+			defer func() {
+				<-concurrencyLimiterCh
+				wg.Done()
+			}()
 
-		partitionPath := filepath.Join(partitionsPath, fname)
-		pt := mustOpenPartition(s, partitionPath)
-		ptws[i] = newPartitionWrapper(pt, day)
+			t, err := time.Parse(partitionNameFormat, fname)
+			if err != nil {
+				logger.Panicf("FATAL: cannot parse partition filename %q at %q; it must be in the form YYYYMMDD: %s", fname, partitionsPath, err)
+			}
+			day := t.UTC().UnixNano() / nsecsPerDay
+
+			partitionPath := filepath.Join(partitionsPath, fname)
+			pt := mustOpenPartition(s, partitionPath)
+			ptws[idx] = newPartitionWrapper(pt, day)
+		}(i)
 	}
+	wg.Wait()
+
 	sort.Slice(ptws, func(i, j int) bool {
 		return ptws[i].day < ptws[j].day
 	})
@@ -305,6 +319,7 @@ func MustOpenStorage(path string, cfg *StorageConfig) *Storage {
 
 	s.partitions = ptws
 	s.runRetentionWatcher()
+	s.runMaxDiskSpaceUsageWatcher()
 	return s
 }
 
@@ -314,6 +329,17 @@ func (s *Storage) runRetentionWatcher() {
 	s.wg.Add(1)
 	go func() {
 		s.watchRetention()
+		s.wg.Done()
+	}()
+}
+
+func (s *Storage) runMaxDiskSpaceUsageWatcher() {
+	if s.maxDiskSpaceUsageBytes <= 0 {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		s.watchMaxDiskSpaceUsage()
 		s.wg.Done()
 	}()
 }
@@ -360,12 +386,68 @@ func (s *Storage) watchRetention() {
 	}
 }
 
+func (s *Storage) watchMaxDiskSpaceUsage() {
+	d := timeutil.AddJitterToDuration(10 * time.Second)
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+	for {
+		s.partitionsLock.Lock()
+		var n uint64
+		ptws := s.partitions
+		var ptwsToDelete []*partitionWrapper
+		for i := len(ptws) - 1; i >= 0; i-- {
+			ptw := ptws[i]
+			var ps PartitionStats
+			ptw.pt.updateStats(&ps)
+			n += ps.IndexdbSizeBytes + ps.CompressedSmallPartSize + ps.CompressedBigPartSize
+			if n <= uint64(s.maxDiskSpaceUsageBytes) {
+				continue
+			}
+			if i >= len(ptws)-2 {
+				// Keep the last two per-day partitions, so logs could be queried for one day time range.
+				continue
+			}
+
+			// ptws are sorted by time, so just drop all the partitions until i, including i.
+			i++
+			ptwsToDelete = ptws[:i]
+			s.partitions = ptws[i:]
+
+			// Remove reference to deleted partitions from s.ptwHot
+			for _, ptw := range ptwsToDelete {
+				if ptw == s.ptwHot {
+					s.ptwHot = nil
+					break
+				}
+			}
+
+			break
+		}
+		s.partitionsLock.Unlock()
+
+		for i, ptw := range ptwsToDelete {
+			logger.Infof("the partition %s is scheduled to be deleted because the total size of partitions exceeds -retention.maxDiskSpaceUsageBytes=%d",
+				ptw.pt.path, s.maxDiskSpaceUsageBytes)
+			ptw.mustDrop.Store(true)
+			ptw.decRef()
+
+			ptwsToDelete[i] = nil
+		}
+
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Storage) getMinAllowedDay() int64 {
-	return time.Now().UTC().Add(-s.retention).UnixNano() / nsecPerDay
+	return time.Now().UTC().Add(-s.retention).UnixNano() / nsecsPerDay
 }
 
 func (s *Storage) getMaxAllowedDay() int64 {
-	return time.Now().UTC().Add(s.futureRetention).UnixNano() / nsecPerDay
+	return time.Now().UTC().Add(s.futureRetention).UnixNano() / nsecsPerDay
 }
 
 // MustClose closes s.
@@ -386,25 +468,51 @@ func (s *Storage) MustClose() {
 	s.partitions = nil
 	s.ptwHot = nil
 
-	// Save caches
-	streamIDCachePath := filepath.Join(s.path, cacheDirname, streamIDCacheFilename)
-	if err := s.streamIDCache.Save(streamIDCachePath); err != nil {
-		logger.Panicf("FATAL: cannot save streamID cache to %q: %s", streamIDCachePath, err)
-	}
-	s.streamIDCache.Stop()
+	// Stop caches
+
+	// Do not persist caches, since they may become out of sync with partitions
+	// if partitions are deleted, restored from backups or copied from other sources
+	// between VictoriaLogs restarts. This may result in various issues
+	// during data ingestion and querying.
+
+	s.streamIDCache.MustStop()
 	s.streamIDCache = nil
 
-	s.streamTagsCache.Stop()
-	s.streamTagsCache = nil
-
-	s.streamFilterCache.Stop()
-	s.streamFilterCache = nil
+	s.filterStreamCache.MustStop()
+	s.filterStreamCache = nil
 
 	// release lock file
 	fs.MustClose(s.flockF)
 	s.flockF = nil
 
 	s.path = ""
+}
+
+// MustForceMerge force-merges parts in s partitions with names starting from the given partitionNamePrefix.
+//
+// Partitions are merged sequentially in order to reduce load on the system.
+func (s *Storage) MustForceMerge(partitionNamePrefix string) {
+	var ptws []*partitionWrapper
+
+	s.partitionsLock.Lock()
+	for _, ptw := range s.partitions {
+		if strings.HasPrefix(ptw.pt.name, partitionNamePrefix) {
+			ptw.incRef()
+			ptws = append(ptws, ptw)
+		}
+	}
+	s.partitionsLock.Unlock()
+
+	s.wg.Add(1)
+	defer s.wg.Done()
+
+	for _, ptw := range ptws {
+		logger.Infof("started force merge for partition %s", ptw.pt.name)
+		startTime := time.Now()
+		ptw.pt.mustForceMerge()
+		ptw.decRef()
+		logger.Infof("finished force merge for partition %s in %.3fs", ptw.pt.name, time.Since(startTime).Seconds())
+	}
 }
 
 // MustAddRows adds lr to s.
@@ -434,30 +542,30 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 	maxAllowedDay := s.getMaxAllowedDay()
 	m := make(map[int64]*LogRows)
 	for i, ts := range lr.timestamps {
-		day := ts / nsecPerDay
+		day := ts / nsecsPerDay
 		if day < minAllowedDay {
-			rf := RowFormatter(lr.rows[i])
+			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
-			minAllowedTsf := TimeFormatter(minAllowedDay * nsecPerDay)
+			minAllowedTsf := TimeFormatter(minAllowedDay * nsecsPerDay)
 			tooSmallTimestampLogger.Warnf("skipping log entry with too small timestamp=%s; it must be bigger than %s according "+
-				"to the configured -retentionPeriod=%dd. See https://docs.victoriametrics.com/VictoriaLogs/#retention ; "+
-				"log entry: %s", &tsf, &minAllowedTsf, durationToDays(s.retention), &rf)
+				"to the configured -retentionPeriod=%dd. See https://docs.victoriametrics.com/victorialogs/#retention ; "+
+				"log entry: %s", &tsf, &minAllowedTsf, durationToDays(s.retention), line)
 			s.rowsDroppedTooSmallTimestamp.Add(1)
 			continue
 		}
 		if day > maxAllowedDay {
-			rf := RowFormatter(lr.rows[i])
+			line := MarshalFieldsToJSON(nil, lr.rows[i])
 			tsf := TimeFormatter(ts)
-			maxAllowedTsf := TimeFormatter(maxAllowedDay * nsecPerDay)
+			maxAllowedTsf := TimeFormatter(maxAllowedDay * nsecsPerDay)
 			tooBigTimestampLogger.Warnf("skipping log entry with too big timestamp=%s; it must be smaller than %s according "+
-				"to the configured -futureRetention=%dd; see https://docs.victoriametrics.com/VictoriaLogs/#retention ; "+
-				"log entry: %s", &tsf, &maxAllowedTsf, durationToDays(s.futureRetention), &rf)
+				"to the configured -futureRetention=%dd; see https://docs.victoriametrics.com/victorialogs/#retention ; "+
+				"log entry: %s", &tsf, &maxAllowedTsf, durationToDays(s.futureRetention), line)
 			s.rowsDroppedTooBigTimestamp.Add(1)
 			continue
 		}
 		lrPart := m[day]
 		if lrPart == nil {
-			lrPart = GetLogRows(nil, nil)
+			lrPart = GetLogRows(nil, nil, nil, "")
 			m[day] = lrPart
 		}
 		lrPart.mustAddInternal(lr.streamIDs[i], ts, lr.rows[i], lr.streamTagsCanonicals[i])
@@ -472,8 +580,6 @@ func (s *Storage) MustAddRows(lr *LogRows) {
 
 var tooSmallTimestampLogger = logger.WithThrottler("too_small_timestamp", 5*time.Second)
 var tooBigTimestampLogger = logger.WithThrottler("too_big_timestamp", 5*time.Second)
-
-const nsecPerDay = 24 * 3600 * 1e9
 
 // TimeFormatter implements fmt.Stringer for timestamp in nanoseconds
 type TimeFormatter int64
@@ -502,7 +608,7 @@ func (s *Storage) getPartitionForDay(day int64) *partitionWrapper {
 	}
 	if ptw == nil {
 		// Missing partition for the given day. Create it.
-		fname := time.Unix(0, day*nsecPerDay).UTC().Format(partitionNameFormat)
+		fname := time.Unix(0, day*nsecsPerDay).UTC().Format(partitionNameFormat)
 		partitionPath := filepath.Join(s.path, partitionsDirname, fname)
 		mustCreatePartition(partitionPath)
 

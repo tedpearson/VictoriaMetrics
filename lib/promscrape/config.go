@@ -12,10 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
+	"github.com/cespare/xxhash/v2"
+	"gopkg.in/yaml.v2"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs/fscore"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
@@ -34,14 +39,15 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kuma"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/marathon"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/nomad"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/openstack"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/ovhcloud"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/puppetdb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/vultr"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
-	"github.com/VictoriaMetrics/metrics"
-	"github.com/cespare/xxhash/v2"
-	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -75,6 +81,8 @@ var (
 	clusterName = flag.String("promscrape.cluster.name", "", "Optional name of the cluster. If multiple vmagent clusters scrape the same targets, "+
 		"then each cluster must have unique name in order to properly de-duplicate samples received from these clusters. "+
 		"See https://docs.victoriametrics.com/vmagent/#scraping-big-number-of-targets for more info")
+	maxScrapeSize = flagutil.NewBytes("promscrape.maxScrapeSize", 16*1024*1024, "The maximum size of scrape response in bytes to process from Prometheus targets. "+
+		"Bigger responses are rejected. See also max_scrape_size option at https://docs.victoriametrics.com/sd_configs/#scrape_configs")
 )
 
 var clusterMemberID int
@@ -256,9 +264,11 @@ func (cfg *Config) getJobNames() []string {
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/
 type GlobalConfig struct {
-	ScrapeInterval *promutils.Duration `yaml:"scrape_interval,omitempty"`
-	ScrapeTimeout  *promutils.Duration `yaml:"scrape_timeout,omitempty"`
-	ExternalLabels *promutils.Labels   `yaml:"external_labels,omitempty"`
+	ScrapeInterval       *promutils.Duration         `yaml:"scrape_interval,omitempty"`
+	ScrapeTimeout        *promutils.Duration         `yaml:"scrape_timeout,omitempty"`
+	ExternalLabels       *promutils.Labels           `yaml:"external_labels,omitempty"`
+	RelabelConfigs       []promrelabel.RelabelConfig `yaml:"relabel_configs,omitempty"`
+	MetricRelabelConfigs []promrelabel.RelabelConfig `yaml:"metric_relabel_configs,omitempty"`
 }
 
 // ScrapeConfig represents essential parts for `scrape_config` section of Prometheus config.
@@ -268,6 +278,7 @@ type ScrapeConfig struct {
 	JobName        string              `yaml:"job_name"`
 	ScrapeInterval *promutils.Duration `yaml:"scrape_interval,omitempty"`
 	ScrapeTimeout  *promutils.Duration `yaml:"scrape_timeout,omitempty"`
+	MaxScrapeSize  string              `yaml:"max_scrape_size,omitempty"`
 	MetricsPath    string              `yaml:"metrics_path,omitempty"`
 	HonorLabels    bool                `yaml:"honor_labels,omitempty"`
 
@@ -305,9 +316,13 @@ type ScrapeConfig struct {
 	HTTPSDConfigs         []http.SDConfig         `yaml:"http_sd_configs,omitempty"`
 	KubernetesSDConfigs   []kubernetes.SDConfig   `yaml:"kubernetes_sd_configs,omitempty"`
 	KumaSDConfigs         []kuma.SDConfig         `yaml:"kuma_sd_configs,omitempty"`
+	MarathonSDConfigs     []marathon.SDConfig     `yaml:"marathon_sd_configs,omitempty"`
 	NomadSDConfigs        []nomad.SDConfig        `yaml:"nomad_sd_configs,omitempty"`
 	OpenStackSDConfigs    []openstack.SDConfig    `yaml:"openstack_sd_configs,omitempty"`
+	OVHCloudSDConfigs     []ovhcloud.SDConfig     `yaml:"ovhcloud_sd_configs,omitempty"`
+	PuppetDBSDConfigs     []puppetdb.SDConfig     `yaml:"puppetdb_sd_configs,omitempty"`
 	StaticConfigs         []StaticConfig          `yaml:"static_configs,omitempty"`
+	VultrSDConfigs        []vultr.SDConfig        `yaml:"vultr_configs,omitempty"`
 	YandexCloudSDConfigs  []yandexcloud.SDConfig  `yaml:"yandexcloud_sd_configs,omitempty"`
 
 	// These options are supported only by lib/promscrape.
@@ -325,7 +340,7 @@ type ScrapeConfig struct {
 }
 
 func (sc *ScrapeConfig) mustStart(baseDir string) {
-	swosFunc := func(metaLabels *promutils.Labels) interface{} {
+	swosFunc := func(metaLabels *promutils.Labels) any {
 		target := metaLabels.Get("__address__")
 		sw, err := sc.swc.getScrapeWork(target, nil, metaLabels)
 		if err != nil {
@@ -387,6 +402,18 @@ func (sc *ScrapeConfig) mustStop() {
 	}
 	for i := range sc.OpenStackSDConfigs {
 		sc.OpenStackSDConfigs[i].MustStop()
+	}
+	for i := range sc.OVHCloudSDConfigs {
+		sc.OVHCloudSDConfigs[i].MustStop()
+	}
+	for i := range sc.PuppetDBSDConfigs {
+		sc.PuppetDBSDConfigs[i].MustStop()
+	}
+	for i := range sc.VultrSDConfigs {
+		sc.VultrSDConfigs[i].MustStop()
+	}
+	for i := range sc.YandexCloudSDConfigs {
+		sc.YandexCloudSDConfigs[i].MustStop()
 	}
 }
 
@@ -725,6 +752,16 @@ func (cfg *Config) getKumaSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	return cfg.getScrapeWorkGeneric(visitConfigs, "kuma_sd_config", prev)
 }
 
+// getMarathonSDScrapeWork returns `marathon_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getMarathonSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	visitConfigs := func(sc *ScrapeConfig, visitor func(sdc targetLabelsGetter)) {
+		for i := range sc.MarathonSDConfigs {
+			visitor(&sc.MarathonSDConfigs[i])
+		}
+	}
+	return cfg.getScrapeWorkGeneric(visitConfigs, "marathon_sd_config", prev)
+}
+
 // getNomadSDScrapeWork returns `nomad_sd_configs` ScrapeWork from cfg.
 func (cfg *Config) getNomadSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	visitConfigs := func(sc *ScrapeConfig, visitor func(sdc targetLabelsGetter)) {
@@ -743,6 +780,36 @@ func (cfg *Config) getOpenStackSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 		}
 	}
 	return cfg.getScrapeWorkGeneric(visitConfigs, "openstack_sd_config", prev)
+}
+
+// getOVHCloudSDScrapeWork returns `ovhcloud_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getOVHCloudSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	visitConfigs := func(sc *ScrapeConfig, visitor func(sdc targetLabelsGetter)) {
+		for i := range sc.OVHCloudSDConfigs {
+			visitor(&sc.OVHCloudSDConfigs[i])
+		}
+	}
+	return cfg.getScrapeWorkGeneric(visitConfigs, "ovhcloud_sd_config", prev)
+}
+
+// getPuppetDBSDScrapeWork returns `puppetdb_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getPuppetDBSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	visitConfigs := func(sc *ScrapeConfig, visitor func(sdc targetLabelsGetter)) {
+		for i := range sc.PuppetDBSDConfigs {
+			visitor(&sc.PuppetDBSDConfigs[i])
+		}
+	}
+	return cfg.getScrapeWorkGeneric(visitConfigs, "puppetdb_sd_config", prev)
+}
+
+// getVultrSDScrapeWork returns `vultr_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getVultrSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	visitConfigs := func(sc *ScrapeConfig, visitor func(sdc targetLabelsGetter)) {
+		for i := range sc.VultrSDConfigs {
+			visitor(&sc.VultrSDConfigs[i])
+		}
+	}
+	return cfg.getScrapeWorkGeneric(visitConfigs, "vultr_sd_config", prev)
 }
 
 // getYandexCloudSDScrapeWork returns `yandexcloud_sd_configs` ScrapeWork from cfg.
@@ -830,6 +897,16 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1281#issuecomment-840538907
 		scrapeTimeout = scrapeInterval
 	}
+	mss := maxScrapeSize.N
+	if sc.MaxScrapeSize != "" {
+		n, err := flagutil.ParseBytes(sc.MaxScrapeSize)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse `max_scrape_size` value %q for `job_name` %q`: %w", sc.MaxScrapeSize, jobName, err)
+		}
+		if n > 0 {
+			mss = n
+		}
+	}
 	honorLabels := sc.HonorLabels
 	honorTimestamps := sc.HonorTimestamps
 	denyRedirects := false
@@ -856,11 +933,23 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse proxy auth config for `job_name` %q: %w", jobName, err)
 	}
-	relabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.RelabelConfigs)
+	rcs := sc.RelabelConfigs
+	if len(globalCfg.RelabelConfigs) > 0 {
+		rcs = make([]promrelabel.RelabelConfig, 0, len(globalCfg.RelabelConfigs)+len(sc.RelabelConfigs))
+		rcs = append(rcs, globalCfg.RelabelConfigs...)
+		rcs = append(rcs, sc.RelabelConfigs...)
+	}
+	relabelConfigs, err := promrelabel.ParseRelabelConfigs(rcs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse `relabel_configs` for `job_name` %q: %w", jobName, err)
 	}
-	metricRelabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.MetricRelabelConfigs)
+	mrcs := sc.MetricRelabelConfigs
+	if len(globalCfg.MetricRelabelConfigs) > 0 {
+		mrcs = make([]promrelabel.RelabelConfig, 0, len(globalCfg.MetricRelabelConfigs)+len(sc.MetricRelabelConfigs))
+		mrcs = append(mrcs, globalCfg.MetricRelabelConfigs...)
+		mrcs = append(mrcs, sc.MetricRelabelConfigs...)
+	}
+	metricRelabelConfigs, err := promrelabel.ParseRelabelConfigs(mrcs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse `metric_relabel_configs` for `job_name` %q: %w", jobName, err)
 	}
@@ -882,6 +971,7 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 		scrapeIntervalString: scrapeInterval.String(),
 		scrapeTimeout:        scrapeTimeout,
 		scrapeTimeoutString:  scrapeTimeout.String(),
+		maxScrapeSize:        mss,
 		jobName:              jobName,
 		metricsPath:          metricsPath,
 		scheme:               scheme,
@@ -912,6 +1002,7 @@ type scrapeWorkConfig struct {
 	scrapeIntervalString string
 	scrapeTimeout        time.Duration
 	scrapeTimeoutString  string
+	maxScrapeSize        int64
 	jobName              string
 	metricsPath          string
 	scheme               string
@@ -1153,6 +1244,16 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		}
 		seriesLimit = n
 	}
+	// Read sample_limit option from __sample_limit__ label.
+	// See https://docs.victoriametrics.com/vmagent/#automatically-generated-metrics
+	sampleLimit := swc.sampleLimit
+	if s := labels.Get("__sample_limit__"); len(s) > 0 {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse __sample_limit__=%q: %w", s, err)
+		}
+		sampleLimit = n
+	}
 	// Read stream_parse option from __stream_parse__ label.
 	// See https://docs.victoriametrics.com/vmagent/#stream-parsing-mode
 	streamParse := swc.streamParse
@@ -1186,6 +1287,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		ScrapeURL:            scrapeURL,
 		ScrapeInterval:       scrapeInterval,
 		ScrapeTimeout:        scrapeTimeout,
+		MaxScrapeSize:        swc.maxScrapeSize,
 		HonorLabels:          swc.honorLabels,
 		HonorTimestamps:      swc.honorTimestamps,
 		DenyRedirects:        swc.denyRedirects,
@@ -1197,7 +1299,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		AuthConfig:           swc.authConfig,
 		RelabelConfigs:       swc.relabelConfigs,
 		MetricRelabelConfigs: swc.metricRelabelConfigs,
-		SampleLimit:          swc.sampleLimit,
+		SampleLimit:          sampleLimit,
 		DisableCompression:   swc.disableCompression,
 		DisableKeepAlive:     swc.disableKeepAlive,
 		StreamParse:          streamParse,

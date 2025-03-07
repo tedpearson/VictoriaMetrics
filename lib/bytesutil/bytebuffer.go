@@ -8,6 +8,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 var (
@@ -33,6 +34,11 @@ func (bb *ByteBuffer) Path() string {
 
 // Reset resets bb.
 func (bb *ByteBuffer) Reset() {
+	if cap(bb.B) > 64*1024 {
+		// It is better dropping too big buffers instead of keeping them around.
+		// This should reduce the overall memory usage, while shouldn't increase time spent in GC too much.
+		bb.B = nil
+	}
 	bb.B = bb.B[:0]
 }
 
@@ -64,8 +70,11 @@ func (bb *ByteBuffer) ReadFrom(r io.Reader) (int64, error) {
 	offset := bLen
 	for {
 		if free := len(b) - offset; free < offset {
-			n := len(b)
-			b = append(b, make([]byte, n)...)
+			// grow slice by 30% similar to how Go does this
+			// https://go.googlesource.com/go/+/2dda92ff6f9f07eeb110ecbf0fc2d7a0ddd27f9d
+			// higher growth rates could consume excessive memory when reading big amounts of data.
+			n := 1.3 * float64(len(b))
+			b = slicesutil.SetLength(b, int(n))
 		}
 		n, err := r.Read(b[offset:])
 		offset += n

@@ -17,27 +17,37 @@ type task struct {
 	ServiceID           string
 	NodeID              string
 	DesiredState        string
-	NetworksAttachments []struct {
-		Addresses []string
-		Network   struct {
-			ID string
-		}
-	}
-	Status struct {
-		State           string
-		ContainerStatus struct {
-			ContainerID string
-		}
-		PortStatus struct {
-			Ports []portConfig
-		}
-	}
-	Spec struct {
-		ContainerSpec struct {
-			Labels map[string]string
-		}
-	}
-	Slot int
+	NetworksAttachments []networkAttachment
+	Status              taskStatus
+	Spec                taskSpec
+	Slot                int
+}
+
+type networkAttachment struct {
+	Addresses []string
+	Network   network
+}
+
+type taskStatus struct {
+	State           string
+	ContainerStatus containerStatus
+	PortStatus      portStatus
+}
+
+type containerStatus struct {
+	ContainerID string
+}
+
+type portStatus struct {
+	Ports []portConfig
+}
+
+type taskSpec struct {
+	ContainerSpec taskContainerSpec
+}
+
+type taskContainerSpec struct {
+	Labels map[string]string
 }
 
 func getTasksLabels(cfg *apiConfig) ([]*promutils.Labels, error) {
@@ -53,7 +63,7 @@ func getTasksLabels(cfg *apiConfig) ([]*promutils.Labels, error) {
 	if err != nil {
 		return nil, err
 	}
-	svcLabels := addServicesLabels(services, networkLabels, cfg.port)
+	svcLabels := addServicesLabelsForTask(services)
 	nodeLabels, err := getNodesLabels(cfg)
 	if err != nil {
 		return nil, err
@@ -79,6 +89,21 @@ func parseTasks(data []byte) ([]task, error) {
 		return nil, fmt.Errorf("cannot parse tasks: %w", err)
 	}
 	return tasks, nil
+}
+
+func addServicesLabelsForTask(services []service) []*promutils.Labels {
+	var ms []*promutils.Labels
+	for _, svc := range services {
+		commonLabels := promutils.NewLabels(3)
+		commonLabels.Add("__meta_dockerswarm_service_id", svc.ID)
+		commonLabels.Add("__meta_dockerswarm_service_name", svc.Spec.Name)
+		commonLabels.Add("__meta_dockerswarm_service_mode", getServiceMode(svc))
+		for k, v := range svc.Spec.Labels {
+			commonLabels.Add(discoveryutils.SanitizeLabelName("__meta_dockerswarm_service_label_"+k), v)
+		}
+		ms = append(ms, commonLabels)
+	}
+	return ms
 }
 
 func addTasksLabels(tasks []task, nodesLabels, servicesLabels []*promutils.Labels, networksLabels map[string]*promutils.Labels, services []service, port int) []*promutils.Labels {

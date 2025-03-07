@@ -7,11 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +69,7 @@ type UserInfo struct {
 	URLPrefix              *URLPrefix  `yaml:"url_prefix,omitempty"`
 	DiscoverBackendIPs     *bool       `yaml:"discover_backend_ips,omitempty"`
 	URLMaps                []URLMap    `yaml:"url_map,omitempty"`
+	DumpRequestOnErrors    bool        `yaml:"dump_request_on_errors,omitempty"`
 	HeadersConf            HeadersConf `yaml:",inline"`
 	MaxConcurrentRequests  int         `yaml:"max_concurrent_requests,omitempty"`
 	DefaultURL             *URLPrefix  `yaml:"default_url,omitempty"`
@@ -93,8 +96,9 @@ type UserInfo struct {
 
 // HeadersConf represents config for request and response headers.
 type HeadersConf struct {
-	RequestHeaders  []*Header `yaml:"headers,omitempty"`
-	ResponseHeaders []*Header `yaml:"response_headers,omitempty"`
+	RequestHeaders   []*Header `yaml:"headers,omitempty"`
+	ResponseHeaders  []*Header `yaml:"response_headers,omitempty"`
+	KeepOriginalHost *bool     `yaml:"keep_original_host,omitempty"`
 }
 
 func (ui *UserInfo) beginConcurrencyLimit() error {
@@ -128,7 +132,7 @@ type Header struct {
 }
 
 // UnmarshalYAML unmarshals h from f.
-func (h *Header) UnmarshalYAML(f func(interface{}) error) error {
+func (h *Header) UnmarshalYAML(f func(any) error) error {
 	var s string
 	if err := f(&s); err != nil {
 		return err
@@ -145,7 +149,7 @@ func (h *Header) UnmarshalYAML(f func(interface{}) error) error {
 }
 
 // MarshalYAML marshals h to yaml.
-func (h *Header) MarshalYAML() (interface{}, error) {
+func (h *Header) MarshalYAML() (any, error) {
 	return h.sOriginal, nil
 }
 
@@ -191,7 +195,7 @@ type QueryArg struct {
 }
 
 // UnmarshalYAML unmarshals qa from yaml.
-func (qa *QueryArg) UnmarshalYAML(f func(interface{}) error) error {
+func (qa *QueryArg) UnmarshalYAML(f func(any) error) error {
 	var s string
 	if err := f(&s); err != nil {
 		return err
@@ -220,7 +224,7 @@ func (qa *QueryArg) UnmarshalYAML(f func(interface{}) error) error {
 }
 
 // MarshalYAML marshals qa to yaml.
-func (qa *QueryArg) MarshalYAML() (interface{}, error) {
+func (qa *QueryArg) MarshalYAML() (any, error) {
 	return qa.sOriginal, nil
 }
 
@@ -253,7 +257,7 @@ type URLPrefix struct {
 	nextDiscoveryDeadline atomic.Uint64
 
 	// vOriginal contains the original yaml value for URLPrefix.
-	vOriginal interface{}
+	vOriginal any
 }
 
 func (up *URLPrefix) setLoadBalancingPolicy(loadBalancingPolicy string) error {
@@ -300,12 +304,18 @@ func (up *URLPrefix) getBackendsCount() int {
 
 // getBackendURL returns the backendURL depending on the load balance policy.
 //
+// It can return nil if there are no backend urls available at the moment.
+//
 // backendURL.put() must be called on the returned backendURL after the request is complete.
 func (up *URLPrefix) getBackendURL() *backendURL {
 	up.discoverBackendAddrsIfNeeded()
 
 	pbus := up.bus.Load()
 	bus := *pbus
+	if len(bus) == 0 {
+		return nil
+	}
+
 	if up.loadBalancingPolicy == "first_available" {
 		return getFirstAvailableBackendURL(bus)
 	}
@@ -340,22 +350,28 @@ func (up *URLPrefix) discoverBackendAddrsIfNeeded() {
 	hostToAddrs := make(map[string][]string)
 	for _, bu := range up.busOriginal {
 		host := bu.Hostname()
+		port := bu.Port()
 		if hostToAddrs[host] != nil {
 			// ips for the given host have been already discovered
 			continue
 		}
+
 		var resolvedAddrs []string
 		if strings.HasPrefix(host, "srv+") {
 			// The host has the format 'srv+realhost'. Strip 'srv+' prefix before performing the lookup.
-			host = strings.TrimPrefix(host, "srv+")
-			_, addrs, err := netutil.Resolver.LookupSRV(ctx, "", "", host)
+			srvHost := strings.TrimPrefix(host, "srv+")
+			_, addrs, err := netutil.Resolver.LookupSRV(ctx, "", "", srvHost)
 			if err != nil {
 				logger.Warnf("cannot discover backend SRV records for %s: %s; use it literally", bu, err)
 				resolvedAddrs = []string{host}
 			} else {
-				resolvedAddrs := make([]string, len(addrs))
+				resolvedAddrs = make([]string, len(addrs))
 				for i, addr := range addrs {
-					resolvedAddrs[i] = fmt.Sprintf("%s:%d", addr.Target, addr.Port)
+					hostPort := port
+					if hostPort == "" && addr.Port > 0 {
+						hostPort = strconv.FormatUint(uint64(addr.Port), 10)
+					}
+					resolvedAddrs[i] = net.JoinHostPort(addr.Target, hostPort)
 				}
 			}
 		} else {
@@ -366,7 +382,7 @@ func (up *URLPrefix) discoverBackendAddrsIfNeeded() {
 			} else {
 				resolvedAddrs = make([]string, len(addrs))
 				for i, addr := range addrs {
-					resolvedAddrs[i] = addr.String()
+					resolvedAddrs[i] = net.JoinHostPort(addr.String(), port)
 				}
 			}
 		}
@@ -380,17 +396,9 @@ func (up *URLPrefix) discoverBackendAddrsIfNeeded() {
 	var busNew []*backendURL
 	for _, bu := range up.busOriginal {
 		host := bu.Hostname()
-		port := bu.Port()
 		for _, addr := range hostToAddrs[host] {
 			buCopy := *bu
 			buCopy.Host = addr
-			if port != "" {
-				if n := strings.IndexByte(buCopy.Host, ':'); n >= 0 {
-					// Drop the discovered port and substitute it the the port specified in bu.
-					buCopy.Host = buCopy.Host[:n]
-				}
-				buCopy.Host += ":" + port
-			}
 			busNew = append(busNew, &backendURL{
 				url: &buCopy,
 			})
@@ -453,8 +461,7 @@ func getLeastLoadedBackendURL(bus []*backendURL, atomicCounter *atomic.Uint32) *
 	}
 
 	// Slow path - select other backend urls.
-	n := atomicCounter.Add(1)
-
+	n := atomicCounter.Add(1) - 1
 	for i := uint32(0); i < uint32(len(bus)); i++ {
 		idx := (n + i) % uint32(len(bus))
 		bu := bus[idx]
@@ -476,7 +483,7 @@ func getLeastLoadedBackendURL(bus []*backendURL, atomicCounter *atomic.Uint32) *
 		if bu.isBroken() {
 			continue
 		}
-		if n := bu.concurrentRequests.Load(); n < minRequests {
+		if n := bu.concurrentRequests.Load(); n < minRequests || buMin.isBroken() {
 			buMin = bu
 			minRequests = n
 		}
@@ -486,8 +493,8 @@ func getLeastLoadedBackendURL(bus []*backendURL, atomicCounter *atomic.Uint32) *
 }
 
 // UnmarshalYAML unmarshals up from yaml.
-func (up *URLPrefix) UnmarshalYAML(f func(interface{}) error) error {
-	var v interface{}
+func (up *URLPrefix) UnmarshalYAML(f func(any) error) error {
+	var v any
 	if err := f(&v); err != nil {
 		return err
 	}
@@ -497,7 +504,7 @@ func (up *URLPrefix) UnmarshalYAML(f func(interface{}) error) error {
 	switch x := v.(type) {
 	case string:
 		urls = []string{x}
-	case []interface{}:
+	case []any:
 		if len(x) == 0 {
 			return fmt.Errorf("`url_prefix` must contain at least a single url")
 		}
@@ -527,7 +534,7 @@ func (up *URLPrefix) UnmarshalYAML(f func(interface{}) error) error {
 }
 
 // MarshalYAML marshals up to yaml.
-func (up *URLPrefix) MarshalYAML() (interface{}, error) {
+func (up *URLPrefix) MarshalYAML() (any, error) {
 	return up.vOriginal, nil
 }
 
@@ -551,7 +558,7 @@ func (r *Regex) match(s string) bool {
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler
-func (r *Regex) UnmarshalYAML(f func(interface{}) error) error {
+func (r *Regex) UnmarshalYAML(f func(any) error) error {
 	var s string
 	if err := f(&s); err != nil {
 		return err
@@ -568,7 +575,7 @@ func (r *Regex) UnmarshalYAML(f func(interface{}) error) error {
 }
 
 // MarshalYAML implements yaml.Marshaler.
-func (r *Regex) MarshalYAML() (interface{}, error) {
+func (r *Regex) MarshalYAML() (any, error) {
 	return r.sOriginal, nil
 }
 
@@ -589,7 +596,7 @@ func initAuthConfig() {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240
 	sighupCh := procutil.NewSighupChan()
 
-	_, err := loadAuthConfig()
+	_, err := reloadAuthConfig()
 	if err != nil {
 		logger.Fatalf("cannot load auth config: %s", err)
 	}
@@ -621,7 +628,7 @@ func authConfigReloader(sighupCh <-chan os.Signal) {
 
 	updateFn := func() {
 		configReloads.Inc()
-		updated, err := loadAuthConfig()
+		updated, err := reloadAuthConfig()
 		if err != nil {
 			logger.Errorf("failed to load auth config; using the last successfully loaded config; error: %s", err)
 			configSuccess.Set(0)
@@ -647,27 +654,45 @@ func authConfigReloader(sighupCh <-chan os.Signal) {
 	}
 }
 
-// authConfigData stores the yaml definition for this config.
-// authConfigData needs to be updated each time authConfig is updated.
-var authConfigData atomic.Pointer[[]byte]
-
 var (
-	authConfig   atomic.Pointer[AuthConfig]
-	authUsers    atomic.Pointer[map[string]*UserInfo]
+	// authConfigData stores the yaml definition for this config.
+	// authConfigData needs to be updated each time authConfig is updated.
+	authConfigData atomic.Pointer[[]byte]
+
+	// authConfig contains the currently loaded auth config
+	authConfig atomic.Pointer[AuthConfig]
+
+	// authUsers contains the currently loaded auth users
+	authUsers atomic.Pointer[map[string]*UserInfo]
+
 	authConfigWG sync.WaitGroup
 	stopCh       chan struct{}
 )
 
-// loadAuthConfig loads and applies the config from *authConfigPath.
+// reloadAuthConfig loads and applies the config from *authConfigPath.
 // It returns bool value to identify if new config was applied.
 // The config can be not applied if there is a parsing error
 // or if there are no changes to the current authConfig.
-func loadAuthConfig() (bool, error) {
+func reloadAuthConfig() (bool, error) {
 	data, err := fscore.ReadFileOrHTTP(*authConfigPath)
 	if err != nil {
 		return false, fmt.Errorf("failed to read -auth.config=%q: %w", *authConfigPath, err)
 	}
 
+	ok, err := reloadAuthConfigData(data)
+	if err != nil {
+		return false, fmt.Errorf("failed to pars -auth.config=%q: %w", *authConfigPath, err)
+	}
+	if !ok {
+		return false, nil
+	}
+
+	mp := authUsers.Load()
+	logger.Infof("loaded information about %d users from -auth.config=%q", len(*mp), *authConfigPath)
+	return true, nil
+}
+
+func reloadAuthConfigData(data []byte) (bool, error) {
 	oldData := authConfigData.Load()
 	if oldData != nil && bytes.Equal(data, *oldData) {
 		// there are no updates in the config - skip reloading.
@@ -676,20 +701,20 @@ func loadAuthConfig() (bool, error) {
 
 	ac, err := parseAuthConfig(data)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse -auth.config=%q: %w", *authConfigPath, err)
+		return false, fmt.Errorf("failed to parse auth config: %w", err)
 	}
 
 	m, err := parseAuthConfigUsers(ac)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse users from -auth.config=%q: %w", *authConfigPath, err)
+		return false, fmt.Errorf("failed to parse users from auth config: %w", err)
 	}
-	logger.Infof("loaded information about %d users from -auth.config=%q", len(m), *authConfigPath)
 
-	prevAc := authConfig.Load()
-	if prevAc != nil {
-		metrics.UnregisterSet(prevAc.ms)
+	acPrev := authConfig.Load()
+	if acPrev != nil {
+		metrics.UnregisterSet(acPrev.ms, true)
 	}
 	metrics.RegisterSet(ac.ms)
+
 	authConfig.Store(ac)
 	authConfigData.Store(&data)
 	authUsers.Store(&m)
@@ -757,10 +782,11 @@ func parseAuthConfig(data []byte) (*AuthConfig, error) {
 
 func parseAuthConfigUsers(ac *AuthConfig) (map[string]*UserInfo, error) {
 	uis := ac.Users
-	if len(uis) == 0 && ac.UnauthorizedUser == nil {
-		return nil, fmt.Errorf("Missing `users` or `unauthorized_user` sections")
-	}
 	byAuthToken := make(map[string]*UserInfo, len(uis))
+	if len(uis) == 0 && ac.UnauthorizedUser == nil {
+		// fast path for empty configuration
+		return byAuthToken, nil
+	}
 	for i := range uis {
 		ui := &uis[i]
 		ats, err := getAuthTokens(ui.AuthToken, ui.BearerToken, ui.Username, ui.Password)
@@ -835,21 +861,22 @@ func (ui *UserInfo) initURLs() error {
 	loadBalancingPolicy := *defaultLoadBalancingPolicy
 	dropSrcPathPrefixParts := 0
 	discoverBackendIPs := *discoverBackendIPsGlobal
+	if ui.RetryStatusCodes != nil {
+		retryStatusCodes = ui.RetryStatusCodes
+	}
+	if ui.LoadBalancingPolicy != "" {
+		loadBalancingPolicy = ui.LoadBalancingPolicy
+	}
+	if ui.DropSrcPathPrefixParts != nil {
+		dropSrcPathPrefixParts = *ui.DropSrcPathPrefixParts
+	}
+	if ui.DiscoverBackendIPs != nil {
+		discoverBackendIPs = *ui.DiscoverBackendIPs
+	}
+
 	if ui.URLPrefix != nil {
 		if err := ui.URLPrefix.sanitizeAndInitialize(); err != nil {
 			return err
-		}
-		if ui.RetryStatusCodes != nil {
-			retryStatusCodes = ui.RetryStatusCodes
-		}
-		if ui.LoadBalancingPolicy != "" {
-			loadBalancingPolicy = ui.LoadBalancingPolicy
-		}
-		if ui.DropSrcPathPrefixParts != nil {
-			dropSrcPathPrefixParts = *ui.DropSrcPathPrefixParts
-		}
-		if ui.DiscoverBackendIPs != nil {
-			discoverBackendIPs = *ui.DiscoverBackendIPs
 		}
 		ui.URLPrefix.retryStatusCodes = retryStatusCodes
 		ui.URLPrefix.dropSrcPathPrefixParts = dropSrcPathPrefixParts
@@ -983,6 +1010,14 @@ func getAuthTokensFromRequest(r *http.Request) []string {
 		}
 	}
 
+	// Authorization via http://user:pass@hosname/path
+	if u := r.URL.User; u != nil && u.Username() != "" {
+		username := u.Username()
+		password, _ := u.Password()
+		at := getHTTPAuthBasicToken(username, password)
+		ats = append(ats, at)
+	}
+
 	return ats
 }
 
@@ -1008,10 +1043,6 @@ func (up *URLPrefix) sanitizeAndInitialize() error {
 }
 
 func sanitizeURLPrefix(urlPrefix *url.URL) (*url.URL, error) {
-	// Remove trailing '/' from urlPrefix
-	for strings.HasSuffix(urlPrefix.Path, "/") {
-		urlPrefix.Path = urlPrefix.Path[:len(urlPrefix.Path)-1]
-	}
 	// Validate urlPrefix
 	if urlPrefix.Scheme != "http" && urlPrefix.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported scheme for `url_prefix: %q`: %q; must be `http` or `https`", urlPrefix, urlPrefix.Scheme)

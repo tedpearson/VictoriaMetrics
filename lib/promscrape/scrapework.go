@@ -53,6 +53,9 @@ type ScrapeWork struct {
 	// Timeout for scraping the ScrapeURL.
 	ScrapeTimeout time.Duration
 
+	// MaxScrapeSize sets max amount of data, that can be scraped by a job
+	MaxScrapeSize int64
+
 	// How to deal with conflicting labels.
 	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
 	HonorLabels bool
@@ -69,8 +72,6 @@ type ScrapeWork struct {
 	// - http2 is used very rarely comparing to http for Prometheus metrics exposition and service discovery
 	// - http2 is much harder to debug than http
 	// - http2 has very bad security record because of its complexity - see https://portswigger.net/research/http2
-	//
-	// VictoriaMetrics components are compiled with nethttpomithttp2 tag because of these issues.
 	//
 	// EnableHTTP2 bool
 
@@ -162,13 +163,13 @@ func (sw *ScrapeWork) key() string {
 	// Do not take into account OriginalLabels, since they can be changed with relabeling.
 	// Do not take into account RelabelConfigs, since it is already applied to Labels.
 	// Take into account JobNameOriginal in order to capture the case when the original job_name is changed via relabeling.
-	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
-		"ExternalLabels=%s, "+
+	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, "+
+		"HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, ExternalLabels=%s, MaxScrapeSize=%d, "+
 		"ProxyURL=%s, ProxyAuthConfig=%s, AuthConfig=%s, MetricRelabelConfigs=%q, "+
 		"SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v, StreamParse=%v, "+
 		"ScrapeAlignInterval=%s, ScrapeOffset=%s, SeriesLimit=%d, NoStaleMarkers=%v",
-		sw.jobNameOriginal, sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.Labels.String(),
-		sw.ExternalLabels.String(),
+		sw.jobNameOriginal, sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels,
+		sw.HonorTimestamps, sw.DenyRedirects, sw.Labels.String(), sw.ExternalLabels.String(), sw.MaxScrapeSize,
 		sw.ProxyURL.String(), sw.ProxyAuthConfig.String(), sw.AuthConfig.String(), sw.MetricRelabelConfigs.String(),
 		sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive, sw.StreamParse,
 		sw.ScrapeAlignInterval, sw.ScrapeOffset, sw.SeriesLimit, sw.NoStaleMarkers)
@@ -497,9 +498,11 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 	if sw.seriesLimitExceeded || !areIdenticalSeries {
 		samplesDropped = sw.applySeriesLimit(wc)
 	}
+	responseSize := len(bodyString)
 	am := &autoMetrics{
 		up:                        up,
 		scrapeDurationSeconds:     scrapeDurationSeconds,
+		scrapeResponseSize:        responseSize,
 		samplesScraped:            samplesScraped,
 		samplesPostRelabeling:     samplesPostRelabeling,
 		seriesAdded:               seriesAdded,
@@ -508,7 +511,7 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 	sw.addAutoMetrics(am, wc, scrapeTimestamp)
 	sw.pushData(sw.Config.AuthToken, &wc.writeRequest)
 	sw.prevLabelsLen = len(wc.labels)
-	sw.prevBodyLen = len(bodyString)
+	sw.prevBodyLen = responseSize
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
 	// body must be released only after wc is released, since wc refers to body.
@@ -519,7 +522,7 @@ func (sw *scrapeWork) processDataOneShot(scrapeTimestamp, realTimestamp int64, b
 		sw.storeLastScrape(body)
 	}
 	sw.finalizeLastScrape()
-	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), samplesScraped, err)
+	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), responseSize, samplesScraped, err)
 	return err
 }
 
@@ -577,9 +580,11 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 		// This is a trade-off between performance and accuracy.
 		seriesAdded = sw.getSeriesAdded(lastScrape, bodyString)
 	}
+	responseSize := len(bodyString)
 	am := &autoMetrics{
 		up:                        up,
 		scrapeDurationSeconds:     scrapeDurationSeconds,
+		scrapeResponseSize:        responseSize,
 		samplesScraped:            samplesScraped,
 		samplesPostRelabeling:     samplesPostRelabeling,
 		seriesAdded:               seriesAdded,
@@ -588,7 +593,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 	sw.addAutoMetrics(am, wc, scrapeTimestamp)
 	sw.pushData(sw.Config.AuthToken, &wc.writeRequest)
 	sw.prevLabelsLen = len(wc.labels)
-	sw.prevBodyLen = len(bodyString)
+	sw.prevBodyLen = responseSize
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
 	if !areIdenticalSeries {
@@ -598,7 +603,7 @@ func (sw *scrapeWork) processDataInStreamMode(scrapeTimestamp, realTimestamp int
 		sw.storeLastScrape(body.B)
 	}
 	sw.finalizeLastScrape()
-	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), samplesScraped, err)
+	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(scrapeDurationSeconds*1000), responseSize, samplesScraped, err)
 	// Do not track active series in streaming mode, since this may need too big amounts of memory
 	// when the target exports too big number of metrics.
 	return err
@@ -810,6 +815,7 @@ func (sw *scrapeWork) getLabelsHash(labels []prompbmarshal.Label) uint64 {
 type autoMetrics struct {
 	up                        int
 	scrapeDurationSeconds     float64
+	scrapeResponseSize        int
 	samplesScraped            int
 	samplesPostRelabeling     int
 	seriesAdded               int
@@ -817,34 +823,47 @@ type autoMetrics struct {
 }
 
 func isAutoMetric(s string) bool {
-	switch s {
-	case "up", "scrape_duration_seconds", "scrape_samples_scraped",
-		"scrape_samples_post_metric_relabeling", "scrape_series_added",
-		"scrape_timeout_seconds", "scrape_samples_limit",
-		"scrape_series_limit_samples_dropped", "scrape_series_limit",
-		"scrape_series_current":
+	if s == "up" {
 		return true
 	}
-	return false
+	if !strings.HasPrefix(s, "scrape_") {
+		return false
+	}
+	switch s {
+	case "scrape_duration_seconds",
+		"scrape_response_size_bytes",
+		"scrape_samples_limit",
+		"scrape_samples_post_metric_relabeling",
+		"scrape_samples_scraped",
+		"scrape_series_added",
+		"scrape_series_current",
+		"scrape_series_limit",
+		"scrape_series_limit_samples_dropped",
+		"scrape_timeout_seconds":
+		return true
+	default:
+		return false
+	}
 }
 
 func (sw *scrapeWork) addAutoMetrics(am *autoMetrics, wc *writeRequestCtx, timestamp int64) {
-	sw.addAutoTimeseries(wc, "up", float64(am.up), timestamp)
 	sw.addAutoTimeseries(wc, "scrape_duration_seconds", am.scrapeDurationSeconds, timestamp)
-	sw.addAutoTimeseries(wc, "scrape_samples_scraped", float64(am.samplesScraped), timestamp)
-	sw.addAutoTimeseries(wc, "scrape_samples_post_metric_relabeling", float64(am.samplesPostRelabeling), timestamp)
-	sw.addAutoTimeseries(wc, "scrape_series_added", float64(am.seriesAdded), timestamp)
-	sw.addAutoTimeseries(wc, "scrape_timeout_seconds", sw.Config.ScrapeTimeout.Seconds(), timestamp)
+	sw.addAutoTimeseries(wc, "scrape_response_size_bytes", float64(am.scrapeResponseSize), timestamp)
 	if sampleLimit := sw.Config.SampleLimit; sampleLimit > 0 {
 		// Expose scrape_samples_limit metric if sample_limit config is set for the target.
 		// See https://github.com/VictoriaMetrics/operator/issues/497
 		sw.addAutoTimeseries(wc, "scrape_samples_limit", float64(sampleLimit), timestamp)
 	}
+	sw.addAutoTimeseries(wc, "scrape_samples_post_metric_relabeling", float64(am.samplesPostRelabeling), timestamp)
+	sw.addAutoTimeseries(wc, "scrape_samples_scraped", float64(am.samplesScraped), timestamp)
+	sw.addAutoTimeseries(wc, "scrape_series_added", float64(am.seriesAdded), timestamp)
 	if sl := sw.seriesLimiter; sl != nil {
+		sw.addAutoTimeseries(wc, "scrape_series_current", float64(sl.CurrentItems()), timestamp)
 		sw.addAutoTimeseries(wc, "scrape_series_limit_samples_dropped", float64(am.seriesLimitSamplesDropped), timestamp)
 		sw.addAutoTimeseries(wc, "scrape_series_limit", float64(sl.MaxItems()), timestamp)
-		sw.addAutoTimeseries(wc, "scrape_series_current", float64(sl.CurrentItems()), timestamp)
 	}
+	sw.addAutoTimeseries(wc, "scrape_timeout_seconds", sw.Config.ScrapeTimeout.Seconds(), timestamp)
+	sw.addAutoTimeseries(wc, "up", float64(am.up), timestamp)
 }
 
 // addAutoTimeseries adds automatically generated time series with the given name, value and timestamp.

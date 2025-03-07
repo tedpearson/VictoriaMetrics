@@ -1,16 +1,13 @@
 ---
-sort: 21
-weight: 21
+weight: 25
 title: Case studies and talks
 menu:
   docs:
-    parent: 'victoriametrics'
-    weight: 21
+    parent: "victoriametrics"
+    weight: 25
 aliases:
-- /CaseStudies.html
+  - /CaseStudies.html
 ---
-
-# Case studies and talks
 
 Below please find public case studies and talks from VictoriaMetrics users. You can also join our [community Slack channel](https://slack.victoriametrics.com/)
 where you can chat with VictoriaMetrics users to get additional references, reviews and case studies.
@@ -45,6 +42,7 @@ where you can chat with VictoriaMetrics users to get additional references, revi
   - [Xiaohongshu](#xiaohongshu)
   - [Zerodha](#zerodha)
   - [zhihu](#zhihu)
+  - [Zomato](#zomato)
 
 You can also read [articles about VictoriaMetrics from our users](https://docs.victoriametrics.com/articles/#third-party-articles-and-slides-about-victoriametrics).
 
@@ -90,12 +88,12 @@ We ended up with the following configuration:
 We learned that remote write protocol generated too much traffic and connections so after 8 months we started looking for alternatives.
 
 Around the same time, VictoriaMetrics released [vmagent](https://docs.victoriametrics.com/vmagent/).
-We tried to scrape all the metrics via a single instance of vmagent but it that didn't work because vmagent wasn't able to catch up with writes
+We tried to scrape all the metrics via a single instance of vmagent but that didn't work because vmagent wasn't able to catch up with writes
 into VictoriaMetrics. We tested different options and end up with the following scheme:
 
 - We removed Prometheus from our setup.
 - VictoriaMetrics [can scrape targets](https://docs.victoriametrics.com/single-server-victoriametrics/#how-to-scrape-prometheus-exporters-such-as-node-exporter) as well
-so we removed vmagent. Now, VictoriaMetrics scrapes all the metrics from 110 jobs and 5531 targets.
+  so we removed vmagent. Now, VictoriaMetrics scrapes all the metrics from 110 jobs and 5531 targets.
 - We use [Promxy](https://github.com/jacksontj/promxy) for alerting.
 
 Such a scheme has generated the following benefits compared with Prometheus:
@@ -167,7 +165,7 @@ Numbers:
 We are running 1 Prometheus, 1 VictoriaMetrics and 1 Grafana server in each datacenter on baremetal servers, scraping 350+ targets
 (and 3k+ devices collected via SNMPCollector sending metrics directly to VM). Each Prometheus is scraping all targets
 so we have all metrics in both VictoriaMetrics instances. We are using [Promxy](https://github.com/jacksontj/promxy) to deduplicate metrics from both instances.
-Grafana has an LB infront so if one DC has problems we can still view all metrics from both DCs on the other Grafana instance.
+Grafana has an LB in front so if one DC has problems we can still view all metrics from both DCs on the other Grafana instance.
 
 We are still in the process of migration, but we are really happy with the whole stack. It has proven to be an essential tool
 for gathering insights into our services during COVID-19 and has enabled us to provide better service and identify problems faster.
@@ -198,8 +196,8 @@ Once we found VictoriaMetrics it solved the following problems:
 - very short startup time and any possible gaps in data can easily be filled in using Promxy
 - we could continue using Telegraf as our metrics agent and ship identical metrics to both InfluxDB and VictoriaMetrics during the migration period (migration just about to start)
 - compression im VM is really good. We can store more metrics and we can easily spin up new VictoriaMetrics instances
-for new data and keep read-only nodes with older data if we need to extend our retention period further
-than single virtual machine disks allow and we can aggregate all the data from VictoriaMetrics with Promxy
+  for new data and keep read-only nodes with older data if we need to extend our retention period further
+  than single virtual machine disks allow and we can aggregate all the data from VictoriaMetrics with Promxy
 
 High availability is done the same way we did with InfluxDB by running parallel single nodes of VictoriaMetrics.
 
@@ -229,14 +227,14 @@ VictoriaMetrics is used for the following purposes as a part of the "CMS Monitor
 - As a long-term storage for Prometheus monitoring system (30 days retention policy. There are plans to increase it up to ½ year)
 - As a data source for visualizing metrics in Grafana.
 
-R&D topic: Evaluate VictoraMetrics vs InfluxDB for large cardinality data.
+R&D topic: Evaluate VictoriaMetrics vs InfluxDB for large cardinality data.
 
 Please also see [The CMS monitoring infrastructure and applications](https://arxiv.org/pdf/2007.03630.pdf) publication from CERN with details about their VictoriaMetrics usage.
 
 ## COLOPL
 
 [COLOPL](http://www.colopl.co.jp/en/) is Japanese game development company. It started using VictoriaMetrics
-after evaulating the following remote storage solutions for Prometheus:
+after evaluating the following remote storage solutions for Prometheus:
 
 - Cortex
 - Thanos
@@ -263,38 +261,38 @@ We started with a Prometheus server on EKS. That worked until it didn't. We then
 
 ### What VictoriaMetrics means for us
 
-* Easy to use and maintain
-* Cost effective
-* The ability to handle billions of time series events at any point of time
-* Multiple K8s clusters to monitor
-* Consistent monitoring infra for each cluster across multiple Regions and clouds
-* Secure communication and data storage
-* Easy Retention
+- Easy to use and maintain
+- Cost effective
+- The ability to handle billions of time series events at any point of time
+- Multiple K8s clusters to monitor
+- Consistent monitoring infra for each cluster across multiple Regions and clouds
+- Secure communication and data storage
+- Easy Retention
 
 ### Some of our initial challenges prior to moving to VictoriaMetrics
 
-* Reducing cost by not using a managed solution of one of the clouds
-* Support HA and recover fast
-* No downtimes
-* Having our main prometheus using too much Ram and restarts.
+- Reducing cost by not using a managed solution of one of the clouds
+- Support HA and recover fast
+- No downtimes
+- Having our main prometheus using too much Ram and restarts.
 
 ### Some of the reasons we chose VictoriaMetrics
 
-* The API is compatible with Prometheus and all standard PromQL queries work well out of the box
-* Handles storage well
-* Available to use in Grafana easily
-* Single and small executable
-* Easy and fast backups
-* Better benchmarks than all the competitors
-* Open Source and maintained with good community
+- The API is compatible with Prometheus and all standard PromQL queries work well out of the box
+- Handles storage well
+- Available to use in Grafana easily
+- Single and small executable
+- Easy and fast backups
+- Better benchmarks than all the competitors
+- Open Source and maintained with good community
 
 ### Some of the benefits we experienced since working with VictoriaMetrics
 
-* We saved around &#x24;5K USD per month
-* It’s seamless and doesn’t cause any override complications on the Infrastructure team
-* It doesn’t use lots of storage
-* It can serve us in the future in even bigger scales
-* It has support with a great community.
+- We saved around &#x24;5K USD per month
+- It’s seamless and doesn’t cause any override complications on the Infrastructure team
+- It doesn’t use lots of storage
+- It can serve us in the future in even bigger scales
+- It has support with a great community.
 
 ## Fly.io
 
@@ -347,7 +345,7 @@ Numbers:
 
 [Grammarly](https://www.grammarly.com/) provides digital writing assistant that helps 30 million people and 30 thousand teams write more clearly and effectively every day. In building a product that scales across multiple platforms and devices, Grammarly works to empower users whenever and wherever they communicate.
 
-See [this blogpost on how Grammarly reduces costs and maintenance burden for their observability solution by 10x after switching to VistoriaMetrics](https://www.grammarly.com/blog/engineering/monitoring-with-victoriametrics/).
+See [this blogpost on how Grammarly reduces costs and maintenance burden for their observability solution by 10x after switching to VictoriaMetrics](https://www.grammarly.com/blog/engineering/monitoring-with-victoriametrics/).
 
 ## Groove X
 
@@ -405,7 +403,7 @@ Numbers with current, limited roll out:
 
 ## Naver
 
-[Naver](https://www.navercorp.com/en/) is a global tech platform that enables wide access to advanced technologies for SMEs, creators and partners,
+[Naver](https://www.navercorp.com/) is a global tech platform that enables wide access to advanced technologies for SMEs, creators and partners,
 fueling their greater growth around the world.
 
 See [this video](https://www.youtube.com/watch?v=OUyXPgVcdw4) and [these slides](https://deview.kr/data/deview/session/attach/%5B2B4%5DVictoriaMetrics_%E1%84%89%E1%85%B5%E1%84%80%E1%85%A8%E1%84%8B%E1%85%A7%E1%86%AF_%E1%84%83%E1%85%A6%E1%84%8B%E1%85%B5%E1%84%90%E1%85%A5_%E1%84%83%E1%85%A2%E1%84%92%E1%85%A9%E1%86%AB%E1%84%83%E1%85%A9%E1%86%AB%E1%84%8B%E1%85%B4_%E1%84%86%E1%85%A5%E1%86%AF%E1%84%90%E1%85%B5%E1%84%87%E1%85%A5%E1%84%89%E1%85%B3_Kor+Eng.pdf) on why and how Naver uses VictoriaMetrics.
@@ -415,12 +413,13 @@ See [this video](https://www.youtube.com/watch?v=OUyXPgVcdw4) and [these slides]
 [NetEase Cloud Music](https://music.163.com/) is a Chinese freemium music streaming service developed and owned by [NetEase, Inc](https://en.wikipedia.org/wiki/NetEase). It is one of the biggest competitors in the Chinese music streaming business, primarily competing with [Tencent](https://en.wikipedia.org/wiki/Tencent)'s QQ Music.
 
 The huge scale of services and the diverse monitoring requirements bring great challenges to timeseries database’s reliability, availability, and performance. With year’s evolution, we finally build a metrics system around VictoriaMetrics, aiming to solve following problems:
-* Weak observability on application layer: in the past, internal monitoring of the product mainly focused on machine level. Although it also provided monitoring plugins for common frameworks, there was still room for improvement in both performance and visualization effects.
-* Linking metrics to trace: metrics are the most intuitive way to discover problems, such as "getting 10 failed http requests in the past 30s", but sometimes traces are also needed to locate the root cause of the errors.
-* Performance and cost: storage cost of the old metric system is relatively high, since prometheus as a standalone application cannot support large scale of data.
-* aggregate queries: aggregate queries are often needed and could take several seconds or even tens of seconds, slowing down troubleshooting process seriously.
-* Weak visualization capabilities: monitoring data are often used in YoY comparison and multi-instance comparison to help locate problems. Neither Prometheus UI nor Grafana supports this feature.
- 
+
+- Weak observability on application layer: in the past, internal monitoring of the product mainly focused on machine level. Although it also provided monitoring plugins for common frameworks, there was still room for improvement in both performance and visualization effects.
+- Linking metrics to trace: metrics are the most intuitive way to discover problems, such as "getting 10 failed http requests in the past 30s", but sometimes traces are also needed to locate the root cause of the errors.
+- Performance and cost: storage cost of the old metric system is relatively high, since prometheus as a standalone application cannot support large scale of data.
+- aggregate queries: aggregate queries are often needed and could take several seconds or even tens of seconds, slowing down troubleshooting process seriously.
+- Weak visualization capabilities: monitoring data are often used in YoY comparison and multi-instance comparison to help locate problems. Neither Prometheus UI nor Grafana supports this feature.
+
 See [this article](https://juejin.cn/post/7322268449409744931) for details on how NetEase Cloud Music build a metrics system base on VictoriaMetrics and give solutions to above problems.
 
 ## Percona
@@ -454,7 +453,7 @@ See [the full article](https://engineering.razorpay.com/scaling-to-trillions-of-
 
 [RELEX Solutions](https://www.relexsolutions.com/), a global software company from Finland, is the market-leading supply chain and retail planning platform.
 
-VictoriaMetrics is used as the central metrics storage for timeseries about applications and machines hosted both in the public cloud and in the private cloud. Metrics are remote-written by Prometheus, the OpenTelemetry collector and sometimes directly by custom Prometheus exporters. 
+VictoriaMetrics is used as the central metrics storage for timeseries about applications and machines hosted both in the public cloud and in the private cloud. Metrics are remote-written by Prometheus, the OpenTelemetry collector and sometimes directly by custom Prometheus exporters.
 
 Alerts are evaluated on vmalert when necessary, either because metrics from multiple sources are needed or because the source is Prometheus in agent mode (mostly for kubernetes clusters). Prometheus Alertmanager and Grafana+Promxy combine all sources together so that the end users of dashboards (and ideally the recipients of alert notifications) don't have to worry where to look for some information.
 
@@ -462,20 +461,20 @@ VictoriaMetrics has allowed us to extend data retention for our metrics effortle
 
 Across our production VictoriaMetrics clusters, in a 12 months period we go beyond the following figures.
 
-- Active time series: 10M
-- Ingestion rate: 300k samples per second
-- Total number of datapoints: 4400G
-- Data size on disk: 3600 GiB
-- Available memory: 320 GiB as seen by kubernetes (160 GiB physical memory for the hosts)
-- CPU: 20 cores (AMD EPYC 7763), about 70 % idle
+- Active time series: 20M
+- Ingestion rate: 1M samples per second (2M before stream aggregation)
+- Total number of datapoints: 15T+
+- Data size on disk: 12+ TiB
+- Available memory: 1.2 TiB as seen by kubernetes (640 GiB physical memory for the hosts)
+- CPU: 80 cores (AMD EPYC 7763), about 50 % idle
 - Retention period: ~1 year
-- Churn rate: 6M new time series per day (monthly average)
+- Churn rate: 16M new time series per day (monthly average)
 - Query rate:
-  - `/api/v1/query_range`: 10 queries per second
+  - `/api/v1/query_range`: 15 queries per second
   - `/api/v1/query`: 10 queries per second
 - Query duration for `/api/v1/query_range` (weekly mean):
-  - 99th percentile: 700 ms
-  - median: 10 ms
+  - 99th percentile: 1.5 s
+  - median: 15 ms
 
 ## Roblox
 
@@ -557,7 +556,7 @@ See [the full article](https://smarketshq.com/monitoring-kubernetes-clusters-41a
 
 [Synthesio](https://www.synthesio.com/) is the leading social intelligence tool for social media monitoring and analytics.
 
-> We fully migrated from [Metrictank](https://github.com/grafana/metrictank)  to VictoriaMetrics
+> We fully migrated from [Metrictank](https://github.com/grafana/metrictank) to VictoriaMetrics
 
 Numbers:
 
@@ -576,12 +575,12 @@ Numbers:
 
 Numbers:
 
-- The number of acitve time series: 32M.
+- The number of active time series: 32M.
 - Ingestion rate: 1.6M data points per second.
 - Query duration: median is ~2ms, 99th percentile is ~50ms.
 - The total number of datapoints per VictoriaMetrics "hot" storage is 5.3 trillion
 
-> We like that VictoriaMetrics is simple to configuree and requires zero maintenance. It works right out of the box and once it's set up you can just forget about it.
+> We like that VictoriaMetrics is simple to configure and requires zero maintenance. It works right out of the box and once it's set up you can just forget about it.
 
 ## Wix.com
 
@@ -614,24 +613,23 @@ Numbers:
 
 Alex Ulstein, Head of Monitoring, Wix.com
 
-
 ## xiaohongshu
 
 With a mission to “inspire lives”, [Xiaohongshu](https://www.xiaohongshu.com) is a lifestyle platform that inspires people to discover and connect with a range of diverse lifestyles from China.
-In the past year, we used VictoriaMetrics to replace Prometheus. After migrating to VictoriaMetrics, we had saved more than ten thousand cpu cores, and our metrics system is more stable. 
+In the past year, we used VictoriaMetrics to replace Prometheus. After migrating to VictoriaMetrics, we had saved more than ten thousand cpu cores, and our metrics system is more stable.
 Now more than thirty VictoriaMetrics storage clusters are running online, including all of our key business areas, such as recommendations, search, community, advertising, infrastructure, etc.
 See [this article](https://mp.weixin.qq.com/s/uJ1t0B8WBBryzvbLWDfl5A) on how Xiaohongshu build metrics system base on VictoriaMetrics and the competing solutions.
 
 Across our production VictoriaMetrics clusters, numbers as below:
+
 - Cpu cores in all VictoriaMetrics clusters: almost 50000
 - Data size on disk: 2400 TB
 - Retention period: 1 month
-- Largset VictoriaMetrics cluster: 450 million samples every scrape interval (15 seconds)
+- Largest VictoriaMetrics cluster: 450 million samples every scrape interval (15 seconds)
 - Total scrape sample every scrape interval: 2400 million samples
 - Query rate:
   - /api/v1/query_range: 2300 queries per second
   - /api/v1/query: 260 queries per second
-
 
 ## Zerodha
 
@@ -667,3 +665,27 @@ Numbers:
 - Index size: ~600 GB
 - The average query rate is ~3k per second (mostly alert queries).
 - Query duration: median is ~40ms, 99th percentile is ~100ms.
+
+## Zomato
+
+### Who We Are
+
+At [Zomato](https://www.zomato.com/), our mission statement is better food for more people, We connect millions of users with restaurants, delivering meals to their doorsteps while offering a variety of services, including restaurant discovery, online ordering, and table reservations.
+
+### The Challenge
+
+As we scaled, our existing observability stack (Prometheus and Thanos) began to show its limitations. We faced challenges like high memory usage, slow query response times, and rising costs, particularly due to the high cardinality of our metrics. Managing this setup became increasingly complex, impacting our ability to maintain reliable service and effectively troubleshoot issues.
+
+### Our Solution
+
+To address these challenges, we decided to migrate to VictoriaMetrics. We were drawn to its reputation for high performance, low resource usage, and scalability. The migration process was carefully planned to ensure a smooth transition with minimal disruption. We focused on:
+
+- **Data Optimization**: We reduced unnecessary metrics to minimize data ingestion and storage needs.
+- **Performance Enhancements**: VictoriaMetrics’ efficient query processing allowed us to achieve significantly faster query response times.
+- **Cost Efficiency**: The optimized storage format in VictoriaMetrics led to a noticeable reduction in our storage and operational costs.
+
+### The Results
+
+Post-migration, we successfully scaled our monitoring infrastructure to handle billions of data points daily, all while experiencing faster query performance and 60% reduction in yearly infra cost. The improved observability has enhanced our ability to deliver reliable service, allowing us to troubleshoot issues more quickly and effectively.
+
+Read more about the migration journey in our blog - https://blog.zomato.com/migrating-to-victoriametrics-a-complete-overhaul-for-enhanced-observability

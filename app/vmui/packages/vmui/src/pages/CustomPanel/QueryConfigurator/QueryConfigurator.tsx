@@ -1,5 +1,4 @@
-import React, { FC, useEffect, useState } from "preact/compat";
-import { StateUpdater } from "preact/hooks";
+import React, { Dispatch, FC, SetStateAction, useEffect, useState } from "preact/compat";
 import QueryEditor from "../../../components/Configurators/QueryEditor/QueryEditor";
 import AdditionalSettings from "../../../components/Configurators/AdditionalSettings/AdditionalSettings";
 import usePrevious from "../../../hooks/usePrevious";
@@ -11,6 +10,7 @@ import {
   PlayIcon,
   PlusIcon,
   Prettify,
+  SpinnerIcon,
   VisibilityIcon,
   VisibilityOffIcon
 } from "../../../components/Main/Icons";
@@ -24,19 +24,28 @@ import useDeviceDetect from "../../../hooks/useDeviceDetect";
 import { QueryStats } from "../../../api/types";
 import { usePrettifyQuery } from "./hooks/usePrettifyQuery";
 import QueryHistory from "../QueryHistory/QueryHistory";
+import AnomalyConfig from "../../../components/ExploreAnomaly/AnomalyConfig";
+import QueryEditorAutocomplete from "../../../components/Configurators/QueryEditor/QueryEditorAutocomplete";
 
 export interface QueryConfiguratorProps {
   queryErrors: string[];
-  setQueryErrors: StateUpdater<string[]>;
-  setHideError: StateUpdater<boolean>;
+  setQueryErrors: Dispatch<SetStateAction<string[]>>;
+  setHideError: Dispatch<SetStateAction<boolean>>;
   stats: QueryStats[];
+  label?: string;
+  isLoading?: boolean;
+  includeFunctions?: boolean;
   onHideQuery?: (queries: number[]) => void
   onRunQuery: () => void;
+  abortFetch?: () => void;
   hideButtons?: {
     addQuery?: boolean;
     prettify?: boolean;
     autocomplete?: boolean;
     traceQuery?: boolean;
+    anomalyConfig?: boolean;
+    disableCache?: boolean;
+    reduceMemUsage?: boolean;
   }
 }
 
@@ -45,8 +54,12 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
   setQueryErrors,
   setHideError,
   stats,
+  label,
+  isLoading,
+  includeFunctions = true,
   onHideQuery,
   onRunQuery,
+  abortFetch,
   hideButtons
 }) => {
 
@@ -83,6 +96,10 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
   };
 
   const handleRunQuery = () => {
+    if (isLoading) {
+      abortFetch && abortFetch();
+      return;
+    }
     updateHistory();
     queryDispatch({ type: "SET_QUERY", payload: stateQuery });
     timeDispatch({ type: "RUN_QUERY" });
@@ -97,7 +114,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
     setStateQuery(prev => prev.filter((q, i) => i !== index));
   };
 
-  const handleToggleHideQuery = (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>, index: number) => {
+  const handleToggleHideQuery = (e: ReactMouseEvent<HTMLButtonElement>, index: number) => {
     const { ctrlKey, metaKey } = e;
     const ctrlMetaKey = ctrlKey || metaKey;
 
@@ -143,7 +160,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
     setHideQuery(prev => prev.includes(i) ? prev.filter(n => n !== i) : prev.map(n => n > i ? n - 1 : n));
   };
 
-  const createHandlerHideQuery = (i: number) => (e: ReactMouseEvent<HTMLButtonElement, MouseEvent>) => {
+  const createHandlerHideQuery = (i: number) => (e: ReactMouseEvent<HTMLButtonElement>) => {
     handleToggleHideQuery(e, i);
   };
 
@@ -176,6 +193,10 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
     }
   }, [stateQuery, awaitStateQuery]);
 
+  useEffect(() => {
+    setStateQuery(query || []);
+  }, [query]);
+
   return <div
     className={classNames({
       "vm-query-configurator": true,
@@ -196,14 +217,16 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
           <QueryEditor
             value={stateQuery[i]}
             autocomplete={!hideButtons?.autocomplete && (autocomplete || autocompleteQuick)}
+            autocompleteEl={QueryEditorAutocomplete}
             error={queryErrors[i]}
             stats={stats[i]}
             onArrowUp={createHandlerArrow(-1, i)}
             onArrowDown={createHandlerArrow(1, i)}
             onEnter={handleRunQuery}
             onChange={createHandlerChangeQuery(i)}
-            label={`Query ${stateQuery.length > 1 ? i + 1 : ""}`}
+            label={`${label || "Query"} ${stateQuery.length > 1 ? i + 1 : ""}`}
             disabled={hideQuery.includes(i)}
+            includeFunctions={includeFunctions}
           />
           {onHideQuery && (
             <Tooltip title={hideQuery.includes(i) ? "Enable query" : "Disable query"}>
@@ -253,6 +276,7 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
       <AdditionalSettings hideButtons={hideButtons}/>
       <div className="vm-query-configurator-settings__buttons">
         <QueryHistory handleSelectQuery={handleSelectHistory}/>
+        {hideButtons?.anomalyConfig && <AnomalyConfig/>}
         {!hideButtons?.addQuery && stateQuery.length < MAX_QUERY_FIELDS && (
           <Button
             variant="outlined"
@@ -265,9 +289,9 @@ const QueryConfigurator: FC<QueryConfiguratorProps> = ({
         <Button
           variant="contained"
           onClick={handleRunQuery}
-          startIcon={<PlayIcon/>}
+          startIcon={isLoading ? <SpinnerIcon/> : <PlayIcon/>}
         >
-          {isMobile ? "Execute" : "Execute Query"}
+          {`${isLoading ? "Cancel" : "Execute"} ${isMobile ? "" : "Query"}`}
         </Button>
       </div>
     </div>

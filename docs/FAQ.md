@@ -1,5 +1,4 @@
 ---
-sort: 24
 weight: 24
 title: FAQ
 menu:
@@ -10,9 +9,6 @@ aliases:
 - /FAQ.html
 - /faq.html
 ---
-
-# FAQ
-
 ## What is the main purpose of VictoriaMetrics?
 
 To provide the best monitoring solution.
@@ -33,7 +29,7 @@ Yes. See [these benchmarks](https://docs.victoriametrics.com/articles/#benchmark
 
 See [these docs](https://docs.victoriametrics.com/quick-start/).
 
-## Hot to contribute to VictoriaMetrics?
+## How to contribute to VictoriaMetrics?
 
 See [these docs](https://docs.victoriametrics.com/contributing/).
 
@@ -57,7 +53,7 @@ and send data to multiple remote storage systems, vmagent has the following addi
 
 * vmagent usually requires lower amounts of CPU, RAM and disk IO compared to Prometheus when scraping an enormous number of targets (more than 1000)
   or targets with a great number of exposed metrics.
-* vmagent provides independent disk-backed buffers for each configured remote storage (see `-remoteWrite.url`). This means that slow or temporarily unavailable storage
+* vmagent provides independent [disk-backed buffers](https://docs.victoriametrics.com/vmagent/#calculating-disk-space-for-persistence-queue) for each configured remote storage (see `-remoteWrite.url`). This means that slow or temporarily unavailable storage
   doesn't prevent it from sending data to healthy storage in parallel. Prometheus uses a single shared buffer for all the configured remote storage systems (see `remote_write->url`)
   with a hardcoded retention of 2 hours.
 * vmagent may accept, relabel and filter data obtained via multiple data ingestion protocols in addition to data scraped from Prometheus targets.
@@ -80,13 +76,15 @@ and send data to multiple remote storage systems, vmagent has the following addi
 Both [vmagent](https://docs.victoriametrics.com/vmagent/) and [Prometheus agent](https://prometheus.io/blog/2021/11/16/agent/) serve the same purpose – to efficiently scrape Prometheus-compatible targets at the edge. They have the following differences:
 
 * vmagent usually requires lower amounts of CPU, RAM and disk IO compared to the Prometheus agent.
-* Prometheus agent supports only pull-based data collection (e.g. it can scrape Prometheus-compatible targets), while vmagent supports both pull and push data collection – it can accept data via many popular data ingestion protocols such as InfluxDB line protocol, Graphite protocol, OpenTSDB protocol, DataDog protocol, Prometheus protocol, CSV and JSON – see [these docs](https://docs.victoriametrics.com/vmagent/#features).
+* vmagent supports both pull and push data collection – it can accept data via many popular data ingestion protocols such as InfluxDB line protocol, Graphite protocol, OpenTSDB protocol, DataDog protocol, Prometheus protocol, OpenTelemetry metrics protocol, CSV and JSON – see [these docs](https://docs.victoriametrics.com/vmagent/#features).
+* vmagent doesn't have limitations on backfilling of historical data.
 * vmagent can easily scale horizontally to multiple instances for scraping a big number of targets – see [these docs](https://docs.victoriametrics.com/vmagent/#scraping-big-number-of-targets).
 * vmagent supports [improved relabeling](https://docs.victoriametrics.com/vmagent/#relabeling).
 * vmagent can limit the number of scraped metrics per target – see [these docs](https://docs.victoriametrics.com/vmagent/#cardinality-limiter).
 * vmagent supports loading scrape configs from multiple files – see [these docs](https://docs.victoriametrics.com/vmagent/#loading-scrape-configs-from-multiple-files).
 * vmagent supports data reading and data writing from/to Kafka – see [these docs](https://docs.victoriametrics.com/vmagent/#kafka-integration).
 * vmagent can read and update scrape configs from http and https URLs, while the Prometheus agent can read them only from the local file system.
+* vmagent supports [stream aggregation](https://docs.victoriametrics.com/stream-aggregation/) feature for performing aggregates on collected or received samples before sending them to remote storage.
 
 ## Is it safe to enable [remote write](https://prometheus.io/docs/operating/integrations/#remote-endpoints-and-storage) in Prometheus?
 
@@ -218,11 +216,10 @@ We provide commercial support for both versions. [Contact us](mailto:info@victor
 
 The following commercial versions of VictoriaMetrics are available:
 
-* [Managed VictoriaMetrics at AWS](https://aws.amazon.com/marketplace/pp/prodview-4tbfq5icmbmyc) (aka managed Prometheus).
+* [VictoriaMetrics Cloud](https://console.victoriametrics.cloud/signUp?utm_source=website&utm_campaign=docs_vm_faq) – the most cost-efficient hosted monitoring platform, operated by VictoriaMetrics core team.
 
 The following commercial versions of VictoriaMetrics are planned:
 
-* Managed VictoriaMetrics at Google Cloud.
 * Cloud monitoring solution based on VictoriaMetrics.
 
 [Contact us](mailto:info@victoriametrics.com) for more information on our plans.
@@ -285,7 +282,8 @@ Questions about VictoriaMetrics can be asked via the following channels:
 
 * [Slack Inviter](https://slack.victoriametrics.com/) and [Slack channel](https://victoriametrics.slack.com/)
 * [Telegram channel](https://t.me/VictoriaMetrics_en)
-* [Google group](https://groups.google.com/forum/#!forum/victorametrics-users)
+
+See the full list of [community channels](https://docs.victoriametrics.com/#community-and-contributions).
 
 ## Where can I file bugs and feature requests regarding VictoriaMetrics?
 
@@ -319,7 +317,7 @@ Yes. See [these docs](https://docs.victoriametrics.com/#graphite-api-usage).
 ## What is an active time series?
 
 A time series is uniquely identified by its name plus a set of its labels. For example, `temperature{city="NY",country="US"}` and `temperature{city="SF",country="US"}`
-are two distinct series, since they differ by the `city` label. A time series is considered active if it receives at least a single new sample during the last hour.
+are two distinct series, since they differ by the `city` label. A time series is considered active if it received at least a single sample during the last hour or it has been touched by queries during the last hour.
 The number of active time series is displayed on the official Grafana dashboard for VictoriaMetrics - see [these docs](https://docs.victoriametrics.com/#monitoring) for details.
 
 ## What is high churn rate?
@@ -338,7 +336,8 @@ The main reason for high churn rate is a metric label with frequently changed va
 * A `hash` or `uuid` label, which changes frequently.
 
 The solution against high churn rate is to identify and eliminate labels with frequently changed values.
-[Cardinality explorer](https://docs.victoriametrics.com/#cardinality-explorer) can help determining these labels.
+[Cardinality explorer](https://docs.victoriametrics.com/#cardinality-explorer) can help determining these labels. If labels can't be removed, try pre-aggregating data
+before it gets ingested into database with [stream aggregation](https://docs.victoriametrics.com/stream-aggregation/).
 
 The official Grafana dashboards for VictoriaMetrics contain graphs for churn rate - see [these docs](https://docs.victoriametrics.com/#monitoring) for details.
 
@@ -487,7 +486,7 @@ when some of `vmstorage` nodes are removed from the cluster because of the follo
   This copying takes additional CPU, disk IO and network bandwidth at `vmstorage` nodes. This may negatively impact
   VictoriaMetrics cluster availability during extended periods of time.
 
-- It is unclear when the automatic replication factor recovery must be started. How to distiguinsh the expected temporary
+- It is unclear when the automatic replication factor recovery must be started. How to distinguish the expected temporary
   `vmstorage` node unavailability because of maintenance, upgrade or config changes from permanent loss of data at the `vmstorage` node?
 
 It is recommended reading [replication and data safety docs](https://docs.victoriametrics.com/cluster-victoriametrics/#replication-and-data-safety)

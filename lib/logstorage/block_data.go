@@ -4,6 +4,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
 )
 
 // blockData contains packed data for a single block.
@@ -29,11 +30,6 @@ type blockData struct {
 
 	// constColumns contains data for const columns across the block
 	constColumns []Field
-
-	// a is used for storing byte slices for timestamps and columns.
-	//
-	// It reduces fragmentation for them.
-	a arena
 }
 
 // reset resets bd for subsequent re-use
@@ -54,42 +50,37 @@ func (bd *blockData) reset() {
 		ccs[i].Reset()
 	}
 	bd.constColumns = ccs[:0]
-
-	bd.a.reset()
 }
 
 func (bd *blockData) resizeColumnsData(columnsDataLen int) []columnData {
-	cds := bd.columnsData
-	if n := columnsDataLen - cap(cds); n > 0 {
-		cds = append(cds[:cap(cds)], make([]columnData, n)...)
-	}
-	cds = cds[:columnsDataLen]
-	bd.columnsData = cds
-	return cds
+	bd.columnsData = slicesutil.SetLength(bd.columnsData, columnsDataLen)
+	return bd.columnsData
 }
 
 // copyFrom copies src to bd.
-func (bd *blockData) copyFrom(src *blockData) {
+//
+// bd is valid until a.reset() is called.
+func (bd *blockData) copyFrom(a *arena, src *blockData) {
 	bd.reset()
 
 	bd.streamID = src.streamID
 	bd.uncompressedSizeBytes = src.uncompressedSizeBytes
 	bd.rowsCount = src.rowsCount
-	bd.timestampsData.copyFrom(&src.timestampsData, &bd.a)
+	bd.timestampsData.copyFrom(a, &src.timestampsData)
 
 	cdsSrc := src.columnsData
 	cds := bd.resizeColumnsData(len(cdsSrc))
 	for i := range cds {
-		cds[i].copyFrom(&cdsSrc[i], &bd.a)
+		cds[i].copyFrom(a, &cdsSrc[i])
 	}
 	bd.columnsData = cds
 
-	bd.constColumns = append(bd.constColumns[:0], src.constColumns...)
+	bd.constColumns = appendFields(a, bd.constColumns[:0], src.constColumns)
 }
 
 // unmarshalRows appends unmarshaled from bd log entries to dst.
 //
-// The returned log entries are valid until sbu and vd are valid.
+// The unmarshaled log entries are valid until sbu and vd are reset.
 func (bd *blockData) unmarshalRows(dst *rows, sbu *stringsBlockUnmarshaler, vd *valuesDecoder) error {
 	b := getBlock()
 	defer putBlock(b)
@@ -101,12 +92,8 @@ func (bd *blockData) unmarshalRows(dst *rows, sbu *stringsBlockUnmarshaler, vd *
 	return nil
 }
 
-// mustWriteTo writes bd with the given sid to sw and updates bh accordingly
+// mustWriteTo writes bd to sw and updates bh accordingly
 func (bd *blockData) mustWriteTo(bh *blockHeader, sw *streamWriters) {
-	// Do not store the version used for encoding directly in the block data, since:
-	// - all the blocks in the same part use the same encoding
-	// - the block encoding version can be put in metadata file for the part (aka metadataFilename)
-
 	bh.reset()
 
 	bh.streamID = bd.streamID
@@ -118,27 +105,24 @@ func (bd *blockData) mustWriteTo(bh *blockHeader, sw *streamWriters) {
 
 	// Marshal columns
 	cds := bd.columnsData
+
 	csh := getColumnsHeader()
+
 	chs := csh.resizeColumnHeaders(len(cds))
 	for i := range cds {
 		cds[i].mustWriteTo(&chs[i], sw)
 	}
 	csh.constColumns = append(csh.constColumns[:0], bd.constColumns...)
 
-	bb := longTermBufPool.Get()
-	bb.B = csh.marshal(bb.B)
+	csh.mustWriteTo(bh, sw)
+
 	putColumnsHeader(csh)
-	bh.columnsHeaderOffset = sw.columnsHeaderWriter.bytesWritten
-	bh.columnsHeaderSize = uint64(len(bb.B))
-	if bh.columnsHeaderSize > maxColumnsHeaderSize {
-		logger.Panicf("BUG: too big columnsHeaderSize: %d bytes; mustn't exceed %d bytes", bh.columnsHeaderSize, maxColumnsHeaderSize)
-	}
-	sw.columnsHeaderWriter.MustWrite(bb.B)
-	longTermBufPool.Put(bb)
 }
 
 // mustReadFrom reads block data associated with bh from sr to bd.
-func (bd *blockData) mustReadFrom(bh *blockHeader, sr *streamReaders) {
+//
+// The bd is valid until a.reset() is called.
+func (bd *blockData) mustReadFrom(a *arena, bh *blockHeader, sr *streamReaders) {
 	bd.reset()
 
 	bd.streamID = bh.streamID
@@ -146,7 +130,7 @@ func (bd *blockData) mustReadFrom(bh *blockHeader, sr *streamReaders) {
 	bd.rowsCount = bh.rowsCount
 
 	// Read timestamps
-	bd.timestampsData.mustReadFrom(&bh.timestampsHeader, sr, &bd.a)
+	bd.timestampsData.mustReadFrom(a, &bh.timestampsHeader, sr)
 
 	// Read columns
 	if bh.columnsHeaderOffset != sr.columnsHeaderReader.bytesRead {
@@ -162,17 +146,44 @@ func (bd *blockData) mustReadFrom(bh *blockHeader, sr *streamReaders) {
 	sr.columnsHeaderReader.MustReadFull(bb.B)
 
 	csh := getColumnsHeader()
-	if err := csh.unmarshal(bb.B); err != nil {
+	if err := csh.unmarshalNoArena(bb.B, sr.partFormatVersion); err != nil {
 		logger.Panicf("FATAL: %s: cannot unmarshal columnsHeader: %s", sr.columnsHeaderReader.Path(), err)
 	}
-	longTermBufPool.Put(bb)
+	if sr.partFormatVersion >= 1 {
+		readColumnNamesFromColumnsHeaderIndex(bh, sr, csh)
+	}
+
 	chs := csh.columnHeaders
 	cds := bd.resizeColumnsData(len(chs))
 	for i := range chs {
-		cds[i].mustReadFrom(&chs[i], sr, &bd.a)
+		cds[i].mustReadFrom(a, &chs[i], sr)
 	}
-	bd.constColumns = append(bd.constColumns[:0], csh.constColumns...)
+	bd.constColumns = appendFields(a, bd.constColumns[:0], csh.constColumns)
 	putColumnsHeader(csh)
+	longTermBufPool.Put(bb)
+}
+
+func readColumnNamesFromColumnsHeaderIndex(bh *blockHeader, sr *streamReaders, csh *columnsHeader) {
+	bb := longTermBufPool.Get()
+	defer longTermBufPool.Put(bb)
+
+	n := bh.columnsHeaderIndexSize
+	if n > maxColumnsHeaderIndexSize {
+		logger.Panicf("BUG: %s: too big columnsHeaderIndexSize: %d bytes; mustn't exceed %d bytes", sr.columnsHeaderIndexReader.Path(), n, maxColumnsHeaderIndexSize)
+	}
+
+	bb.B = bytesutil.ResizeNoCopyMayOverallocate(bb.B, int(n))
+	sr.columnsHeaderIndexReader.MustReadFull(bb.B)
+
+	cshIndex := getColumnsHeaderIndex()
+	if err := cshIndex.unmarshalNoArena(bb.B); err != nil {
+		logger.Panicf("FATAL: %s: cannot unmarshal columnsHeaderIndex: %s", sr.columnsHeaderIndexReader.Path(), err)
+	}
+	if err := csh.setColumnNames(cshIndex, sr.columnNames); err != nil {
+		logger.Panicf("FATAL: %s: %s", sr.columnsHeaderIndexReader.Path(), err)
+	}
+
+	putColumnsHeaderIndex(cshIndex)
 }
 
 // timestampsData contains the encoded timestamps data.
@@ -199,7 +210,9 @@ func (td *timestampsData) reset() {
 }
 
 // copyFrom copies src to td.
-func (td *timestampsData) copyFrom(src *timestampsData, a *arena) {
+//
+// td is valid until a.reset() is called.
+func (td *timestampsData) copyFrom(a *arena, src *timestampsData) {
 	td.reset()
 
 	td.data = a.copyBytes(src.data)
@@ -224,7 +237,9 @@ func (td *timestampsData) mustWriteTo(th *timestampsHeader, sw *streamWriters) {
 }
 
 // mustReadFrom reads timestamps data associated with th from sr to td.
-func (td *timestampsData) mustReadFrom(th *timestampsHeader, sr *streamReaders, a *arena) {
+//
+// td is valid until a.reset() is called.
+func (td *timestampsData) mustReadFrom(a *arena, th *timestampsHeader, sr *streamReaders) {
 	td.reset()
 
 	td.marshalType = th.marshalType
@@ -287,97 +302,93 @@ func (cd *columnData) reset() {
 }
 
 // copyFrom copies src to cd.
-func (cd *columnData) copyFrom(src *columnData, a *arena) {
+//
+// cd is valid until a.reset() is called.
+func (cd *columnData) copyFrom(a *arena, src *columnData) {
 	cd.reset()
 
-	cd.name = src.name
+	cd.name = a.copyString(src.name)
 	cd.valueType = src.valueType
 
 	cd.minValue = src.minValue
 	cd.maxValue = src.maxValue
-	cd.valuesDict.copyFrom(&src.valuesDict)
+	cd.valuesDict.copyFrom(a, &src.valuesDict)
 
 	cd.valuesData = a.copyBytes(src.valuesData)
 	cd.bloomFilterData = a.copyBytes(src.bloomFilterData)
 }
 
 // mustWriteTo writes cd to sw and updates ch accordingly.
+//
+// ch is valid until cd is changed.
 func (cd *columnData) mustWriteTo(ch *columnHeader, sw *streamWriters) {
 	ch.reset()
-
-	valuesWriter := &sw.fieldValuesWriter
-	bloomFilterWriter := &sw.fieldBloomFilterWriter
-	if cd.name == "" {
-		valuesWriter = &sw.messageValuesWriter
-		bloomFilterWriter = &sw.messageBloomFilterWriter
-	}
 
 	ch.name = cd.name
 	ch.valueType = cd.valueType
 
 	ch.minValue = cd.minValue
 	ch.maxValue = cd.maxValue
-	ch.valuesDict.copyFrom(&cd.valuesDict)
+	ch.valuesDict.copyFromNoArena(&cd.valuesDict)
+
+	bloomValuesWriter := sw.getBloomValuesWriterForColumnName(ch.name)
 
 	// marshal values
 	ch.valuesSize = uint64(len(cd.valuesData))
 	if ch.valuesSize > maxValuesBlockSize {
 		logger.Panicf("BUG: too big valuesSize: %d bytes; mustn't exceed %d bytes", ch.valuesSize, maxValuesBlockSize)
 	}
-	ch.valuesOffset = valuesWriter.bytesWritten
-	valuesWriter.MustWrite(cd.valuesData)
+	ch.valuesOffset = bloomValuesWriter.values.bytesWritten
+	bloomValuesWriter.values.MustWrite(cd.valuesData)
 
 	// marshal bloom filter
 	ch.bloomFilterSize = uint64(len(cd.bloomFilterData))
 	if ch.bloomFilterSize > maxBloomFilterBlockSize {
 		logger.Panicf("BUG: too big bloomFilterSize: %d bytes; mustn't exceed %d bytes", ch.bloomFilterSize, maxBloomFilterBlockSize)
 	}
-	ch.bloomFilterOffset = bloomFilterWriter.bytesWritten
-	bloomFilterWriter.MustWrite(cd.bloomFilterData)
+	ch.bloomFilterOffset = bloomValuesWriter.bloom.bytesWritten
+	bloomValuesWriter.bloom.MustWrite(cd.bloomFilterData)
 }
 
 // mustReadFrom reads columns data associated with ch from sr to cd.
-func (cd *columnData) mustReadFrom(ch *columnHeader, sr *streamReaders, a *arena) {
+//
+// cd is valid until a.reset() is called.
+func (cd *columnData) mustReadFrom(a *arena, ch *columnHeader, sr *streamReaders) {
 	cd.reset()
 
-	valuesReader := &sr.fieldValuesReader
-	bloomFilterReader := &sr.fieldBloomFilterReader
-	if ch.name == "" {
-		valuesReader = &sr.messageValuesReader
-		bloomFilterReader = &sr.messageBloomFilterReader
-	}
-
-	cd.name = ch.name
+	cd.name = a.copyString(ch.name)
 	cd.valueType = ch.valueType
 
 	cd.minValue = ch.minValue
 	cd.maxValue = ch.maxValue
-	cd.valuesDict.copyFrom(&ch.valuesDict)
+	cd.valuesDict.copyFrom(a, &ch.valuesDict)
+
+	bloomValuesReader := sr.getBloomValuesReaderForColumnName(ch.name)
 
 	// read values
-	if ch.valuesOffset != valuesReader.bytesRead {
+	if ch.valuesOffset != bloomValuesReader.values.bytesRead {
 		logger.Panicf("FATAL: %s: unexpected columnHeader.valuesOffset=%d; must equal to the number of bytes read: %d",
-			valuesReader.Path(), ch.valuesOffset, valuesReader.bytesRead)
+			bloomValuesReader.values.Path(), ch.valuesOffset, bloomValuesReader.values.bytesRead)
 	}
 	valuesSize := ch.valuesSize
 	if valuesSize > maxValuesBlockSize {
-		logger.Panicf("FATAL: %s: values block size cannot exceed %d bytes; got %d bytes", valuesReader.Path(), maxValuesBlockSize, valuesSize)
+		logger.Panicf("FATAL: %s: values block size cannot exceed %d bytes; got %d bytes", bloomValuesReader.values.Path(), maxValuesBlockSize, valuesSize)
 	}
 	cd.valuesData = a.newBytes(int(valuesSize))
-	valuesReader.MustReadFull(cd.valuesData)
+	bloomValuesReader.values.MustReadFull(cd.valuesData)
 
 	// read bloom filter
 	// bloom filter is missing in valueTypeDict.
 	if ch.valueType != valueTypeDict {
-		if ch.bloomFilterOffset != bloomFilterReader.bytesRead {
+		if ch.bloomFilterOffset != bloomValuesReader.bloom.bytesRead {
 			logger.Panicf("FATAL: %s: unexpected columnHeader.bloomFilterOffset=%d; must equal to the number of bytes read: %d",
-				bloomFilterReader.Path(), ch.bloomFilterOffset, bloomFilterReader.bytesRead)
+				bloomValuesReader.bloom.Path(), ch.bloomFilterOffset, bloomValuesReader.bloom.bytesRead)
 		}
 		bloomFilterSize := ch.bloomFilterSize
 		if bloomFilterSize > maxBloomFilterBlockSize {
-			logger.Panicf("FATAL: %s: bloom filter block size cannot exceed %d bytes; got %d bytes", bloomFilterReader.Path(), maxBloomFilterBlockSize, bloomFilterSize)
+			logger.Panicf("FATAL: %s: bloom filter block size cannot exceed %d bytes; got %d bytes", bloomValuesReader.bloom.Path(), maxBloomFilterBlockSize, bloomFilterSize)
 		}
 		cd.bloomFilterData = a.newBytes(int(bloomFilterSize))
-		bloomFilterReader.MustReadFull(cd.bloomFilterData)
+		bloomValuesReader.bloom.MustReadFull(cd.bloomFilterData)
 	}
 }

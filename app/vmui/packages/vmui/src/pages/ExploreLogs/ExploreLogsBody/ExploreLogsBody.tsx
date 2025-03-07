@@ -1,23 +1,27 @@
-import React, { FC, useState, useMemo } from "preact/compat";
-import JsonView from "../../../components/Views/JsonView/JsonView";
+import React, { FC, useState, useMemo, useRef } from "preact/compat";
 import { CodeIcon, ListIcon, TableIcon } from "../../../components/Main/Icons";
 import Tabs from "../../../components/Main/Tabs/Tabs";
 import "./style.scss";
 import classNames from "classnames";
 import useDeviceDetect from "../../../hooks/useDeviceDetect";
 import { Logs } from "../../../api/types";
-import dayjs from "dayjs";
-import { useTimeState } from "../../../state/time/TimeStateContext";
 import useStateSearchParams from "../../../hooks/useStateSearchParams";
 import useSearchParamsFromObject from "../../../hooks/useSearchParamsFromObject";
 import TableSettings from "../../../components/Table/TableSettings/TableSettings";
 import useBoolean from "../../../hooks/useBoolean";
 import TableLogs from "./TableLogs";
-import GroupLogs from "./GroupLogs";
+import GroupLogs from "../GroupLogs/GroupLogs";
+import JsonView from "../../../components/Views/JsonView/JsonView";
+import LineLoader from "../../../components/Main/LineLoader/LineLoader";
+import SelectLimit from "../../../components/Main/Pagination/SelectLimit/SelectLimit";
+
+const MemoizedTableLogs = React.memo(TableLogs);
+const MemoizedGroupLogs = React.memo(GroupLogs);
+const MemoizedJsonView = React.memo(JsonView);
 
 export interface ExploreLogBodyProps {
   data: Logs[];
-  loaded?: boolean;
+  isLoading: boolean;
 }
 
 enum DisplayType {
@@ -32,36 +36,35 @@ const tabs = [
   { label: "JSON", value: DisplayType.json, icon: <CodeIcon/> },
 ];
 
-const ExploreLogsBody: FC<ExploreLogBodyProps> = ({ data, loaded }) => {
+const ExploreLogsBody: FC<ExploreLogBodyProps> = ({ data, isLoading }) => {
   const { isMobile } = useDeviceDetect();
-  const { timezone } = useTimeState();
   const { setSearchParamsFromKeys } = useSearchParamsFromObject();
+  const groupSettingsRef = useRef<HTMLDivElement>(null);
 
   const [activeTab, setActiveTab] = useStateSearchParams(DisplayType.group, "view");
   const [displayColumns, setDisplayColumns] = useState<string[]>([]);
+  const [rowsPerPage, setRowsPerPage] = useStateSearchParams(1000, "rows_per_page");
   const { value: tableCompact, toggle: toggleTableCompact } = useBoolean(false);
 
-  const logs = useMemo(() => data.map((item) => ({
-    time: dayjs(item._time).tz().format("MMM DD, YYYY \nHH:mm:ss.SSS"),
-    data: JSON.stringify(item, null, 2),
-    ...item,
-  })) as Logs[], [data, timezone]);
-
   const columns = useMemo(() => {
-    if (!logs?.length) return [];
-    const hideColumns = ["data", "_time"];
+    if (!data?.length || activeTab !== DisplayType.table) return [];
     const keys = new Set<string>();
-    for (const item of logs) {
+    for (const item of data) {
       for (const key in item) {
         keys.add(key);
       }
     }
-    return Array.from(keys).filter((col) => !hideColumns.includes(col));
-  }, [logs]);
+    return Array.from(keys);
+  }, [data, activeTab]);
 
   const handleChangeTab = (view: string) => {
     setActiveTab(view as DisplayType);
     setSearchParamsFromKeys({ view });
+  };
+
+  const handleSetRowsPerPage = (limit: number) => {
+    setRowsPerPage(limit);
+    setSearchParamsFromKeys({ rows_per_page: limit });
   };
 
   return (
@@ -72,6 +75,7 @@ const ExploreLogsBody: FC<ExploreLogBodyProps> = ({ data, loaded }) => {
         "vm-block_mobile": isMobile,
       })}
     >
+      {isLoading && <LineLoader/>}
       <div
         className={classNames({
           "vm-explore-logs-body-header": true,
@@ -85,17 +89,30 @@ const ExploreLogsBody: FC<ExploreLogBodyProps> = ({ data, loaded }) => {
             items={tabs}
             onChange={handleChangeTab}
           />
+          <div className="vm-explore-logs-body-header__log-info">
+            Total logs returned: <b>{data.length}</b>
+          </div>
         </div>
         {activeTab === DisplayType.table && (
           <div className="vm-explore-logs-body-header__settings">
+            <SelectLimit
+              limit={rowsPerPage}
+              onChange={handleSetRowsPerPage}
+            />
             <TableSettings
               columns={columns}
-              defaultColumns={displayColumns}
+              selectedColumns={displayColumns}
               onChangeColumns={setDisplayColumns}
               tableCompact={tableCompact}
               toggleTableCompact={toggleTableCompact}
             />
           </div>
+        )}
+        {activeTab === DisplayType.group && (
+          <div
+            className="vm-explore-logs-body-header__settings"
+            ref={groupSettingsRef}
+          />
         )}
       </div>
 
@@ -105,29 +122,26 @@ const ExploreLogsBody: FC<ExploreLogBodyProps> = ({ data, loaded }) => {
           "vm-explore-logs-body__table_mobile": isMobile,
         })}
       >
-        {!data.length && (
-          <div className="vm-explore-logs-body__empty">
-            {loaded ? "No logs found" : "Run query to see logs"}
-          </div>
-        )}
+        {!data.length && <div className="vm-explore-logs-body__empty">No logs found</div>}
         {!!data.length && (
           <>
             {activeTab === DisplayType.table && (
-              <TableLogs
-                logs={logs}
+              <MemoizedTableLogs
+                logs={data}
                 displayColumns={displayColumns}
                 tableCompact={tableCompact}
                 columns={columns}
+                rowsPerPage={Number(rowsPerPage)}
               />
             )}
             {activeTab === DisplayType.group && (
-              <GroupLogs
-                logs={logs}
-                columns={columns}
+              <MemoizedGroupLogs
+                logs={data}
+                settingsRef={groupSettingsRef}
               />
             )}
             {activeTab === DisplayType.json && (
-              <JsonView data={data}/>
+              <MemoizedJsonView data={data}/>
             )}
           </>
         )}
