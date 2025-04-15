@@ -1,8 +1,7 @@
 **Fork notes:**
 
-I maintain this fork for two current reasons:
+I maintain this fork for this current reasons:
 - To recompile with support for inserting data more than 3 hours into the future to support forecast data
-- To recompile vmutils (vmbackup primarily) with an older aws s3 library that still works with backblaze b2. The current version in the upstream master branch uses AWS specific checksum headers that backblaze b2 does not support which breaks backups.
 
 Build files are also different as I don't need to build for every architecture or to build victorialogs.
 
