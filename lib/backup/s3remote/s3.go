@@ -20,6 +20,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fscommon"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
@@ -103,6 +104,11 @@ func (fs *FS) Init() error {
 			return retry.NewStandard(func(o *retry.StandardOptions) {
 				o.Backoff = retry.NewExponentialJitterBackoff(3 * time.Minute)
 				o.MaxAttempts = 10
+				o.Retryables = append(retry.DefaultRetryables, retry.RetryableErrorCode{
+					Codes: map[string]struct{}{
+						"IncompleteBody": {},
+					},
+				})
 			})
 		}),
 	}
@@ -130,11 +136,14 @@ func (fs *FS) Init() error {
 		return err
 	}
 
+	tr := httputil.NewTransport(false, "vmbackup_s3_client")
 	if fs.TLSInsecureSkipVerify {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		tr.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
 		}
-		cfg.HTTPClient = &http.Client{Transport: tr}
+	}
+	cfg.HTTPClient = &http.Client{
+		Transport: tr,
 	}
 
 	var outerErr error

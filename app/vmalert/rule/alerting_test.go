@@ -16,11 +16,37 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/vmalertutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 )
+
+func TestNewAlertingRule(t *testing.T) {
+	f := func(group *Group, rule config.Rule, expectRule *AlertingRule) {
+		t.Helper()
+
+		r := NewAlertingRule(&datasource.FakeQuerier{}, group, rule)
+		if err := CompareRules(t, expectRule, r); err != nil {
+			t.Fatalf("unexpected rule mismatch: %s", err)
+		}
+	}
+
+	f(&Group{Name: "foo"},
+		config.Rule{
+			Alert: "health",
+			Expr:  "up == 0",
+			Labels: map[string]string{
+				"foo": "bar",
+			},
+		}, &AlertingRule{
+			Name: "health",
+			Expr: "up == 0",
+			Labels: map[string]string{
+				"foo": "bar",
+			},
+		})
+}
 
 func TestAlertingRuleToTimeSeries(t *testing.T) {
 	timestamp := time.Now()
@@ -198,7 +224,7 @@ func TestAlertingRule_Exec(t *testing.T) {
 		fakeGroup := Group{
 			Name: "TestRule_Exec",
 		}
-		rule.GroupID = fakeGroup.ID()
+		rule.GroupID = fakeGroup.GetID()
 		for i, step := range steps {
 			fq.Reset()
 			fq.Add(step...)
@@ -556,7 +582,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 
 		fq := &datasource.FakeQuerier{}
 		rule.q = fq
-		rule.GroupID = fakeGroup.ID()
+		rule.GroupID = fakeGroup.GetID()
 		fq.Add(data...)
 		gotTS, err := rule.execRange(context.TODO(), time.Unix(1, 0), time.Unix(5, 0))
 		if err != nil {
@@ -625,7 +651,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 		{State: notifier.StatePending, ActiveAt: time.Unix(5, 0)},
 	}, map[uint64]*notifier.Alert{
 		hash(map[string]string{"alertname": "for-pending"}): {
-			GroupID:     fakeGroup.ID(),
+			GroupID:     fakeGroup.GetID(),
 			Name:        "for-pending",
 			Labels:      map[string]string{"alertname": "for-pending"},
 			Annotations: map[string]string{"activeAt": "5000"},
@@ -644,7 +670,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 		{State: notifier.StateFiring, ActiveAt: time.Unix(1, 0)},
 	}, map[uint64]*notifier.Alert{
 		hash(map[string]string{"alertname": "for-firing"}): {
-			GroupID:     fakeGroup.ID(),
+			GroupID:     fakeGroup.GetID(),
 			Name:        "for-firing",
 			Labels:      map[string]string{"alertname": "for-firing"},
 			Annotations: map[string]string{"activeAt": "1000"},
@@ -664,7 +690,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 		{State: notifier.StatePending, ActiveAt: time.Unix(5, 0)},
 	}, map[uint64]*notifier.Alert{
 		hash(map[string]string{"alertname": "for-hold-pending"}): {
-			GroupID:     fakeGroup.ID(),
+			GroupID:     fakeGroup.GetID(),
 			Name:        "for-hold-pending",
 			Labels:      map[string]string{"alertname": "for-hold-pending"},
 			Annotations: map[string]string{"activeAt": "5000"},
@@ -719,7 +745,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 		},
 	}, map[uint64]*notifier.Alert{
 		hash(map[string]string{"alertname": "multi-series"}): {
-			GroupID:     fakeGroup.ID(),
+			GroupID:     fakeGroup.GetID(),
 			Name:        "multi-series",
 			Labels:      map[string]string{"alertname": "multi-series"},
 			Annotations: map[string]string{},
@@ -730,7 +756,7 @@ func TestAlertingRuleExecRange(t *testing.T) {
 			For:         3 * time.Second,
 		},
 		hash(map[string]string{"alertname": "multi-series", "foo": "bar"}): {
-			GroupID:     fakeGroup.ID(),
+			GroupID:     fakeGroup.GetID(),
 			Name:        "multi-series",
 			Labels:      map[string]string{"alertname": "multi-series", "foo": "bar"},
 			Annotations: map[string]string{},
@@ -789,6 +815,7 @@ func TestGroup_Restore(t *testing.T) {
 		}
 
 		fg := NewGroup(config.Group{Name: "TestRestore", Rules: rules}, fqr, time.Second, nil)
+		fg.Init()
 		wg := sync.WaitGroup{}
 		wg.Add(1)
 		go func() {
@@ -840,7 +867,7 @@ func TestGroup_Restore(t *testing.T) {
 
 	// one active alert, no previous state
 	fn(
-		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutils.NewDuration(time.Second)}},
+		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutil.NewDuration(time.Second)}},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore"}): {
 				Name:     "foo",
@@ -854,7 +881,7 @@ func TestGroup_Restore(t *testing.T) {
 	fqr.Set(`default_rollup(ALERTS_FOR_STATE{alertgroup="TestRestore",alertname="foo"}[3600s])`,
 		stateMetric("foo", ts))
 	fn(
-		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutils.NewDuration(time.Second)}},
+		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutil.NewDuration(time.Second)}},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore"}): {
 				Name:     "foo",
@@ -868,8 +895,8 @@ func TestGroup_Restore(t *testing.T) {
 		stateMetric("bar", ts))
 	fn(
 		[]config.Rule{
-			{Alert: "foo", Expr: "foo", For: promutils.NewDuration(time.Second)},
-			{Alert: "bar", Expr: "bar", For: promutils.NewDuration(time.Second)},
+			{Alert: "foo", Expr: "foo", For: promutil.NewDuration(time.Second)},
+			{Alert: "bar", Expr: "bar", For: promutil.NewDuration(time.Second)},
 		},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore"}): {
@@ -890,8 +917,8 @@ func TestGroup_Restore(t *testing.T) {
 		stateMetric("bar", ts))
 	fn(
 		[]config.Rule{
-			{Alert: "foo", Expr: "foo", For: promutils.NewDuration(time.Second)},
-			{Alert: "bar", Expr: "bar", For: promutils.NewDuration(time.Second)},
+			{Alert: "foo", Expr: "foo", For: promutil.NewDuration(time.Second)},
+			{Alert: "bar", Expr: "bar", For: promutil.NewDuration(time.Second)},
 		},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore"}): {
@@ -909,7 +936,7 @@ func TestGroup_Restore(t *testing.T) {
 	fqr.Set(`default_rollup(ALERTS_FOR_STATE{alertname="bar",alertgroup="TestRestore"}[3600s])`,
 		stateMetric("wrong alert", ts))
 	fn(
-		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutils.NewDuration(time.Second)}},
+		[]config.Rule{{Alert: "foo", Expr: "foo", For: promutil.NewDuration(time.Second)}},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore"}): {
 				Name:     "foo",
@@ -922,7 +949,7 @@ func TestGroup_Restore(t *testing.T) {
 	fqr.Set(`default_rollup(ALERTS_FOR_STATE{alertgroup="TestRestore",alertname="foo",env="dev"}[3600s])`,
 		stateMetric("foo", ts, "env", "dev"))
 	fn(
-		[]config.Rule{{Alert: "foo", Expr: "foo", Labels: map[string]string{"env": "dev"}, For: promutils.NewDuration(time.Second)}},
+		[]config.Rule{{Alert: "foo", Expr: "foo", Labels: map[string]string{"env": "dev"}, For: promutil.NewDuration(time.Second)}},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore", "env": "dev"}): {
 				Name:     "foo",
@@ -930,12 +957,12 @@ func TestGroup_Restore(t *testing.T) {
 			},
 		})
 
-	// one active alert with restore labels missmatch
+	// one active alert with restore labels mismatch
 	ts = time.Now().Truncate(time.Hour)
 	fqr.Set(`default_rollup(ALERTS_FOR_STATE{alertgroup="TestRestore",alertname="foo",env="dev"}[3600s])`,
 		stateMetric("foo", ts, "env", "dev", "team", "foo"))
 	fn(
-		[]config.Rule{{Alert: "foo", Expr: "foo", Labels: map[string]string{"env": "dev"}, For: promutils.NewDuration(time.Second)}},
+		[]config.Rule{{Alert: "foo", Expr: "foo", Labels: map[string]string{"env": "dev"}, For: promutil.NewDuration(time.Second)}},
 		map[uint64]*notifier.Alert{
 			hash(map[string]string{alertNameLabel: "foo", alertGroupNameLabel: "TestRestore", "env": "dev"}): {
 				Name:     "foo",
@@ -975,7 +1002,7 @@ func TestAlertingRule_Exec_Negative(t *testing.T) {
 		t.Fatalf("expected to get err; got nil")
 	}
 	if !strings.Contains(err.Error(), expErr) {
-		t.Fatalf("expected to get err %q; got %q insterad", expErr, err)
+		t.Fatalf("expected to get err %q; got %q instead", expErr, err)
 	}
 }
 
@@ -1041,7 +1068,7 @@ func TestAlertingRule_Template(t *testing.T) {
 			Name: "TestRule_Exec",
 		}
 		fq := &datasource.FakeQuerier{}
-		rule.GroupID = fakeGroup.ID()
+		rule.GroupID = fakeGroup.GetID()
 		rule.q = fq
 		rule.state = &ruleState{
 			entries: make([]StateEntry, 10),
@@ -1257,7 +1284,7 @@ func newTestAlertingRule(name string, waitFor time.Duration) *AlertingRule {
 
 func getTestAlertingRuleMetrics(name string) *alertingRuleMetrics {
 	m := &alertingRuleMetrics{}
-	m.errors = utils.NewCounter(metrics.NewSet(), fmt.Sprintf(`vmalert_alerting_rules_errors_total{alertname=%q}`, name))
+	m.errors = vmalertutil.NewCounter(metrics.NewSet(), fmt.Sprintf(`vmalert_alerting_rules_errors_total{alertname=%q}`, name))
 	return m
 }
 
@@ -1319,5 +1346,25 @@ func TestAlertingRule_ToLabels(t *testing.T) {
 
 	if !reflect.DeepEqual(ls.processed, expectedProcessedLabels) {
 		t.Fatalf("processed labels mismatch, got: %v, want: %v", ls.processed, expectedProcessedLabels)
+	}
+}
+
+func TestAlertingRuleExec_Partial(t *testing.T) {
+	fq := &datasource.FakeQuerier{}
+	fq.Add(metricWithValueAndLabels(t, 10, "__name__", "bar"))
+	fq.SetPartialResponse(true)
+
+	ar := newTestAlertingRule("test", 0)
+	ar.Debug = true
+	ar.Labels = map[string]string{"job": "test"}
+	ar.q = fq
+	ar.For = time.Second
+
+	fq.Add(metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "bar"))
+
+	ts := time.Now()
+	_, err := ar.exec(context.TODO(), ts, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
 	}
 }

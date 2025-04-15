@@ -6,19 +6,7 @@ import (
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/slicesutil"
-)
-
-var (
-	// Verify ByteBuffer implements the given interfaces.
-	_ io.Writer           = &ByteBuffer{}
-	_ fs.MustReadAtCloser = &ByteBuffer{}
-	_ io.ReaderFrom       = &ByteBuffer{}
-
-	// Verify reader implement filestream.ReadCloser interface.
-	_ filestream.ReadCloser = &reader{}
 )
 
 // ByteBuffer implements a simple byte buffer.
@@ -34,12 +22,14 @@ func (bb *ByteBuffer) Path() string {
 
 // Reset resets bb.
 func (bb *ByteBuffer) Reset() {
-	if cap(bb.B) > 64*1024 {
-		// It is better dropping too big buffers instead of keeping them around.
-		// This should reduce the overall memory usage, while shouldn't increase time spent in GC too much.
-		bb.B = nil
-	}
 	bb.B = bb.B[:0]
+}
+
+// Grow grows bb capacity, so it can accept n bytes without additional allocations.
+func (bb *ByteBuffer) Grow(n int) {
+	bLen := len(bb.B)
+	bb.B = slicesutil.SetLength(bb.B, bLen+n)
+	bb.B = bb.B[:bLen]
 }
 
 // Write appends p to bb.
@@ -48,35 +38,24 @@ func (bb *ByteBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// MustReadAt reads len(p) bytes starting from the given offset.
-func (bb *ByteBuffer) MustReadAt(p []byte, offset int64) {
-	if offset < 0 {
-		logger.Panicf("BUG: cannot read at negative offset=%d", offset)
-	}
-	if offset > int64(len(bb.B)) {
-		logger.Panicf("BUG: too big offset=%d; cannot exceed len(bb.B)=%d", offset, len(bb.B))
-	}
-	if n := copy(p, bb.B[offset:]); n < len(p) {
-		logger.Panicf("BUG: EOF occurred after reading %d bytes out of %d bytes at offset %d", n, len(p), offset)
-	}
-}
-
 // ReadFrom reads all the data from r to bb until EOF.
 func (bb *ByteBuffer) ReadFrom(r io.Reader) (int64, error) {
 	b := bb.B
 	bLen := len(b)
-	b = ResizeWithCopyMayOverallocate(b, 4*1024)
-	b = b[:cap(b)]
+	if cap(b) < 4*1024 {
+		// Pre-allocate at least 4KiB
+		b = slicesutil.SetLength(b, 4*1024)
+	}
 	offset := bLen
 	for {
-		if free := len(b) - offset; free < offset {
+		if free := cap(b) - offset; free < (cap(b) / 16) {
 			// grow slice by 30% similar to how Go does this
 			// https://go.googlesource.com/go/+/2dda92ff6f9f07eeb110ecbf0fc2d7a0ddd27f9d
 			// higher growth rates could consume excessive memory when reading big amounts of data.
-			n := 1.3 * float64(len(b))
-			b = slicesutil.SetLength(b, int(n))
+			n := int(1.3 * float64(cap(b)))
+			b = slicesutil.SetLength(b, n)
 		}
-		n, err := r.Read(b[offset:])
+		n, err := r.Read(b[offset:cap(b)])
 		offset += n
 		if err != nil {
 			bb.B = b[:offset]
@@ -86,11 +65,6 @@ func (bb *ByteBuffer) ReadFrom(r io.Reader) (int64, error) {
 			return int64(offset - bLen), err
 		}
 	}
-}
-
-// MustClose closes bb for subsequent re-use.
-func (bb *ByteBuffer) MustClose() {
-	// Do nothing, since certain code rely on bb reading after MustClose call.
 }
 
 // NewReader returns new reader for the given bb.
@@ -123,7 +97,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// MustClose closes bb for subsequent re-use.
+// MustClose closes bb for subsequent reuse.
 func (r *reader) MustClose() {
 	r.bb = nil
 	r.readOffset = 0

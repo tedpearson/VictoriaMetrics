@@ -1,6 +1,7 @@
 package apptest
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -24,6 +25,7 @@ type Vmsingle struct {
 
 	// vmstorage URLs.
 	forceFlushURL string
+	forceMergeURL string
 
 	// vminsert URLs.
 	influxLineWriteURL                 string
@@ -64,7 +66,9 @@ func StartVmsingle(instance string, flags []string, cli *Client) (*Vmsingle, err
 		storageDataPath: stderrExtracts[0],
 		httpListenAddr:  stderrExtracts[1],
 
-		forceFlushURL:                      fmt.Sprintf("http://%s/internal/force_flush", stderrExtracts[1]),
+		forceFlushURL: fmt.Sprintf("http://%s/internal/force_flush", stderrExtracts[1]),
+		forceMergeURL: fmt.Sprintf("http://%s/internal/force_merge", stderrExtracts[1]),
+
 		influxLineWriteURL:                 fmt.Sprintf("http://%s/influx/write", stderrExtracts[1]),
 		prometheusAPIV1ImportPrometheusURL: fmt.Sprintf("http://%s/prometheus/api/v1/import/prometheus", stderrExtracts[1]),
 		prometheusAPIV1WriteURL:            fmt.Sprintf("http://%s/prometheus/api/v1/write", stderrExtracts[1]),
@@ -81,6 +85,16 @@ func (app *Vmsingle) ForceFlush(t *testing.T) {
 	t.Helper()
 
 	_, statusCode := app.cli.Get(t, app.forceFlushURL)
+	if statusCode != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d, want %d", statusCode, http.StatusOK)
+	}
+}
+
+// ForceMerge is a test helper function that forces the merging of parts.
+func (app *Vmsingle) ForceMerge(t *testing.T) {
+	t.Helper()
+
+	_, statusCode := app.cli.Get(t, app.forceMergeURL)
 	if statusCode != http.StatusOK {
 		t.Fatalf("unexpected status code: got %d, want %d", statusCode, http.StatusOK)
 	}
@@ -186,6 +200,154 @@ func (app *Vmsingle) PrometheusAPIV1Series(t *testing.T, matchQuery string, opts
 
 	res, _ := app.cli.PostForm(t, app.prometheusAPIV1SeriesURL, values)
 	return NewPrometheusAPIV1SeriesResponse(t, res)
+}
+
+// APIV1StatusMetricNamesStats sends a query to a /api/v1/status/metric_names_stats endpoint
+// and returns the statistics response for given params.
+//
+// See https://docs.victoriametrics.com/#track-ingested-metrics-usage
+func (app *Vmsingle) APIV1StatusMetricNamesStats(t *testing.T, limit, le, matchPattern string, opts QueryOpts) MetricNamesStatsResponse {
+	t.Helper()
+
+	values := opts.asURLValues()
+	values.Add("limit", limit)
+	values.Add("le", le)
+	values.Add("match_pattern", matchPattern)
+	queryURL := fmt.Sprintf("http://%s/api/v1/status/metric_names_stats", app.httpListenAddr)
+
+	res, statusCode := app.cli.PostForm(t, queryURL, values)
+	if statusCode != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", statusCode, http.StatusOK, res)
+	}
+	var resp MetricNamesStatsResponse
+	if err := json.Unmarshal([]byte(res), &resp); err != nil {
+		t.Fatalf("could not unmarshal metric names stats response data:\n%s\n err: %v", res, err)
+	}
+	return resp
+}
+
+// APIV1AdminStatusMetricNamesStatsReset sends a query to a /api/v1/admin/status/metric_names_stats/reset endpoint
+//
+// See https://docs.victoriametrics.com/#Trackingestedmetricsusage
+func (app *Vmsingle) APIV1AdminStatusMetricNamesStatsReset(t *testing.T, opts QueryOpts) {
+	t.Helper()
+
+	values := opts.asURLValues()
+	queryURL := fmt.Sprintf("http://%s/api/v1/admin/status/metric_names_stats/reset", app.httpListenAddr)
+
+	res, statusCode := app.cli.PostForm(t, queryURL, values)
+	if statusCode != http.StatusNoContent {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", statusCode, http.StatusNoContent, res)
+	}
+}
+
+// SnapshotCreate creates a database snapshot by sending a query to the
+// /snapshot/create endpoint.
+//
+// See https://docs.victoriametrics.com/single-server-victoriametrics/#how-to-work-with-snapshots
+func (app *Vmsingle) SnapshotCreate(t *testing.T) *SnapshotCreateResponse {
+	t.Helper()
+
+	queryURL := fmt.Sprintf("http://%s/snapshot/create", app.httpListenAddr)
+	data, statusCode := app.cli.Post(t, queryURL, "", nil)
+	if got, want := statusCode, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", got, want, data)
+	}
+
+	var res SnapshotCreateResponse
+	if err := json.Unmarshal([]byte(data), &res); err != nil {
+		t.Fatalf("could not unmarshal snapshot create response: data=%q, err: %v", data, err)
+	}
+
+	return &res
+}
+
+// APIV1AdminTSDBSnapshot creates a database snapshot by sending a query to the
+// /api/v1/admin/tsdb/snapshot endpoint.
+//
+// See https://prometheus.io/docs/prometheus/latest/querying/api/#snapshot.
+func (app *Vmsingle) APIV1AdminTSDBSnapshot(t *testing.T) *APIV1AdminTSDBSnapshotResponse {
+	t.Helper()
+
+	queryURL := fmt.Sprintf("http://%s/api/v1/admin/tsdb/snapshot", app.httpListenAddr)
+	data, statusCode := app.cli.Post(t, queryURL, "", nil)
+	if got, want := statusCode, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", got, want, data)
+	}
+
+	var res APIV1AdminTSDBSnapshotResponse
+	if err := json.Unmarshal([]byte(data), &res); err != nil {
+		t.Fatalf("could not unmarshal prometheus snapshot create response: data=%q, err: %v", data, err)
+	}
+
+	return &res
+}
+
+// SnapshotList lists existing database snapshots by sending a query to the
+// /snapshot/list endpoint.
+//
+// See https://docs.victoriametrics.com/single-server-victoriametrics/#how-to-work-with-snapshots
+func (app *Vmsingle) SnapshotList(t *testing.T) *SnapshotListResponse {
+	t.Helper()
+
+	queryURL := fmt.Sprintf("http://%s/snapshot/list", app.httpListenAddr)
+	data, statusCode := app.cli.Get(t, queryURL)
+	if got, want := statusCode, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", got, want, data)
+	}
+
+	var res SnapshotListResponse
+	if err := json.Unmarshal([]byte(data), &res); err != nil {
+		t.Fatalf("could not unmarshal snapshot list response: data=%q, err: %v", data, err)
+	}
+
+	return &res
+}
+
+// SnapshotDelete deletes a snapshot by sending a query to the
+// /snapshot/delete endpoint.
+//
+// See https://docs.victoriametrics.com/single-server-victoriametrics/#how-to-work-with-snapshots
+func (app *Vmsingle) SnapshotDelete(t *testing.T, snapshotName string) *SnapshotDeleteResponse {
+	t.Helper()
+
+	queryURL := fmt.Sprintf("http://%s/snapshot/delete?snapshot=%s", app.httpListenAddr, snapshotName)
+	data, statusCode := app.cli.Delete(t, queryURL)
+	wantStatusCodes := map[int]bool{
+		http.StatusOK:                  true,
+		http.StatusInternalServerError: true,
+	}
+	if !wantStatusCodes[statusCode] {
+		t.Fatalf("unexpected status code: got %d, want %v, resp text=%q", statusCode, wantStatusCodes, data)
+	}
+
+	var res SnapshotDeleteResponse
+	if err := json.Unmarshal([]byte(data), &res); err != nil {
+		t.Fatalf("could not unmarshal snapshot delete response: data=%q, err: %v", data, err)
+	}
+
+	return &res
+}
+
+// SnapshotDeleteAll deletes all snapshots by sending a query to the
+// /snapshot/delete_all endpoint.
+//
+// See https://docs.victoriametrics.com/single-server-victoriametrics/#how-to-work-with-snapshots
+func (app *Vmsingle) SnapshotDeleteAll(t *testing.T) *SnapshotDeleteAllResponse {
+	t.Helper()
+
+	queryURL := fmt.Sprintf("http://%s/snapshot/delete_all", app.httpListenAddr)
+	data, statusCode := app.cli.Get(t, queryURL)
+	if got, want := statusCode, http.StatusOK; got != want {
+		t.Fatalf("unexpected status code: got %d, want %d, resp text=%q", got, want, data)
+	}
+
+	var res SnapshotDeleteAllResponse
+	if err := json.Unmarshal([]byte(data), &res); err != nil {
+		t.Fatalf("could not unmarshal snapshot delete all response: data=%q, err: %v", data, err)
+	}
+
+	return &res
 }
 
 // String returns the string representation of the vmsingle app state.

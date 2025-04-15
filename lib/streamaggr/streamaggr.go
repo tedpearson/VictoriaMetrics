@@ -20,7 +20,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/valyala/histogram"
@@ -54,7 +54,7 @@ var supportedOutputs = []string{
 
 var (
 	// lc contains information about all compressed labels for streaming aggregation
-	lc promutils.LabelsCompressor
+	lc promutil.LabelsCompressor
 
 	_ = metrics.NewGauge(`vm_streamaggr_labels_compressor_size_bytes`, func() float64 {
 		return float64(lc.SizeBytes())
@@ -360,7 +360,7 @@ func (a *Aggregators) Equal(b *Aggregators) bool {
 // Otherwise matchIdxs[idx] is set to 0.
 //
 // Push returns matchIdxs with len equal to len(tss).
-// It re-uses the matchIdxs if it has enough capacity to hold len(tss) items.
+// It reuses the matchIdxs if it has enough capacity to hold len(tss) items.
 // Otherwise it allocates new matchIdxs.
 func (a *Aggregators) Push(tss []prompbmarshal.TimeSeries, matchIdxs []byte) []byte {
 	matchIdxs = bytesutil.ResizeNoCopyMayOverallocate(matchIdxs, len(tss))
@@ -921,15 +921,12 @@ func (a *aggregator) dedupFlush(dedupTime time.Time, cs *currentState) {
 //
 // If pushFunc is nil, then the aggregator state is just reset.
 func (a *aggregator) flush(pushFunc PushFunc, flushTime time.Time, cs *currentState, isLast bool) {
-	if a.dedupInterval > 0 {
-		a.minDeadline.Store(cs.maxDeadline)
-	}
-
 	startTime := time.Now()
 	ao := a.aggrOutputs
 
 	ctx := getFlushCtx(a, ao, pushFunc, flushTime.UnixMilli(), isLast)
 	if a.dedupInterval <= 0 {
+		a.minDeadline.Store(cs.maxDeadline)
 		ctx.isGreen = cs.isGreen
 	}
 	ao.flushState(ctx)
@@ -1080,9 +1077,9 @@ func decompressLabels(dst []prompbmarshal.Label, key string) []prompbmarshal.Lab
 type pushCtx struct {
 	green        []pushSample
 	blue         []pushSample
-	labels       promutils.Labels
-	inputLabels  promutils.Labels
-	outputLabels promutils.Labels
+	labels       promutil.Labels
+	inputLabels  promutil.Labels
+	outputLabels promutil.Labels
 	buf          []byte
 }
 
@@ -1097,7 +1094,7 @@ func (ctx *pushCtx) reset() {
 
 type pushSample struct {
 	// key identifies a sample that belongs to unique series
-	// key value can't be re-used
+	// key value can't be reused
 	key       string
 	value     float64
 	timestamp int64
@@ -1213,7 +1210,7 @@ func (ctx *flushCtx) flushSeries() {
 	}
 
 	// Slow path - apply output relabeling and then push the output metrics.
-	auxLabels := promutils.GetLabels()
+	auxLabels := promutil.GetLabels()
 	dstLabels := auxLabels.Labels[:0]
 	dst := tss[:0]
 	for _, ts := range tss {
@@ -1232,7 +1229,7 @@ func (ctx *flushCtx) flushSeries() {
 		ctx.ao.outputSamples.Add(len(dst))
 	}
 	auxLabels.Labels = dstLabels
-	promutils.PutLabels(auxLabels)
+	promutil.PutLabels(auxLabels)
 }
 
 func (ctx *flushCtx) appendSeries(key, suffix string, value float64) {

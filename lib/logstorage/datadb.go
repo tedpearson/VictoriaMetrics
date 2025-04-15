@@ -29,10 +29,6 @@ const maxBigPartSize = 1e12
 // cannot keep up with the rate of creating new in-memory parts.
 const maxInmemoryPartsPerPartition = 20
 
-// The interval for guaranteed flush of recently ingested data from memory to on-disk parts,
-// so they survive process crash.
-var dataFlushInterval = 5 * time.Second
-
 // Default number of parts to merge at once.
 //
 // This number has been obtained empirically - it gives the lowest possible overhead.
@@ -170,7 +166,7 @@ func mustOpenDatadb(pt *partition, path string, flushInterval time.Duration) *da
 		if !fs.IsPathExist(partPath) {
 			partsFile := filepath.Join(path, partsFilename)
 			logger.Panicf("FATAL: part %q is listed in %q, but is missing on disk; "+
-				"ensure %q contents is not corrupted; remove %q to rebuild its' content from the list of existing parts",
+				"ensure %q contents is not corrupted; remove %q to rebuild its content from the list of existing parts",
 				partPath, partsFile, partsFile, partsFile)
 		}
 
@@ -272,7 +268,7 @@ func (ddb *datadb) startInmemoryPartsFlusher() {
 
 func (ddb *datadb) inmemoryPartsFlusher() {
 	// Do not add jitter to d in order to guarantee the flush interval
-	ticker := time.NewTicker(dataFlushInterval)
+	ticker := time.NewTicker(ddb.flushInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -790,7 +786,7 @@ func (ddb *datadb) updateStats(s *DatadbStats) {
 	ddb.partsLock.Unlock()
 }
 
-// debugFlush() makes sure that the recently ingested data is availalbe for search.
+// debugFlush() makes sure that the recently ingested data is available for search.
 func (ddb *datadb) debugFlush() {
 	// Nothing to do, since all the ingested data is available for search via ddb.inmemoryParts.
 }

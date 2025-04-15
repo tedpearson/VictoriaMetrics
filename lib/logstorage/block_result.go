@@ -312,10 +312,8 @@ func (br *blockResult) addResultColumnConst(rc *resultColumn) {
 	})
 }
 
-// initAllColumns initializes all the columns in br.
-func (br *blockResult) initAllColumns() {
-	unneededColumnNames := br.bs.bsw.so.unneededColumnNames
-
+// initAllColumns initializes all the columns in br except of unneededColumnNames.
+func (br *blockResult) initAllColumns(unneededColumnNames []string) {
 	if !slices.Contains(unneededColumnNames, "_time") {
 		// Add _time column
 		br.addTimeColumn()
@@ -373,9 +371,9 @@ func (br *blockResult) initAllColumns() {
 	br.csInitFast()
 }
 
-// initRequestedColumns initialized only requested columns in br.
-func (br *blockResult) initRequestedColumns() {
-	for _, columnName := range br.bs.bsw.so.neededColumnNames {
+// initRequestedColumns initializes neededColumnNames at br.
+func (br *blockResult) initRequestedColumns(neededColumnNames []string) {
+	for _, columnName := range neededColumnNames {
 		switch columnName {
 		case "_stream_id":
 			br.addStreamIDColumn()
@@ -1368,7 +1366,7 @@ func (br *blockResult) getBucketedFloat64Values(c *blockResultColumn, bf *byStat
 	fMin := truncateFloat64(minValue, p10, bucketSizeP10, bf.bucketOffset)
 	fMax := truncateFloat64(maxValue, p10, bucketSizeP10, bf.bucketOffset)
 	if fMin == fMax {
-		// Fast path - all the trucated values in the block are the same.
+		// Fast path - all the truncated values in the block are the same.
 		buf := br.a.b
 		bufLen := len(buf)
 		buf = marshalFloat64String(buf, fMin)
@@ -1988,7 +1986,7 @@ func (br *blockResult) truncateRows(keepRows int) {
 // blockResultColumn represents named column from blockResult.
 //
 // blockResultColumn doesn't own any referred data - all the referred data must be owned by blockResult.
-// This simplifies copying, resetting and re-using of the struct.
+// This simplifies copying, resetting and reusing of the struct.
 type blockResultColumn struct {
 	// name is column name
 	name string
@@ -2489,7 +2487,13 @@ func getEmptyStrings(rowsLen int) []string {
 		return values
 	}
 	values := *p
-	return slicesutil.SetLength(values, rowsLen)
+	needStore := cap(values) < rowsLen
+	values = slicesutil.SetLength(values, rowsLen)
+	if needStore {
+		valuesLocal := values
+		emptyStrings.Store(&valuesLocal)
+	}
+	return values
 }
 
 var emptyStrings atomic.Pointer[[]string]

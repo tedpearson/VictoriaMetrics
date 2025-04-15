@@ -76,6 +76,11 @@ var (
 		"This may improve performance and decrease disk space usage for the use cases with fixed set of timeseries scattered across a "+
 		"big time range (for example, when loading years of historical data). "+
 		"See https://docs.victoriametrics.com/single-server-victoriametrics/#index-tuning")
+	trackMetricNamesStats = flag.Bool("storage.trackMetricNamesStats", false, "Whether to track ingest and query requests for timeseries metric names. "+
+		"This feature allows to track metric names unused at query requests. "+
+		"See https://docs.victoriametrics.com/#track-ingested-metrics-usage")
+	cacheSizeMetricNamesStats = flagutil.NewBytes("storage.cacheSizeMetricNamesStats", 0, "Overrides max size for storage/metricNamesStatsTracker cache. "+
+		"See https://docs.victoriametrics.com/single-server-victoriametrics/#cache-tuning")
 )
 
 // CheckTimeRange returns true if the given tr is denied for querying.
@@ -105,6 +110,7 @@ func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
 	storage.SetTSIDCacheSize(cacheSizeStorageTSID.IntN())
 	storage.SetTagFiltersCacheSize(cacheSizeIndexDBTagFilters.IntN())
+	storage.SetMetricNamesStatsCacheSize(cacheSizeMetricNamesStats.IntN())
 	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.IntN())
 	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.IntN())
 	mergeset.SetDataBlocksSparseCacheSize(cacheSizeIndexDBDataBlocksSparse.IntN())
@@ -115,12 +121,12 @@ func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
-
 	opts := storage.OpenOptions{
-		Retention:          retentionPeriod.Duration(),
-		MaxHourlySeries:    *maxHourlySeries,
-		MaxDailySeries:     *maxDailySeries,
-		DisablePerDayIndex: *disablePerDayIndex,
+		Retention:             retentionPeriod.Duration(),
+		MaxHourlySeries:       *maxHourlySeries,
+		MaxDailySeries:        *maxDailySeries,
+		DisablePerDayIndex:    *disablePerDayIndex,
+		TrackMetricNamesStats: *trackMetricNamesStats,
 	}
 	strg := storage.MustOpenStorage(*DataPath, opts)
 	Storage = strg
@@ -191,6 +197,21 @@ func DeleteSeries(qt *querytracer.Tracer, tfss []*storage.TagFilters, maxMetrics
 	n, err := Storage.DeleteSeries(qt, tfss, maxMetrics)
 	WG.Done()
 	return n, err
+}
+
+// GetMetricNamesStats returns metric names usage stats with give limit and lte predicate
+func GetMetricNamesStats(qt *querytracer.Tracer, limit, le int, matchPattern string) (storage.MetricNamesStatsResponse, error) {
+	WG.Add(1)
+	r := Storage.GetMetricNamesStats(qt, limit, le, matchPattern)
+	WG.Done()
+	return r, nil
+}
+
+// ResetMetricNamesStats resets state for metric names usage tracker
+func ResetMetricNamesStats(qt *querytracer.Tracer) {
+	WG.Add(1)
+	Storage.ResetMetricNamesStats(qt)
+	WG.Done()
 }
 
 // SearchMetricNames returns metric names for the given tfss on the given tr.
@@ -315,13 +336,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	case "/create":
 		snapshotsCreateTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
-		snapshotPath, err := Storage.CreateSnapshot()
-		if err != nil {
-			err = fmt.Errorf("cannot create snapshot: %w", err)
-			jsonResponseError(w, err)
-			snapshotsCreateErrorsTotal.Inc()
-			return true
-		}
+		snapshotPath := Storage.MustCreateSnapshot()
 		if prometheusCompatibleResponse {
 			fmt.Fprintf(w, `{"status":"success","data":{"name":%s}}`, stringsutil.JSONString(snapshotPath))
 		} else {
@@ -331,13 +346,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	case "/list":
 		snapshotsListTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
-		snapshots, err := Storage.ListSnapshots()
-		if err != nil {
-			err = fmt.Errorf("cannot list snapshots: %w", err)
-			jsonResponseError(w, err)
-			snapshotsListErrorsTotal.Inc()
-			return true
-		}
+		snapshots := Storage.MustListSnapshots()
 		fmt.Fprintf(w, `{"status":"ok","snapshots":[`)
 		if len(snapshots) > 0 {
 			for _, snapshot := range snapshots[:len(snapshots)-1] {
@@ -352,13 +361,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Content-Type", "application/json")
 		snapshotName := r.FormValue("snapshot")
 
-		snapshots, err := Storage.ListSnapshots()
-		if err != nil {
-			err = fmt.Errorf("cannot list snapshots: %w", err)
-			jsonResponseError(w, err)
-			snapshotsDeleteErrorsTotal.Inc()
-			return true
-		}
+		snapshots := Storage.MustListSnapshots()
 		for _, snName := range snapshots {
 			if snName == snapshotName {
 				if err := Storage.DeleteSnapshot(snName); err != nil {
@@ -372,19 +375,13 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 			}
 		}
 
-		err = fmt.Errorf("cannot find snapshot %q", snapshotName)
+		err := fmt.Errorf("cannot find snapshot %q", snapshotName)
 		jsonResponseError(w, err)
 		return true
 	case "/delete_all":
 		snapshotsDeleteAllTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
-		snapshots, err := Storage.ListSnapshots()
-		if err != nil {
-			err = fmt.Errorf("cannot list snapshots: %w", err)
-			jsonResponseError(w, err)
-			snapshotsDeleteAllErrorsTotal.Inc()
-			return true
-		}
+		snapshots := Storage.MustListSnapshots()
 		for _, snapshotName := range snapshots {
 			if err := Storage.DeleteSnapshot(snapshotName); err != nil {
 				err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
@@ -418,10 +415,7 @@ func initStaleSnapshotsRemover(strg *storage.Storage) {
 				return
 			case <-t.C:
 			}
-			if err := strg.DeleteStaleSnapshots(snapshotsMaxAgeDur); err != nil {
-				// Use logger.Errorf instead of logger.Fatalf in the hope the error is temporary.
-				logger.Errorf("cannot delete stale snapshots: %s", err)
-			}
+			strg.MustDeleteStaleSnapshots(snapshotsMaxAgeDur)
 		}
 	}()
 }
@@ -439,11 +433,9 @@ var (
 var (
 	activeForceMerges = metrics.NewCounter("vm_active_force_merges")
 
-	snapshotsCreateTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/create"}`)
-	snapshotsCreateErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/create"}`)
+	snapshotsCreateTotal = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/create"}`)
 
-	snapshotsListTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/list"}`)
-	snapshotsListErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/list"}`)
+	snapshotsListTotal = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/list"}`)
 
 	snapshotsDeleteTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/delete"}`)
 	snapshotsDeleteErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/delete"}`)
@@ -656,6 +648,12 @@ func writeStorageMetrics(w io.Writer, strg *storage.Storage) {
 	metrics.WriteCounterUint64(w, `vm_cache_collisions_total{type="storage/metricName"}`, m.MetricNameCacheCollisions)
 
 	metrics.WriteGaugeUint64(w, `vm_next_retention_seconds`, m.NextRetentionSeconds)
+
+	if *trackMetricNamesStats {
+		metrics.WriteCounterUint64(w, `vm_cache_size_bytes{type="storage/metricNamesStatsTracker"}`, m.MetricNamesUsageTrackerSizeBytes)
+		metrics.WriteCounterUint64(w, `vm_cache_size{type="storage/metricNamesStatsTracker"}`, m.MetricNamesUsageTrackerSize)
+		metrics.WriteCounterUint64(w, `vm_cache_size_max_bytes{type="storage/metricNamesStatsTracker"}`, m.MetricNamesUsageTrackerSizeMaxBytes)
+	}
 
 	metrics.WriteGaugeUint64(w, `vm_downsampling_partitions_scheduled`, tm.ScheduledDownsamplingPartitions)
 	metrics.WriteGaugeUint64(w, `vm_downsampling_partitions_scheduled_size_bytes`, tm.ScheduledDownsamplingPartitionsSize)

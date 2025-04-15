@@ -1,11 +1,11 @@
 ---
-weight: 4
+weight: 5
 title: FAQ
 menu:
   docs:
     identifier: "vmanomaly-faq"
     parent: "anomaly-detection"
-    weight: 4
+    weight: 5
 aliases:
 - /anomaly-detection/FAQ.html
 ---
@@ -84,17 +84,83 @@ models:
 ## Output produced by vmanomaly
 `vmanomaly` models generate [metrics](https://docs.victoriametrics.com/anomaly-detection/components/models#vmanomaly-output) like `anomaly_score`, `yhat`, `yhat_lower`, `yhat_upper`, and `y`. These metrics provide a comprehensive view of the detected anomalies. The service also produces [health check metrics](https://docs.victoriametrics.com/anomaly-detection/components/monitoring#metrics-generated-by-vmanomaly) for monitoring its performance.
 
-## Choosing the right model for vmanomaly
-Selecting the best model for `vmanomaly` depends on the data's nature and the [types of anomalies](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-2/#categories-of-anomalies) to detect. For instance, [Z-score](https://docs.victoriametrics.com/anomaly-detection/components/models#z-score) is suitable for data without trends or seasonality, while more complex patterns might require models like [Prophet](https://docs.victoriametrics.com/anomaly-detection/components/models#prophet).
+## Visualizations  
 
-Also, it's possible to auto-tune the most important params of selected model class {{% available_from "v1.12.0" anomaly %}}, find [the details here](https://docs.victoriametrics.com/anomaly-detection/components/models#autotuned).
+To visualize and interact with both [self-monitoring metrics](https://docs.victoriametrics.com/anomaly-detection/components/monitoring/) and [produced anomaly scores](#what-is-anomaly-score), `vmanomaly` provides respective Grafana dashboards:
+
+- For guidance on using the `vmanomaly` Grafana dashboard and drilling down into anomaly score visualizations, refer to the [default preset section](https://docs.victoriametrics.com/anomaly-detection/presets/#default).  
+- To monitor `vmanomaly` health, operational performance, and potential issues in real time, visit the [self-monitoring section](https://docs.victoriametrics.com/anomaly-detection/self-monitoring/).
+
+
+## Choosing the right model for vmanomaly
+Selecting the best model for `vmanomaly` depends on the data's nature and the [types of anomalies](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-2/#categories-of-anomalies) to detect. For instance, [Z-score](https://docs.victoriametrics.com/anomaly-detection/components/models#online-z-score) is suitable for data without trends or seasonality, while more complex patterns might require models like [Prophet](https://docs.victoriametrics.com/anomaly-detection/components/models#prophet).
+
+Also, there is an option to auto-tune the most important (hyper)parameters of selected model class {{% available_from "v1.12.0" anomaly %}}, find [the details here](https://docs.victoriametrics.com/anomaly-detection/components/models#autotuned).
 
 Please refer to [respective blogpost on anomaly types and alerting heuristics](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-2/) for more details.
 
 Still not 100% sure what to use? We are [here to help](https://docs.victoriametrics.com/anomaly-detection/#get-in-touch).
 
+## Incorporating domain knowledge
+
+Anomaly detection models can significantly improve when incorporating business-specific assumptions about the data and what constitutes an anomaly. `vmanomaly` supports various [business-side configuration parameters](https://docs.victoriametrics.com/anomaly-detection/components/models/#common-args) across all built-in models to **reduce [false positives](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-1/#false-positive)** and **align model behavior with business needs**, for example:
+
+- **Setting `detection_direction`** – use [`detection_direction`](https://docs.victoriametrics.com/anomaly-detection/components/models/#detection-direction) to specify whether anomalies occur **above or below expectations**:
+  - Set to `above_expected` for metrics like error rates, where spikes indicate anomalies.
+  - Set to `below_expected` for metrics like customer satisfaction scores or SLAs, where drops indicate anomalies.
+
+- **Defining a `data_range`** – configure [`data_range`](https://docs.victoriametrics.com/anomaly-detection/components/reader/?highlight=data_range#config-parameters) for the model’s input query to **automatically assign anomaly scores > 1** for values (`y`) that fall outside the defined range.
+
+- **Filtering minor fluctuations with `min_dev_from_expected`** – use [`min_dev_from_expected`](https://docs.victoriametrics.com/anomaly-detection/components/models/#minimal-deviation-from-expected) to **ignore insignificant deviations** and prevent small fluctuations from triggering [false positives](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-1/#false-positive).
+
+- **Applying `scale` for asymmetric confidence adjustments** – use [`scale`](https://docs.victoriametrics.com/anomaly-detection/components/models/#scale) to adjust confidence intervals **differently for spikes and drops**, ensuring more appropriate anomaly detection.
+
+**Example:**
+
+Consider a metric tracking the percentage of HTTP 4xx status codes for a specific endpoint. Hypothetical business expectations for anomaly detection may be defined as follows:
+
+- **Expected data range**: The percentage naturally falls between `0%` and `100%` (`[0, 1]`).
+- **Threshold-based anomaly detection**: If the error rate exceeds `5%`, it should be **automatically flagged as an anomaly** ([anomaly score](#what-is-anomaly-score) > 1), encouraging an incident investigation.
+- **Regime shift detection**: A **continuous increase** in error rates (e.g., from `1.5%` to `3%`) should also be considered **anomalous**, as regime change may indicate underlying system problem, e.g. with a new release.
+- **Avoiding false positives**: **Small, infrequent deviations** (e.g., from `1%` to `1.3%`) should **not** trigger alerts to **prevent unnecessary SRE escalations**. Let it be on the level of 0.5%.
+
+Then, the following config may be used to benefit from incorporating domain knowledge into model behavior:
+
+```yaml
+# other sections, like writer, monitoring ...
+schedulers:
+  periodic_http:
+    class: periodic
+    fit_every: 12w
+    fit_window: 1w
+    infer_every: 1m
+  # other schedulers ...
+reader:
+  # other reader args, like datasource_url, tenant_id ...
+  queries:
+    percentage_4xx:
+      expr: respective_metricsQL_expr
+      data_range: [0, 0.05]  # to automatically trigger anomaly score > 1 for error rates > 5%
+      step: 1m
+models:
+  # other models ...
+  zscore:  # let it be online Z-score, for simplicity
+    class: zscore_online  # online model update itself each infer call, resulting in resource-efficient setups
+    z_threshold: 3.0
+    schedulers: ['periodic_http']
+    queries: ['percentage_4xx']
+    detection_direction: 'above_expected'  # as interested only in spikes, drops are OK
+    min_dev_from_expected: 0.005  # <0.5% deviations vs expected values should be neglected, generating anomaly score == 0
+    # to align predictions to be within [0, 5%] interval, defined in reader.queries.percentage_4xx.data_range
+    clip_predictions: True
+    # specify output series produced by vmanomaly to be written to VictoriaMetrics in `writer`
+    provide_series: ['anomaly_score', 'y', 'yhat', 'yhat_lower', 'yhat_upper']
+```
+
 ## Alert generation in vmanomaly
-While `vmanomaly` detects anomalies and produces scores, it *does not directly generate alerts*. The anomaly scores are written back to VictoriaMetrics, where an external alerting tool, like [`vmalert`](https://docs.victoriametrics.com/vmalert), can be used to create alerts based on these scores for integrating it with your alerting management system.
+While `vmanomaly` detects anomalies and produces scores, it *does not directly generate alerts*. The anomaly scores are written back to VictoriaMetrics, where respective alerting tool, like [`vmalert`](https://docs.victoriametrics.com/vmalert), can be used to create alerts based on these scores for integrating it with your alerting management system. See an example diagram of how `vmanomaly` integrates into observability pipeline for anomaly detection on `node_exporter` metrics:
+
+<img src="https://docs.victoriametrics.com/anomaly-detection/guides/guide-vmanomaly-vmalert/guide-vmanomaly-vmalert_overview.webp" alt="node_exporter_example_diagram" style="width:60%"/>
 
 ## Preventing alert fatigue
 Produced anomaly scores are designed in such a way that values from 0.0 to 1.0 indicate non-anomalous data, while a value greater than 1.0 is generally classified as an anomaly. However, there are no perfect models for anomaly detection, that's why reasonable defaults expressions like `anomaly_score > 1` may not work 100% of the time. However, anomaly scores, produced by `vmanomaly` are written back as metrics to VictoriaMetrics, where tools like [`vmalert`](https://docs.victoriametrics.com/vmalert) can use [MetricsQL](https://docs.victoriametrics.com/metricsql/) expressions to fine-tune alerting thresholds and conditions, balancing between avoiding [false negatives](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-1/#false-negative) and reducing [false positives](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-1/#false-positive).
@@ -158,7 +224,7 @@ services:
   # ...
   vmanomaly:
     container_name: vmanomaly
-    image: victoriametrics/vmanomaly:v1.19.2
+    image: victoriametrics/vmanomaly:v1.21.0
     # ...
     ports:
       - "8490:8490"
@@ -253,7 +319,6 @@ P.s. `infer` data volume will remain the same for both models, so it does not af
 
 ## Handling large queries in vmanomaly
 
-
 If you're dealing with a large query in the `queries` argument of [VmReader](https://docs.victoriametrics.com/anomaly-detection/components/reader/#vm-reader) (especially when running [within a scheduler using a long](https://docs.victoriametrics.com/anomaly-detection/components/scheduler/?highlight=fit_window#periodic-scheduler) `fit_window`), you may encounter issues such as query timeouts (due to the `search.maxQueryDuration` server limit) or rejections (if the `search.maxPointsPerTimeseries` server limit is exceeded). 
 
 We recommend upgrading to [v1.17.2](https://docs.victoriametrics.com/anomaly-detection/changelog/#v1171) (or newer), which introduced the `max_points_per_query` argument (both global and [query-specific](https://docs.victoriametrics.com/anomaly-detection/components/reader/#per-query-parameters)) for the [VmReader](https://docs.victoriametrics.com/anomaly-detection/components/reader/#vm-reader). This argument overrides how `search.maxPointsPerTimeseries` flag handling (introduced in [v1.14.1](https://docs.victoriametrics.com/anomaly-detection/changelog/#v1141)) is used in `vmanomaly` for splitting long `fit_window` queries into smaller sub-intervals. This helps users avoid hitting the `search.maxQueryDuration` limit for individual queries by distributing initial query across multiple subquery requests with minimal overhead.
@@ -323,7 +388,7 @@ Please note that this approach may not fully resolve the issue if subqueries are
 
 ## Scaling vmanomaly
 
-> **Note:** As of latest release we do not support cluster or auto-scaled version yet (though, it's in our roadmap for - better backends, more parallelization, etc.), so proposed workarounds should be addressed *manually*.
+> Note: {{% available_from "v1.21.0" anomaly %}} `vmanomaly` supports [horizontal scalability](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly#horizontal-scalability) via sub-config sharding and [high availability](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly#high-availability) through sub-config replication. Please find the instructions on [dedicated page](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly). Prior to [v1.21.0](https://docs.victoriametrics.com/anomaly-detection/changelog#v1210) it should be addressed *manually* e.g. with the help of `config_splitting` util, follow the intuition [below](#splitting-the-config).
 
 `vmanomaly` supports **vertical** scalability, benefiting from additional CPU cores (resulting in faster processing times) and increased RAM (allowing more models to be trained and larger volumes of timeseries data to be processed efficiently).
 
@@ -331,7 +396,7 @@ For **horizontal** scalability, `vmanomaly` can be deployed as multiple independ
 
 - Splitting by **queries** [defined in the reader section](https://docs.victoriametrics.com/anomaly-detection/components/reader#vm-reader) and assigning each subset to a separate service instance should be used when having *a single query returning a large number of timeseries*. This can be further split by applying global MetricsQL filters using the `extra_filters` [parameter in the reader](https://docs.victoriametrics.com/anomaly-detection/components/reader?highlight=extra_filters#vm-reader). See example below.
 
-- Spliting by **models** should be used when running multiple models on the same query. This is commonly done to reduce false positives by alerting only if multiple models detect an anomaly. See the `queries` argument in the [model configuration](https://docs.victoriametrics.com/anomaly-detection/components/models#queries). Additionally, this approach is useful when you just have a large set of resource-intensive independent models.
+- Splitting by **models** should be used when running multiple models on the same query. This is commonly done to reduce [false positives](https://victoriametrics.com/blog/victoriametrics-anomaly-detection-handbook-chapter-1/#false-positive) by alerting only if multiple models detect an anomaly. See the `queries` argument in the [model configuration](https://docs.victoriametrics.com/anomaly-detection/components/models#queries). Additionally, this approach is useful when you just have a large set of resource-intensive independent models.
 
 - Splitting by **schedulers** should be used when the same models needs to be trained or inferred under different schedules. Refer to the `schedulers` argument in the [model section](https://docs.victoriametrics.com/anomaly-detection/components/models#schedulers) and the `scheduler` [component documentation](https://docs.victoriametrics.com/anomaly-detection/components/scheduler).
 
@@ -365,7 +430,7 @@ options:
 Here’s an example of using the config splitter to divide configurations based on the `extra_filters` argument from the reader section:
 
 ```sh
-docker pull victoriametrics/vmanomaly:v1.19.2 && docker image tag victoriametrics/vmanomaly:v1.19.2 vmanomaly
+docker pull victoriametrics/vmanomaly:v1.21.0 && docker image tag victoriametrics/vmanomaly:v1.21.0 vmanomaly
 ```
 
 ```sh

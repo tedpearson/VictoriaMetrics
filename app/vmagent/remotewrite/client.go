@@ -14,11 +14,11 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/awsapi"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/protoparserutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ratelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
@@ -124,14 +124,14 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 	if err != nil {
 		logger.Fatalf("cannot initialize AWS Config for -remoteWrite.url=%q: %s", remoteWriteURL, err)
 	}
-	tr := &http.Transport{
-		DialContext:         netutil.NewStatDialFunc("vmagent_remotewrite"),
-		TLSHandshakeTimeout: tlsHandshakeTimeout.GetOptionalArg(argIdx),
-		MaxConnsPerHost:     2 * concurrency,
-		MaxIdleConnsPerHost: 2 * concurrency,
-		IdleConnTimeout:     time.Minute,
-		WriteBufferSize:     64 * 1024,
-	}
+
+	tr := httputil.NewTransport(false, "vmagent_remotewrite")
+	tr.TLSHandshakeTimeout = tlsHandshakeTimeout.GetOptionalArg(argIdx)
+	tr.MaxConnsPerHost = 2 * concurrency
+	tr.MaxIdleConnsPerHost = 2 * concurrency
+	tr.IdleConnTimeout = time.Minute
+	tr.WriteBufferSize = 64 * 1024
+
 	pURL := proxyURL.GetOptionalArg(argIdx)
 	if len(pURL) > 0 {
 		if !strings.Contains(pURL, "://") {
@@ -170,7 +170,7 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 		doRequest := func(url string) (*http.Response, error) {
 			return c.doRequest(url, nil)
 		}
-		useVMProto = common.HandleVMProtoClientHandshake(c.remoteWriteURL, doRequest)
+		useVMProto = protoparserutil.HandleVMProtoClientHandshake(c.remoteWriteURL, doRequest)
 		if !useVMProto {
 			logger.Infof("the remote storage at %q doesn't support VictoriaMetrics remote write protocol. Switching to Prometheus remote write protocol. "+
 				"See https://docs.victoriametrics.com/vmagent/#victoriametrics-remote-write-protocol", sanitizedURL)
