@@ -1,3 +1,11 @@
+**Fork notes:**
+
+I maintain this fork for two current reasons:
+- To recompile with support for inserting data more than 3 hours into the future to support forecast data
+- To recompile vmutils (vmbackup primarily) with an older aws s3 library that still works with backblaze b2. The current version in the upstream master branch uses AWS specific checksum headers that backblaze b2 does not support which breaks backups.
+
+Build files are also different as I don't need to build for every architecture or to build victorialogs.
+
 # VictoriaMetrics
 
 ![Latest Release](https://img.shields.io/github/v/release/VictoriaMetrics/VictoriaMetrics?sort=semver&label=&filter=!*-victorialogs&logo=github&labelColor=gray&color=gray&link=https%3A%2F%2Fgithub.com%2FVictoriaMetrics%2FVictoriaMetrics%2Freleases%2Flatest)
