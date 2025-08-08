@@ -1604,7 +1604,7 @@ as their values are always increasing. Downsampling [gauges](https://docs.victor
 and [summaries](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#summary) lose some changes within the downsampling interval,
 since only the last sample on the given interval is left and the rest of samples are dropped.
 
-You can use [recording rules](https://docs.victoriametrics.com/victoriametrics/vmalert/#rules) or [steaming aggregation](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/)
+You can use [recording rules](https://docs.victoriametrics.com/victoriametrics/vmalert/#rules) or [streaming aggregation](https://docs.victoriametrics.com/victoriametrics/stream-aggregation/)
 to apply custom aggregation functions, like min/max/avg etc., in order to make gauges more resilient to downsampling.
 
 Downsampling can reduce disk space usage and improve query performance if it is applied to time series with big number
@@ -1805,7 +1805,7 @@ VictoriaMetrics enhances Prometheus stats with `requestsCount` and `lastRequestT
 VictoriaMetrics can track statistics of fetched [metric names](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#structure-of-a-metric) 
 during [querying](https://docs.victoriametrics.com/victoriametrics/keyconcepts/#query-data) {{% available_from "v1.113.0" %}}. It tracks
 only metric names, as the number of names is usually limited (thousands) compared to time series (millions or billions).
-This feature can be enabled via the flag `--storage.trackMetricNamesStats` (**disabled by default**) on a single-node 
+This feature can be disabled via the flag `--storage.trackMetricNamesStats=false` (**enabled by default**) on a single-node 
 VictoriaMetrics or [vmstorage](https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/#architecture-overview). 
 
 During querying, VictoriaMetrics tracks how many times the requested metric name was fetched from the database and 
@@ -2048,12 +2048,13 @@ and [cardinality explorer docs](#cardinality-explorer).
   or [high churn rate](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-high-churn-rate) can be determined
   via [cardinality explorer](#cardinality-explorer) and via [/api/v1/status/tsdb](#tsdb-stats) endpoint.
 
-* New time series can be logged if `-logNewSeries` command-line flag is passed to VictoriaMetrics.
+* New time series can be logged if `-logNewSeries` command-line flag is passed to VictoriaMetrics or temporary enabled via `/internal/log_new_series` API call.
+  `/internal/log_new_series` API accepts query parameter `seconds`, with default value of `60`, which defines a duration for logging newly created series.
 
 * VictoriaMetrics limits the number of labels per each series, label name length and label value length
   via `-maxLabelsPerTimeseries`, `-maxLabelNameLen` and `-maxLabelValueLen` command-line flags respectively.
   Series that exceed the limits are ignored on ingestion. This prevents from ingesting malformed series.
-  It is recommended [monitoring](#monitoring) `vm_rows_ingored_total` metric and VictoriaMetrics logs in order 
+  It is recommended [monitoring](#monitoring) `vm_rows_ignored_total` metric and VictoriaMetrics logs in order 
   to determine whether limits must be adjusted for your workload.
   Alternatively, you can use [relabeling](https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#relabeling) to change metric target labels.
 
@@ -2173,7 +2174,7 @@ Things to consider when copying data:
 1. Copying data folder means complete replacement of the previous data on destination VictoriaMetrics.
 
 For more complex scenarios like single-to-cluster, cluster-to-single, re-sharding or migrating only a fraction
-of data - see [vmctl. Migrating data from VictoriaMetrics](https://docs.victoriametrics.com/victoriametrics/vmctl/#migrating-data-from-victoriametrics).
+of data - see [vmctl. Migrating data from VictoriaMetrics](https://docs.victoriametrics.com/victoriametrics/vmctl/victoriametrics/).
 
 ### From other systems
 
@@ -2272,14 +2273,6 @@ The command for collecting CPU profile waits for 30 seconds before returning.
 
 The collected profiles may be analyzed with [go tool pprof](https://github.com/google/pprof).
 It is safe sharing the collected profiles from security point of view, since they do not contain sensitive information.
-
-## Integrations
-
-* [go-graphite/carbonapi](https://github.com/go-graphite/carbonapi) can use VictoriaMetrics as time series backend.
-  See [this example](https://github.com/go-graphite/carbonapi/blob/main/cmd/carbonapi/carbonapi.example.victoriametrics.yaml).
-* [netdata](https://github.com/netdata/netdata) can push data into VictoriaMetrics via `Prometheus remote_write API`.
-  See [these docs](https://github.com/netdata/netdata#integrations).
-* [vmalert-cli](https://github.com/aorfanos/vmalert-cli) - a CLI application for managing [vmalert](https://docs.victoriametrics.com/victoriametrics/vmalert/).
 
 ## Third-party contributions
 
@@ -2539,6 +2532,10 @@ Pass `-help` to VictoriaMetrics in order to see the list of supported command-li
      Interval for reloading the license file specified via -licenseFile. See https://victoriametrics.com/products/enterprise/ . This flag is available only in Enterprise binaries (default 1h0m0s)
   -logNewSeries
      Whether to log new series. This option is for debug purposes only. It can lead to performance issues when big number of new series are ingested into VictoriaMetrics
+  -logNewSeriesAuthKey value
+     authKey, which must be passed in query string to /internal/log_new_series. It overrides -httpAuth.*
+     Flag value can be read from the given file when using -logNewSeriesAuthKey=file:///abs/path/to/file or -logNewSeriesAuthKey=file://./relative/path/to/file .
+     Flag value can be read from the given http/https url when using -logNewSeriesAuthKey=http://host/path or -logNewSeriesAuthKey=https://host/path
   -loggerDisableTimestamps
      Whether to disable writing timestamps in logs
   -loggerErrorsPerSecondLimit int
@@ -2786,6 +2783,10 @@ Pass `-help` to VictoriaMetrics in order to see the list of supported command-li
      Log queries with execution time exceeding this value. Zero disables slow query logging. See also -search.logQueryMemoryUsage (default 5s)
   -search.logSlowQueryStats duration
      Log query statistics if execution time exceeding this value - see https://docs.victoriametrics.com/victoriametrics/query-stats . Zero disables slow query statistics logging. This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/victoriametrics/enterprise/
+  -search.logSlowQueryStatsHeaders array
+     White list of header keys to log for queries exceeding -search.logSlowQueryStats. By default, no headers are logged. This flag is available only in VictoriaMetrics enterprise. See https://docs.victoriametrics.com/victoriametrics/enterprise/
+     Supports an array of values separated by comma or specified via multiple flags.
+     Value can contain comma inside single-quoted or double-quoted string, {}, [] and () braces.
   -search.maxBinaryOpPushdownLabelValues instance
      The maximum number of values for a label in the first expression that can be extracted as a common label filter and pushed down to the second expression in a binary operation. A larger value makes the pushed-down filter more complex but fewer time series will be returned. This flag is useful when selective label contains numerous values, for example instance, and storage resources are abundant. (default 100)
   -search.maxConcurrentRequests int
@@ -2890,7 +2891,7 @@ Pass `-help` to VictoriaMetrics in order to see the list of supported command-li
      Deprecated: this flag does nothing
   -snapshotsMaxAge value
      Automatically delete snapshots older than -snapshotsMaxAge if it is set to non-zero duration. Make sure that backup process has enough time to finish the backup before the corresponding snapshot is automatically deleted
-     The following optional suffixes are supported: s (second), h (hour), d (day), w (week), y (year). If suffix isn't set, then the duration is counted in months (default 0)
+     The following optional suffixes are supported: s (second), h (hour), d (day), w (week), y (year). If suffix isn't set, then the duration is counted in months (default 3d)
   -sortLabels
      Whether to sort labels for incoming samples before writing them to storage. This may be needed for reducing memory usage at storage when the order of labels in incoming samples is random. For example, if m{k1="v1",k2="v2"} may be sent as m{k2="v2",k1="v1"}. Enabled sorting for labels can slow down ingestion performance a bit
   -storage.cacheSizeIndexDBDataBlocks size
@@ -2913,6 +2914,9 @@ Pass `-help` to VictoriaMetrics in order to see the list of supported command-li
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 0)
   -storage.finalDedupScheduleCheckInterval duration
      The interval for checking when final deduplication process should be started.Storage unconditionally adds 25% jitter to the interval value on each check evaluation. Changing the interval to the bigger values may delay downsampling, deduplication for historical data. See also https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication (default 1h0m0s)
+  -storage.idbPrefillStart duration
+     Specifies how early VictoriaMetrics starts pre-filling indexDB records before indexDB rotation. Starting the pre-fill process earlier can help reduce resource usage spikes during rotation.
+     In most cases, this value should not be changed. The maximum allowed value is 23h. (default 1h0m0s)
   -storage.maxDailySeries int
      The maximum number of unique series can be added to the storage during the last 24 hours. Excess series are logged and dropped. This can be useful for limiting series churn rate. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cardinality-limiter . See also -storage.maxHourlySeries
   -storage.maxHourlySeries int
@@ -2921,7 +2925,7 @@ Pass `-help` to VictoriaMetrics in order to see the list of supported command-li
      The minimum free disk space at -storageDataPath after which the storage stops accepting new data
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 10000000)
   -storage.trackMetricNamesStats
-     Whether to track ingest and query requests for timeseries metric names. This feature allows to track metric names unused at query requests. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#track-ingested-metrics-usage
+     Whether to track ingest and query requests for timeseries metric names. This feature allows to track metric names unused at query requests. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#track-ingested-metrics-usage (default true)
   -storageDataPath string
      Path to storage data (default "victoria-metrics-data")
   -streamAggr.config string
@@ -3045,3 +3049,7 @@ Moved to [integrations/graphite/#metrics-api](https://docs.victoriametrics.com/v
 ###### Graphite Tags API usage
 
 Moved to [integrations/graphite/#tags-api](https://docs.victoriametrics.com/victoriametrics/integrations/graphite/#tags-api).
+
+###### Integrations
+
+Moved to [integrations](https://docs.victoriametrics.com/victoriametrics/integrations).

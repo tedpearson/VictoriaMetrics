@@ -10,7 +10,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
@@ -100,7 +100,7 @@ func TestScrapeWorkScrapeInternalFailure(t *testing.T) {
 
 	pushDataCalls := 0
 	var pushDataErr error
-	sw.PushData = func(_ *auth.Token, wr *prompbmarshal.WriteRequest) {
+	sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
 		if err := expectEqualTimeseries(wr.Timeseries, timeseriesExpected); err != nil {
 			pushDataErr = fmt.Errorf("unexpected data pushed: %w\ngot\n%#v\nwant\n%#v", err, wr.Timeseries, timeseriesExpected)
 		}
@@ -158,7 +158,7 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
 		var pushDataMu sync.Mutex
 		var pushDataCalls int
 		var pushDataErr error
-		sw.PushData = func(_ *auth.Token, wr *prompbmarshal.WriteRequest) {
+		sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
 			pushDataMu.Lock()
 			defer pushDataMu.Unlock()
 
@@ -184,7 +184,7 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
 		timestamp := int64(123000)
 		tsmGlobal.Register(&sw)
 		if err := sw.scrapeInternal(timestamp, timestamp); err != nil {
-			if !strings.Contains(err.Error(), "sample_limit") {
+			if !strings.Contains(err.Error(), "sample_limit") && !strings.Contains(err.Error(), "label_limit") {
 				t.Fatalf("unexpected error: %s", err)
 			}
 		}
@@ -486,6 +486,25 @@ func testScrapeWorkScrapeInternalSuccess(t *testing.T, streamParse bool) {
 		scrape_series_limit_samples_dropped 0 123
 		scrape_timeout_seconds 42 123
 	`)
+	// Scrape failure because of the exceeded LabelLimit
+	f(`
+                foo{bar="baz"} 34.44
+                bar{a="b",c="d",e="f"} -3e4
+        `, &ScrapeWork{
+		StreamParse:   streamParse,
+		ScrapeTimeout: time.Second * 42,
+		HonorLabels:   true,
+		LabelLimit:    2,
+	}, `
+                up 0 123
+                scrape_samples_scraped 2 123
+                scrape_response_size_bytes 0 123
+                scrape_duration_seconds 0 123
+                scrape_samples_post_metric_relabeling 0 123
+                scrape_series_added 0 123
+                scrape_timeout_seconds 42 123
+		scrape_labels_limit 2 123
+        `)
 	// Scrape success with the given SeriesLimit.
 	f(`
 		foo{bar="baz"} 34.44
@@ -551,7 +570,7 @@ func TestScrapeWorkScrapeInternalStreamConcurrency(t *testing.T) {
 
 		var pushDataCalls atomic.Int64
 		var pushedTimeseries atomic.Int64
-		sw.PushData = func(_ *auth.Token, wr *prompbmarshal.WriteRequest) {
+		sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
 			pushDataCalls.Add(1)
 			pushedTimeseries.Add(int64(len(wr.Timeseries)))
 		}
@@ -580,7 +599,7 @@ func TestScrapeWorkScrapeInternalStreamConcurrency(t *testing.T) {
 		// see https://github.com/VictoriaMetrics/VictoriaMetrics/pull/8515#issuecomment-2741063155
 		lowerExpectedDelta := pushedTimeseries.Load() - timeseriesExpectedDelta
 		upperExpectedDelta := pushedTimeseries.Load() + timeseriesExpectedDelta + 1
-		if !(timeseriesExpected >= lowerExpectedDelta && timeseriesExpected < upperExpectedDelta) {
+		if timeseriesExpected < lowerExpectedDelta || timeseriesExpected >= upperExpectedDelta {
 			t.Fatalf("unexpected number of pushed timeseries; got %d; want within range [%d, %d)",
 				pushedTimeseries.Load(),
 				lowerExpectedDelta,
@@ -628,7 +647,10 @@ func TestWriteRequestCtx_AddRowNoRelabeling(t *testing.T) {
 		t.Helper()
 		r := parsePromRow(row)
 		var wc writeRequestCtx
-		wc.addRow(cfg, r, r.Timestamp, false)
+		err := wc.addRow(cfg, r, r.Timestamp, false)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
 		tss := wc.writeRequest.Timeseries
 		tssExpected := parseData(dataExpected)
 		if err := expectEqualTimeseries(tss, tssExpected); err != nil {
@@ -867,7 +889,7 @@ func TestSendStaleSeries(t *testing.T) {
 		defer protoparserutil.StopUnmarshalWorkers()
 
 		var staleMarks atomic.Int64
-		sw.PushData = func(_ *auth.Token, wr *prompbmarshal.WriteRequest) {
+		sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
 			staleMarks.Add(int64(len(wr.Timeseries)))
 		}
 		sw.sendStaleSeries(lastScrape, currScrape, 0, false)
@@ -904,11 +926,11 @@ func parsePromRow(data string) *prometheus.Row {
 	return &rows.Rows[0]
 }
 
-func parseData(data string) []prompbmarshal.TimeSeries {
+func parseData(data string) []prompb.TimeSeries {
 	return prometheus.MustParsePromMetrics(data, 0)
 }
 
-func expectEqualTimeseries(tss, tssExpected []prompbmarshal.TimeSeries) error {
+func expectEqualTimeseries(tss, tssExpected []prompb.TimeSeries) error {
 	m, err := timeseriesToMap(tss)
 	if err != nil {
 		return fmt.Errorf("invalid generated timeseries: %w", err)
@@ -929,7 +951,7 @@ func expectEqualTimeseries(tss, tssExpected []prompbmarshal.TimeSeries) error {
 	return nil
 }
 
-func timeseriesToMap(tss []prompbmarshal.TimeSeries) (map[string]string, error) {
+func timeseriesToMap(tss []prompb.TimeSeries) (map[string]string, error) {
 	m := make(map[string]string, len(tss))
 	for i := range tss {
 		ts := &tss[i]
@@ -951,7 +973,7 @@ func timeseriesToMap(tss []prompbmarshal.TimeSeries) (map[string]string, error) 
 	return m, nil
 }
 
-func timeseriesToString(ts *prompbmarshal.TimeSeries) string {
+func timeseriesToString(ts *prompb.TimeSeries) string {
 	promrelabel.SortLabels(ts.Labels)
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "{")

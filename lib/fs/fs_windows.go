@@ -12,19 +12,7 @@ import (
 
 // at windows only files could be synced
 // Sync for directories is not supported.
-func mustSyncPath(path string) {
-}
-
-func mustRemoveDirAtomic(dir string) {
-	n := atomicDirRemoveCounter.Add(1)
-	tmpDir := fmt.Sprintf("%s.must-remove.%d", dir, n)
-	if err := os.Rename(dir, tmpDir); err != nil {
-		logger.Panicf("FATAL: cannot move %s to %s: %s", dir, tmpDir, err)
-	}
-	if err := os.RemoveAll(tmpDir); err != nil {
-		logger.Warnf("cannot remove dir: %q: %s; restart VictoriaMetrics to complete dir removal; "+
-			"see https://github.com/VictoriaMetrics/VictoriaMetrics/issues/70#issuecomment-1491529183", tmpDir, err)
-	}
+func mustSyncPath(_ string) {
 }
 
 const (
@@ -66,7 +54,7 @@ var (
 	mmapByAddr     = map[uintptr]windows.Handle{}
 )
 
-func mmap(fd int, length int) ([]byte, error) {
+func mmap(fd, length int) ([]byte, error) {
 	flProtect := uint32(windows.PAGE_READONLY)
 	dwDesiredAccess := uint32(windows.FILE_MAP_READ)
 	// https://learn.microsoft.com/en-us/windows/win32/memory/creating-a-file-mapping-object#file-mapping-size
@@ -81,7 +69,11 @@ func mmap(fd int, length int) ([]byte, error) {
 		windows.CloseHandle(h)
 		return nil, os.NewSyscallError("MapViewOfFile", errno)
 	}
-	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), length)
+
+	// mitigate go vet false positive
+	// https://github.com/golang/go/issues/58625
+	addrPtr := *(*unsafe.Pointer)(unsafe.Pointer(&addr))
+	data := unsafe.Slice((*byte)(addrPtr), length)
 
 	mmapByAddrLock.Lock()
 	mmapByAddr[addr] = h
@@ -121,7 +113,7 @@ func mustGetFreeSpace(path string) uint64 {
 }
 
 // stub
-func fadviseSequentialRead(f *os.File, prefetch bool) error {
+func fadviseSequentialRead(_ *os.File, _ bool) error {
 	return nil
 }
 
