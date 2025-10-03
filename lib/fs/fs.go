@@ -107,31 +107,32 @@ func IsTemporaryFileName(fn string) bool {
 var tmpFileNameRe = regexp.MustCompile(`\.tmp\.\d+$`)
 
 // MustMkdirIfNotExist creates the given path dir if it isn't exist.
+//
+// The caller is responsible for MustSyncPath() call for the parent directory for the path.
 func MustMkdirIfNotExist(path string) {
 	if IsPathExist(path) {
 		return
 	}
-	mustMkdirSync(path)
+	mustMkdir(path)
 }
 
 // MustMkdirFailIfExist creates the given path dir if it isn't exist.
 //
-// If the directory at the given path already exists, then the function logs the error and exits.
+// If the directory at the given path already exists, then the function logs the fatal error and exits the process.
+//
+// The caller is responsible for MustSyncPath() call for the parent directory for the path.
 func MustMkdirFailIfExist(path string) {
 	if IsPathExist(path) {
 		logger.Panicf("FATAL: the %q already exists", path)
 	}
-	mustMkdirSync(path)
+	mustMkdir(path)
 }
 
-func mustMkdirSync(path string) {
+func mustMkdir(path string) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		logger.Panicf("FATAL: cannot create directory: %s", err)
 	}
-	// Sync the parent directory, so the created directory becomes visible
-	// in the fs after power loss.
-	parentDirPath := filepath.Dir(path)
-	MustSyncPath(parentDirPath)
+	// Do not sync the parent directory - this is the responsibility of the caller.
 }
 
 // MustClose must close the given file f.
@@ -174,9 +175,11 @@ func MustReadDir(dir string) []os.DirEntry {
 	return des
 }
 
-// MustHardLinkFiles makes hard links for all the files from srcDir in dstDir.
+// MustHardLinkFiles creates dstDir and makes hard links for all the files from srcDir in dstDir.
+//
+// The caller is responsible for calling MustSyncPath for the parent directory of dstDir.
 func MustHardLinkFiles(srcDir, dstDir string) {
-	mustMkdirSync(dstDir)
+	mustMkdir(dstDir)
 
 	des := MustReadDir(srcDir)
 	for _, de := range des {
@@ -196,6 +199,8 @@ func MustHardLinkFiles(srcDir, dstDir string) {
 }
 
 // MustSymlinkRelative creates relative symlink for srcPath in dstPath.
+//
+// The caller is responsible for calling MustSyncPath() for the parent directory of dstPath.
 func MustSymlinkRelative(srcPath, dstPath string) {
 	baseDir := filepath.Dir(dstPath)
 	srcPathRel, err := filepath.Rel(baseDir, srcPath)
@@ -207,10 +212,13 @@ func MustSymlinkRelative(srcPath, dstPath string) {
 	}
 }
 
-// MustCopyDirectory copies all the files in srcPath to dstPath.
+// MustCopyDirectory creates dstPath and copies all the files in srcPath to dstPath.
+//
+// The caller is responsible for calling MustSyncPath() for the parent directory of dstPath.
 func MustCopyDirectory(srcPath, dstPath string) {
+	mustMkdir(dstPath)
+
 	des := MustReadDir(srcPath)
-	MustMkdirIfNotExist(dstPath)
 	for _, de := range des {
 		if !de.Type().IsRegular() {
 			// Skip non-files
@@ -220,6 +228,7 @@ func MustCopyDirectory(srcPath, dstPath string) {
 		dst := filepath.Join(dstPath, de.Name())
 		MustCopyFile(src, dst)
 	}
+
 	MustSyncPath(dstPath)
 }
 
@@ -286,31 +295,57 @@ const FlockFilename = "flock.lock"
 // MustGetFreeSpace returns free space for the given directory path.
 func MustGetFreeSpace(path string) uint64 {
 	// Try obtaining cached value at first.
-	freeSpaceMapLock.Lock()
-	defer freeSpaceMapLock.Unlock()
+	diskSpaceMapLock.Lock()
+	defer diskSpaceMapLock.Unlock()
 
-	e, ok := freeSpaceMap[path]
+	e, ok := diskSpaceMap[path]
 	if ok && fasttime.UnixTimestamp()-e.updateTime < 2 {
 		// Fast path - the entry is fresh.
-		return e.freeSpace
+		return e.free
 	}
 
 	// Slow path.
 	// Determine the amount of free space at path.
-	e.freeSpace = mustGetFreeSpace(path)
+	e = updateDiskSpaceLocked(path)
+	return e.free
+}
+
+// MustGetTotalSpace returns the total disk space for the given directory path.
+func MustGetTotalSpace(path string) uint64 {
+	// Try obtaining cached value at first.
+	diskSpaceMapLock.Lock()
+	defer diskSpaceMapLock.Unlock()
+
+	e, ok := diskSpaceMap[path]
+	if ok && fasttime.UnixTimestamp()-e.updateTime < 2 {
+		// Fast path - the entry is fresh.
+		return e.total
+	}
+
+	// Slow path.
+	// Determine the amount of total space at path.
+	e = updateDiskSpaceLocked(path)
+	return e.total
+}
+
+func updateDiskSpaceLocked(path string) diskSpaceEntry {
+	var e diskSpaceEntry
+	e.total, e.free = mustGetDiskSpace(path)
 	e.updateTime = fasttime.UnixTimestamp()
-	freeSpaceMap[path] = e
-	return e.freeSpace
+	diskSpaceMap[path] = e
+
+	return e
 }
 
 var (
-	freeSpaceMap     = make(map[string]freeSpaceEntry)
-	freeSpaceMapLock sync.Mutex
+	diskSpaceMap     = make(map[string]diskSpaceEntry)
+	diskSpaceMapLock sync.Mutex
 )
 
-type freeSpaceEntry struct {
+type diskSpaceEntry struct {
 	updateTime uint64
-	freeSpace  uint64
+	free       uint64
+	total      uint64
 }
 
 // IsDirOrSymlink returns true if de is directory or symlink.
