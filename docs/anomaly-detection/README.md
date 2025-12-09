@@ -54,6 +54,7 @@ VictoriaMetrics Anomaly Detection **continuously re-fit and apply machine learni
 Get started with VictoriaMetrics Anomaly Detection by following our guides and installation options:
 
 - **Quickstart**: Learn how to quickly set up `vmanomaly` by following the [Quickstart Guide](https://docs.victoriametrics.com/anomaly-detection/quickstart/).
+- **UI**: Explore anomaly detection configurations through the [vmanomaly UI](https://docs.victoriametrics.com/anomaly-detection/ui/).
 - **Integration**: Integrate anomaly detection into your existing observability stack. Find detailed steps [here](https://docs.victoriametrics.com/anomaly-detection/guides/guide-vmanomaly-vmalert/).
 - **Anomaly Detection Presets**: Enable anomaly detection on predefined sets of metrics. Learn more [here](https://docs.victoriametrics.com/anomaly-detection/presets/).
 
@@ -65,6 +66,8 @@ Get started with VictoriaMetrics Anomaly Detection by following our guides and i
 - **High Availability**: See how to enable [horizontal scalability](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#horizontal-scalability) and [high availability](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/#high-availability) for `vmanomaly` service [here](https://docs.victoriametrics.com/anomaly-detection/scaling-vmanomaly/)
 
 - **Self-Monitoring**: Ensure `vmanomaly` is functioning optimally, using provided Grafana dashboards and alerting rules to track service health and operational metrics. Find the guide [here](https://docs.victoriametrics.com/anomaly-detection/self-monitoring/).
+
+- **Migration**: For information on migrating between different versions of `vmanomaly`, please refer to the [Migration section](https://docs.victoriametrics.com/anomaly-detection/migration/) for compatibility considerations and steps for a smooth transition.
 
 > Starting from [v1.5.0](https://docs.victoriametrics.com/anomaly-detection/changelog/#v150) `vmanomaly` requires a [license key](https://docs.victoriametrics.com/anomaly-detection/quickstart/#licensing) to run. You can obtain a trial license key [**here**](https://victoriametrics.com/products/enterprise/trial/).
 
