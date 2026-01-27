@@ -9,9 +9,11 @@ import (
 	"github.com/klauspost/compress/zlib"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding/snappy"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding/zstd"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ioutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 )
@@ -28,18 +30,21 @@ const maxSnappyBlockSize = 56_000_000
 // The maxDataSize limits the maximum data size, which can be read from r.
 //
 // The callback must not hold references to the data after returning.
-func ReadUncompressedData(r io.Reader, encoding string, maxDataSize *flagutil.Bytes, callback func(data []byte) error) error {
-	wcr := writeconcurrencylimiter.GetReader(r)
+func ReadUncompressedData(r io.Reader, contentType string, maxDataSize *flagutil.Bytes, callback func(data []byte) error) error {
+	wcr, err := writeconcurrencylimiter.GetReader(r)
+	if err != nil {
+		return err
+	}
 	defer writeconcurrencylimiter.PutReader(wcr)
 
-	if encoding == "zstd" {
-		// Fast path for zstd encoding - read the data in full and then decompress it by a single call.
+	if contentType == "zstd" {
+		// Fast path for zstd contentType - read the data in full and then decompress it by a single call.
 		dcompress := func(dst, src []byte) ([]byte, error) {
-			return zstd.DecompressLimited(dst, src, maxDataSize.IntN())
+			return encoding.DecompressZSTDLimited(dst, src, maxDataSize.IntN())
 		}
 		return readUncompressedData(wcr, maxDataSize, dcompress, callback)
 	}
-	if encoding == "snappy" {
+	if contentType == "snappy" {
 		// Special case for snappy. The snappy data must be read in full and then decompressed,
 		// since streaming snappy encoding is incompatible with block snappy encoding.
 		decompress := func(dst, src []byte) ([]byte, error) {
@@ -49,16 +54,24 @@ func ReadUncompressedData(r io.Reader, encoding string, maxDataSize *flagutil.By
 	}
 
 	// Slow path for other supported protocol encoders.
-	reader, err := GetUncompressedReader(wcr, encoding)
+	reader, err := GetUncompressedReader(wcr, contentType)
 	if err != nil {
 		return err
 	}
-	lr := io.LimitReader(reader, maxDataSize.N+1)
+	lr := ioutil.GetLimitedReader(reader, maxDataSize.N+1)
 
 	dbb := decompressedBufPool.Get()
-	defer decompressedBufPool.Put(dbb)
+	defer func() {
+		if len(dbb.B) > 1024*1024 && cap(dbb.B) > 4*len(dbb.B) {
+			// Do not store too big ddb to the pool if only a small part of the buffer is used last time.
+			// This should reduce memory waste.
+			return
+		}
+		decompressedBufPool.Put(dbb)
+	}()
 
 	_, err = dbb.ReadFrom(lr)
+	ioutil.PutLimitedReader(lr)
 	PutUncompressedReader(reader)
 	if err != nil {
 		return err
@@ -71,10 +84,11 @@ func ReadUncompressedData(r io.Reader, encoding string, maxDataSize *flagutil.By
 }
 
 func readUncompressedData(r io.Reader, maxDataSize *flagutil.Bytes, decompress func(dst, src []byte) ([]byte, error), callback func(data []byte) error) error {
-	lr := io.LimitReader(r, maxDataSize.N+1)
+	lr := ioutil.GetLimitedReader(r, maxDataSize.N+1)
 	cbb := compressedBufPool.Get()
 
 	_, err := cbb.ReadFrom(lr)
+	ioutil.PutLimitedReader(lr)
 	if err != nil {
 		compressedBufPool.Put(cbb)
 		return fmt.Errorf("cannot read request body: %w", err)
@@ -104,11 +118,11 @@ var (
 	decompressedBufPool bytesutil.ByteBufferPool
 )
 
-// GetUncompressedReader returns uncompressed reader for r and the given encoding
+// GetUncompressedReader returns uncompressed reader for r and the given contentType
 //
 // The returned reader must be passed to PutUncompressedReader when no longer needed.
-func GetUncompressedReader(r io.Reader, encoding string) (io.Reader, error) {
-	switch encoding {
+func GetUncompressedReader(r io.Reader, contentType string) (io.Reader, error) {
+	switch contentType {
 	case "zstd":
 		return zstd.GetReader(r), nil
 	case "snappy":
@@ -120,11 +134,9 @@ func GetUncompressedReader(r io.Reader, encoding string) (io.Reader, error) {
 	case "", "none", "identity":
 		// Datadog extensions sends Content-Encoding: identity, which is not supported by RFC 2616
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8649
-		return &plainReader{
-			r: r,
-		}, nil
+		return getPlainReader(r), nil
 	default:
-		return nil, fmt.Errorf("unsupported encoding: %s", encoding)
+		return nil, fmt.Errorf("unsupported contentType: %s", contentType)
 	}
 }
 
@@ -140,7 +152,7 @@ func PutUncompressedReader(r io.Reader) {
 	case zlib.Resetter:
 		putZlibReader(t)
 	case *plainReader:
-		// do nothing
+		putPlainReader(t)
 	default:
 		logger.Panicf("BUG: unsupported reader passed to PutUncompressedReader: %T", r)
 	}
@@ -153,6 +165,23 @@ type plainReader struct {
 func (pr *plainReader) Read(p []byte) (int, error) {
 	return pr.r.Read(p)
 }
+
+func getPlainReader(r io.Reader) *plainReader {
+	v := plainReaderPool.Get()
+	if v == nil {
+		v = &plainReader{}
+	}
+	pr := v.(*plainReader)
+	pr.r = r
+	return pr
+}
+
+func putPlainReader(pr *plainReader) {
+	pr.r = nil
+	plainReaderPool.Put(pr)
+}
+
+var plainReaderPool sync.Pool
 
 func getGzipReader(r io.Reader) (*gzip.Reader, error) {
 	v := gzipReaderPool.Get()

@@ -5,10 +5,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 )
 
 func TestDateMetricIDCacheSerial(t *testing.T) {
 	c := newDateMetricIDCache()
+	defer c.MustStop()
 	if err := testDateMetricIDCache(c, false); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
@@ -16,6 +19,7 @@ func TestDateMetricIDCacheSerial(t *testing.T) {
 
 func TestDateMetricIDCacheConcurrent(t *testing.T) {
 	c := newDateMetricIDCache()
+	defer c.MustStop()
 	ch := make(chan error, 5)
 	for i := 0; i < 5; i++ {
 		go func() {
@@ -60,9 +64,9 @@ func testDateMetricIDCache(c *dateMetricIDCache, concurrent bool) error {
 			c.mu.Unlock()
 		}
 		if i%34323 == 0 {
-			c.mu.Lock()
-			c.resetLocked()
-			c.mu.Unlock()
+			// Two rotations are needed to clear the cache.
+			c.rotate()
+			c.rotate()
 			m = make(map[dmk]bool)
 		}
 	}
@@ -84,14 +88,16 @@ func testDateMetricIDCache(c *dateMetricIDCache, concurrent bool) error {
 		}
 	}
 
-	// Verify c.Reset
-	if n := c.EntriesCount(); !concurrent && n < 123 {
+	// Verify that cache becomes empty after two rotations.
+	if n := c.Stats().Size; !concurrent && n < 123 {
 		return fmt.Errorf("c.EntriesCount must return at least 123; returned %d", n)
 	}
-	c.mu.Lock()
-	c.resetLocked()
-	c.mu.Unlock()
-	if n := c.EntriesCount(); !concurrent && n > 0 {
+	c.rotate()
+	if n := c.Stats().Size; !concurrent && n < 123 {
+		return fmt.Errorf("c.EntriesCount must return at least 123; returned %d", n)
+	}
+	c.rotate()
+	if n := c.Stats().Size; !concurrent && n > 0 {
 		return fmt.Errorf("c.EntriesCount must return 0 after reset; returned %d", n)
 	}
 	return nil
@@ -105,6 +111,7 @@ func TestDateMetricIDCacheIsConsistent(_ *testing.T) {
 		numMetrics  = 100000
 	)
 	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
 	var wg sync.WaitGroup
 	for i := range concurrency {
 		wg.Add(1)
@@ -119,4 +126,57 @@ func TestDateMetricIDCacheIsConsistent(_ *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestDateMetricIDCache_Size(t *testing.T) {
+	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
+	for i := range 100_000 {
+		date := 12345 + uint64(i%30)
+		metricID := uint64(i)
+		dmc.Set(date, metricID)
+
+		if got, want := dmc.Stats().Size, uint64(i+1); got != want {
+			t.Fatalf("unexpected size: got %d, want %d", got, want)
+		}
+	}
+
+	// Retrieve all entries and check the cache size again.
+	for i := range 100_000 {
+		date := 12345 + uint64(i%30)
+		metricID := uint64(i)
+		if !dmc.Has(date, metricID) {
+			t.Fatalf("entry not in cache: (date=%d, metricID=%d)", date, metricID)
+		}
+	}
+	if got, want := dmc.Stats().Size, uint64(100_000); got != want {
+		t.Fatalf("unexpected size: got %d, want %d", got, want)
+	}
+}
+
+func TestDateMetricIDCache_SizeBytes(t *testing.T) {
+	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
+	metricIDs := &uint64set.Set{}
+	for i := range 100_000 {
+		date := uint64(123)
+		metricID := uint64(i)
+		metricIDs.Add(metricID)
+		dmc.Set(date, metricID)
+	}
+	if got, want := dmc.Stats().SizeBytes, metricIDs.SizeBytes(); got != want {
+		t.Fatalf("unexpected sizeBytes: got %d, want %d", got, want)
+	}
+
+	// Retrieve all entries and check the cache sizeBytes again.
+	for i := range 100_000 {
+		date := uint64(123)
+		metricID := uint64(i)
+		if !dmc.Has(date, metricID) {
+			t.Fatalf("entry not in cache: (date=%d, metricID=%d)", date, metricID)
+		}
+	}
+	if got, want := dmc.Stats().SizeBytes, metricIDs.SizeBytes(); got != want {
+		t.Fatalf("unexpected sizeBytes: got %d, want %d", got, want)
+	}
 }

@@ -776,6 +776,27 @@ The following approaches can be used for reducing resource usage at `vmstorage` 
 
 See also [minimum downtime strategy](#minimum-downtime-strategy).
 
+## Slowness-based re-routing
+
+By default, `vminsert` nodes limit the cluster's overall ingestion rate to the throughput of the slowest `vmstorage` node. 
+This ensures that incoming metrics are evenly distributed across all `vmstorage` nodes. 
+The downside is that a single slow vmstorage node can throttle the entire cluster.
+
+When `-disableRerouting=false` is enabled on `vminsert`, 
+the cluster will automatically re-route writes away from the slowest vmstorage node to preserve maximum ingestion throughput.
+
+Re-routing occurs only when all of the following conditions hold:
+- the storage send buffer is full.
+- the saturated vmstorage node is the slowest.
+- the vmstorage cluster have much lower saturation overall.
+- the vmstorage cluster has at least three ready nodes.
+
+Enable slowness-based re-routing when peak write throughput matters more 
+than minimizing the number of [active time series](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-an-active-time-series)
+or keeping metrics perfectly balanced across nodes.
+
+The rerouting and node saturation could be seen at  [VictoriaMetrics - cluster](https://grafana.com/grafana/dashboards/11176) dashboard.
+
 ## Capacity planning
 
 VictoriaMetrics uses lower amounts of CPU, RAM and storage space on production workloads compared to competing solutions (Prometheus, Thanos, Cortex, TimescaleDB, InfluxDB, QuestDB, M3DB) according to [our case studies](https://docs.victoriametrics.com/victoriametrics/casestudies/).
@@ -1126,16 +1147,37 @@ Report bugs and propose new features in our [GitHub Issues](https://github.com/V
 
 ### List of command-line flags for vminsert
 
-Below is the output for `/path/to/vminsert -help`:
+Pass `-help` to vminsert in order to see the list of supported command-line flags with their description.
 
-{{% content "vminsert_flags.md" %}}
+#### Common vminsert flags
+These flags are available in both VictoriaMetrics OSS and VictoriaMetrics Enterprise.
+{{% content "vminsert_common_flags.md" %}}
+
+#### Enterprise vminsert flags
+These flags are available only in [VictoriaMetrics enterprise](https://docs.victoriametrics.com/victoriametrics/enterprise/).
+{{% content "vminsert_enterprise_flags.md" %}}
+
 
 ### List of command-line flags for vmselect
 
-Below is the output for `/path/to/vmselect -help`:
+Pass `-help` to vmselect in order to see the list of supported command-line flags with their description.
 
-{{% content "vmselect_flags.md" %}}
+#### Common vmselect flags
+These flags are available in both VictoriaMetrics OSS and VictoriaMetrics Enterprise.
+{{% content "vmselect_common_flags.md" %}}
+
+#### Enterprise vmselect flags
+These flags are available only in [VictoriaMetrics enterprise](https://docs.victoriametrics.com/victoriametrics/enterprise/).
+{{% content "vmselect_enterprise_flags.md" %}}
 
 ### List of command-line flags for vmstorage
 
-{{% content "vmstorage_flags.md" %}}
+Pass `-help` to vmstorage in order to see the list of supported command-line flags with their description.
+
+#### Common vmstorage flags
+These flags are available in both VictoriaMetrics OSS and VictoriaMetrics Enterprise.
+{{% content "vmstorage_common_flags.md" %}}
+
+#### Enterprise vmstorage flags
+These flags are available only in [VictoriaMetrics enterprise](https://docs.victoriametrics.com/victoriametrics/enterprise/).
+{{% content "vmstorage_enterprise_flags.md" %}}
