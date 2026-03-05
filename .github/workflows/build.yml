@@ -4,15 +4,6 @@ on:
   push:
     tags:
       - 'v*-ted-*'
-  workflow_dispatch:
-    inputs:
-      release_version:
-        description: version to release
-        required: true
-        type: string
-
-env:
-  release_version: ${{ case(inputs.release_version == null, github.ref, inputs.release_version) }}
 
 permissions:
   contents: write
@@ -78,6 +69,5 @@ jobs:
         with:
           allowUpdates: true
           artifacts: bin/victoria-metrics-${{ matrix.os }}-${{ matrix.arch }}
-          tag: ${{ env.release_version }}
           commit: master
           token: ${{ secrets.GITHUB_TOKEN }}
