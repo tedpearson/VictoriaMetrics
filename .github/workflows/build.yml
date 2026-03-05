@@ -12,7 +12,7 @@ on:
         type: string
 
 env:
-  release_version: ${{ case(inputs.release_version == null, GITHUB_REF_NAME, inputs.release_version) }}
+  release_version: ${{ case(inputs.release_version == null, github.ref, inputs.release_version) }}
 
 permissions:
   contents: write
@@ -78,6 +78,6 @@ jobs:
         with:
           allowUpdates: true
           artifacts: bin/victoria-metrics-${{ matrix.os }}-${{ matrix.arch }}
-          tag: ${{GITHUB_REF_NAME}}
+          tag: ${{ release_version }}
           commit: master
           token: ${{ secrets.GITHUB_TOKEN }}
