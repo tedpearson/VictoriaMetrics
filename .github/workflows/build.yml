@@ -78,6 +78,6 @@ jobs:
         with:
           allowUpdates: true
           artifacts: bin/victoria-metrics-${{ matrix.os }}-${{ matrix.arch }}
-          tag: ${{ release_version }}
+          tag: ${{ env.release_version }}
           commit: master
           token: ${{ secrets.GITHUB_TOKEN }}
