@@ -1,9 +1,6 @@
-**Fork notes:**
+# Archived, no longer needed
 
-I maintain this fork for this current reasons:
-- To recompile with support for inserting data more than 3 hours into the future to support forecast data
-
-Build files are also different as I don't need to build for every architecture or to build victorialogs.
+This fork was maintained to recompile with support for future data insertion, when VictoriaMetrics didn't support metrics more than 3 hours in the future. VictoriaMetrics 1.141.0 now supports future insertion with the `-futureRetention` flag, so this fork is now archived.
 
 # VictoriaMetrics
 
